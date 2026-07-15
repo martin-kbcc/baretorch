@@ -12,17 +12,6 @@ For our historical research diary, baseline comparison files, and proof-of-conce
 
 ---
 
-## ⚡ Key Highlights (Symmetric Hybrid Benchmarks)
-
-We benchmarked the BareTorch scalable core on our local workstation (dual RTX 4090s) training over a high-density stream of the **DCLM-100BT** dataset. 
-
-Our **Symmetric Hybrid** configuration—interleaving 3 layers of sub-quadratic **CS-LRAD** with 1 layer of standard **Softmax Attention**—yielded breakthrough modeling density and speed:
-
-* **Massive Perplexity Reduction:** Achieved a validation loss of **`4.586`** (yielding **`98.10` Perplexity**), outperforming the standard Softmax Transformer baseline (`4.783` loss / `119.46` PPL) by over **21 perplexity points** in 10,000 pretraining steps.
-* **Retained Hardware Speed:** Maintained **84.3% of the throughput speed** of a highly optimized, hardware-native FlashAttention Transformer (running at **9.50 steps/s** vs. 11.27 steps/s) without utilizing a single line of un-portable low-level kernel code.
-
----
-
 ## 🛠️ Getting Started
 
 ### 1. Environment Setup
