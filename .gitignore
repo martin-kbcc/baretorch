@@ -1,0 +1,24 @@
+# --- Large Model Checkpoints & Shards ---
+output_*/
+runs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# --- Dataset Caches & Tokenizer Outputs ---
+.cache/
+huggingface/
+data/
+
+# --- Python & Environment Files ---
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+.env
+venv/
+env/
+miniconda3/
+baretorch.egg-info/
