@@ -8,7 +8,7 @@ By structuring sub-quadratic recurrence into block-parallel chunk segments, Bare
 
 This repository houses the production core of the BareTorch framework, featuring dynamic hybrid sequencing, gradient checkpointing, and PyTorch compilation integration for scaling up to billions of parameters.
 
-For our historical research diary, baseline comparison files, and proof-of-concept benchmarks, visit the [BareTorch Research Playground](https://github.com/model-rampage/baretorch-experiments).
+For our historical research diary, baseline comparison files, and proof-of-concept benchmarks, visit the [BareTorch Research Playground](https://github.com/martin-kbcc/baretorch-experiments).
 
 ---
 
