@@ -101,10 +101,9 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, L, self.inner_dim)
         
         # --- Hugging Face Cache Optimization: S_final (State at step L) ---
-        # Closed-form recurrent update sequence over the final chunk space:
-        chunk_decay_last = exp_Lambda[:, :, -1, -1:, :] # [B, H, 1, 1]
-        S_historical_last = S_historical[:, :, -1]      # [B, H, r, d_h]
-        S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V[:, :, -1]) # [B, H, r, d_h]
+        chunk_decay_last = exp_Lambda[:, :, -1, -1:, :] 
+        S_historical_last = S_historical[:, :, -1]      
+        S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V[:, :, -1]) 
         S_final = (chunk_decay_last * S_historical_last) + S_local_last
         
         return self.W_out(Out * F.silu(self.W_swish_gate(x))), S_final
@@ -112,6 +111,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
     def step_inference(self, x, past_S=None):
         B, L, D = x.shape
         H, d_h, r = self.num_heads, self.d_head, self.r
+        scaling = 1.0 / math.sqrt(d_h)
         
         Q = F.silu(self.W_q(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
         K = F.silu(self.W_k(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
@@ -121,11 +121,21 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         gate = torch.clamp(torch.sigmoid(self.W_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), min=1e-3, max=0.999)
         beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
         
-        S_state = gate * (past_S if past_S is not None else torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)) + \
-                  torch.matmul((U * beta_gate).transpose(-1, -2), V)
+        past_S = past_S if past_S is not None else torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)
         
-        Out = (torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) + torch.matmul(R, S_state)) * (1.0 / math.sqrt(d_h))
-        return self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, self.inner_dim) * F.silu(self.W_swish_gate(x))), S_state
+        # 1. Decay past historical state for the current step
+        S_decayed = gate * past_S
+        
+        # 2. Local step attention + global historical attention (read BEFORE local state write)
+        Y_local = torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) * scaling
+        Y_global = torch.matmul(R, S_decayed) * scaling
+        Out = Y_local + Y_global
+        
+        # 3. Update state with current token's associative delta for future steps
+        S_local = torch.matmul((U * beta_gate).transpose(-1, -2), V)
+        next_S = S_decayed + S_local
+        
+        return self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, self.inner_dim) * F.silu(self.W_swish_gate(x))), next_S
 
 
 class LRADDecoderBlock(nn.Module):
@@ -142,7 +152,6 @@ class LRADDecoderBlock(nn.Module):
             h_attn = self.ln1(x_in)
             B, L, _ = x_in.shape
             
-            # Recurrent decoding loop selection threshold
             is_step_inference = (p_state is not None) or (L == 1)
             
             if is_step_inference:
@@ -159,10 +168,6 @@ class LRADDecoderBlock(nn.Module):
         else:
             return _block_forward(x, past_state)
 
-
-# ==========================================
-# 3. Hugging Face Serialization Configuration & Wrappers
-# ==========================================
 
 class CSLRADConfig(PretrainedConfig):
     model_type = "cs_lrad"
@@ -274,7 +279,6 @@ class CSLRADModel(CSLRADPreTrainedModel):
         
         is_step_inference = (past_key_values is not None) or (seq_length == 1)
         
-        # Causal block-parallel chunk padding for parallel sequence tracking
         pad_len = 0
         if not is_step_inference:
             chunk_size = self.config.chunk_size
@@ -296,7 +300,6 @@ class CSLRADModel(CSLRADPreTrainedModel):
 
         h = self.final_norm(h)
         
-        # Remove padding slice if padded
         if not is_step_inference and pad_len > 0:
             h = h[:, :seq_length, :]
 

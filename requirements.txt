@@ -1,5 +1,13 @@
-torch>=2.0.0
-transformers>=4.36.0
-accelerate>=0.25.0
+# Core Frameworks
+torch>=2.2.0
+transformers>=4.38.0
+accelerate>=0.27.0
 datasets>=2.15.0
-tensorboard
+tensorboard>=2.15.0
+lm_eval
+
+# Data Engineering & Streaming
+numpy>=1.24.0
+pyarrow>=14.0.0
+tqdm>=4.66.0
+huggingface_hub>=0.20.0

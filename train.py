@@ -1,16 +1,19 @@
 import os
+import glob
 import argparse
 import logging
+import subprocess
+import numpy as np
 import torch
+from torch.utils.data import Dataset, Subset
 from transformers import (
     Trainer,
     TrainingArguments,
     AutoTokenizer,
     default_data_collator,
+    TrainerCallback,
 )
-from datasets import load_dataset
 
-# Import all BareTorch configurations and causal language models
 from baretorch import (
     CSLRADConfig, CSLRADForCausalLM,
     TransformerConfig, TransformerForCausalLM,
@@ -22,19 +25,16 @@ from baretorch import (
 )
 
 # ==============================================================================
-#                               Logging Configuration
+#                                Logging Configuration
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
-# Mute chatty background connection threads from downloading dataset shards
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-logging.getLogger("datasets").setLevel(logging.WARNING)
 
-# Map command-line strings to our custom model architectures
 MODEL_MAP = {
     "cs_lrad": (CSLRADConfig, CSLRADForCausalLM),
     "transformer": (TransformerConfig, TransformerForCausalLM),
@@ -46,87 +46,180 @@ MODEL_MAP = {
 }
 
 
-def tokenize_and_chunk(tokenizer, max_length=1024):
+# ==============================================================================
+#                        Azure Blob Storage Sync Callback
+# ==============================================================================
+class AzureBlobCheckpointCallback(TrainerCallback):
     """
-    Groups tokenized streams into raw sequence blocks of exactly 'max_length'.
-    This avoids wasteful padding tokens and ensures maximum pre-training efficiency.
+    Hugging Face Trainer Callback that automatically syncs newly saved 
+    checkpoints to Azure Blob Storage asynchronously using azcopy.
+    Does nothing if Azure credentials are not configured.
     """
-    def process_fn(batch):
-        tokenized = tokenizer(batch["text"], truncation=False, padding=False)
-        concatenated_ids = []
-        for ids in tokenized["input_ids"]:
-            concatenated_ids.extend(ids)
+    def __init__(self, blob_url: str, sas_token: str):
+        self.blob_url = blob_url.rstrip("/")
+        self.sas_token = sas_token.lstrip("?")
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            checkpoint_dir = f"checkpoint-{state.global_step}"
+            local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
             
-        # Group tokens into equal-sized block chunks
-        total_length = len(concatenated_ids)
-        total_length = (total_length // max_length) * max_length
+            if os.path.exists(local_ckpt_path):
+                rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+                target_blob_url = f"{self.blob_url}/{rel_output_dir}/{checkpoint_dir}?{self.sas_token}"
+                
+                logger.info(f"\n[Azure Sync] Uploading {checkpoint_dir} to Azure Blob Storage in background...")
+                cmd = [
+                    "azcopy", "copy",
+                    local_ckpt_path,
+                    target_blob_url,
+                    "--recursive=true",
+                    "--overwrite=true"
+                ]
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ==============================================================================
+#                  Zero-Copy Memory-Mapped Binary Dataset
+# ==============================================================================
+class MemmapDataset(Dataset):
+    """
+    High-Performance, zero-copy PyTorch Dataset mapping directly over 
+    flat uint16 pre-tokenized binary files using numpy.memmap.
+    """
+    def __init__(self, bin_dir: str, seq_len: int = 2048):
+        self.seq_len = seq_len
         
-        result = {
-            "input_ids": [
-                concatenated_ids[i : i + max_length]
-                for i in range(0, total_length, max_length)
-            ]
-        }
-        # Copy inputs to labels for Hugging Face causal autoregressive loss tracking
-        result["labels"] = result["input_ids"].copy()
-        return result
-    return process_fn
+        # Search for binary shard files
+        bin_files = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
+        if not bin_files:
+            raise FileNotFoundError(f"❌ No .bin files found in '{bin_dir}'. Run tokenize_to_bin.py first!")
+
+        self.memmaps = []
+        self.file_lengths = []
+        total_tokens = 0
+
+        for fpath in bin_files:
+            # uint16 = 2 bytes per token
+            num_tokens = os.path.getsize(fpath) // 2
+            if num_tokens >= seq_len:
+                # Direct pointer to NVMe memory space with zero RAM loading
+                mmap = np.memmap(fpath, dtype=np.uint16, mode="r")
+                self.memmaps.append(mmap)
+                
+                num_samples = num_tokens // seq_len
+                self.file_lengths.append(num_samples)
+                total_tokens += num_tokens
+
+        self.cum_samples = np.cumsum(self.file_lengths)
+        self.total_samples = int(self.cum_samples[-1]) if len(self.cum_samples) > 0 else 0
+        
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if local_rank == 0:
+            logger.info(f"Loaded {len(self.memmaps)} binary shard(s) from '{bin_dir}'")
+            logger.info(f"   └─ Total Tokens: {total_tokens:,} | Total Sequences (L={seq_len}): {self.total_samples:,}")
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        # Locate target shard via binary search
+        file_idx = np.searchsorted(self.cum_samples, idx, side="right")
+        sample_in_file = idx if file_idx == 0 else idx - self.cum_samples[file_idx - 1]
+
+        start_idx = sample_in_file * self.seq_len
+        end_idx = start_idx + self.seq_len
+
+        # Slice sequence window off NVMe disk
+        chunk = self.memmaps[file_idx][start_idx:end_idx].astype(np.int64)
+        x = torch.from_numpy(chunk)
+
+        return {"input_ids": x, "labels": x.clone()}
+
+
+def prepare_dataset(args):
+    """
+    Instantiates memory-mapped datasets directly from pre-tokenized binary directories.
+    Optionally caps validation set to args.max_val_samples if configured.
+    """
+    train_dir = os.path.join(args.data_cache_dir, "train")
+    val_dir = os.path.join(args.data_cache_dir, "val")
+    
+    # Fallback if binary files are placed directly inside data_cache_dir root
+    if not os.path.exists(train_dir) and os.path.exists(args.data_cache_dir):
+        train_dir = args.data_cache_dir
+        val_dir = args.data_cache_dir
+
+    train_dataset = MemmapDataset(bin_dir=train_dir, seq_len=args.seq_len)
+    val_dataset = MemmapDataset(bin_dir=val_dir, seq_len=args.seq_len)
+    
+    # Optional capping of validation samples
+    if args.max_val_samples is not None and args.max_val_samples > 0:
+        if len(val_dataset) > args.max_val_samples:
+            val_dataset = Subset(val_dataset, range(args.max_val_samples))
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if local_rank == 0:
+                capped_tokens = args.max_val_samples * args.seq_len
+                logger.info(f"✂️ Capped validation dataset to {args.max_val_samples:,} sequences (~{capped_tokens:,} tokens)")
+
+    return train_dataset, val_dataset
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Cluster-Scale Pre-training Engine")
+    # Early Distributed Process Group Initialization for torchrun
+    if "LOCAL_RANK" in os.environ:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+
+    parser = argparse.ArgumentParser(description="BareTorch High-Throughput Cluster Pre-training Engine")
     
-    # 1. High-Level Architecture Parameters
-    parser.add_argument(
-        "--model_type",
-        type=str,
-        default="baretorch",
-        choices=list(MODEL_MAP.keys()),
-        help="The specific BareTorch model architecture configuration to train."
-    )
-    parser.add_argument(
-        "--layer_sequence",
-        type=str,
-        default="cs_lrad,cs_lrad,cs_lrad,transformer",
-        help="Comma-separated sequence of layer types (only used for baretorch model_type)."
-    )
+    # Architecture
+    parser.add_argument("--model_type", type=str, default="baretorch", choices=list(MODEL_MAP.keys()))
+    parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_500m")
     
-    # 2. Optimization Parameters
-    parser.add_argument("--max_steps", type=int, default=10000, help="Total training steps.")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Peak learning rate.")
-    parser.add_argument("--scheduler", type=str, default="cosine", help="LR scheduler type.")
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Warmup steps.")
-    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay parameter.")
+    # Dataset & Binary Paths
+    parser.add_argument("--dataset_name", type=str, default="HuggingFaceFW/dclm_100BT-shuffled")
+    parser.add_argument("--data_cache_dir", type=str, default="./tokenized_bin", help="Directory containing pre-tokenized uint16 .bin files.")
+    parser.add_argument("--max_val_samples", type=int, default=None, help="Maximum validation sequence samples (L=seq_len). If unset, uses full validation dataset.")
     
-    # 3. Structural Dimensions
-    parser.add_argument("--d_model", type=int, default=256, help="Model hidden dimension.")
-    parser.add_argument("--num_heads", type=int, default=8, help="Number of query attention heads.")
-    parser.add_argument("--num_layers", type=int, default=4, help="Total layer count.")
-    parser.add_argument("--chunk_size", type=int, default=32, help="Sequence chunk segmentation size.")
-    parser.add_argument("--rank", type=int, default=8, help="Internal low-rank projection parameter.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout percentage.")
-    parser.add_argument("--seq_len", type=int, default=1024, help="Maximum training sequence context length.")
+    # Optimization & Batching
+    parser.add_argument("--max_steps", type=int, default=50000)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--scheduler", type=str, default="cosine")
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--batch_size", type=int, default=8, help="Per-GPU batch size.")
+    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps.")
     
-    # 4. Engine & Workload Configuration
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU device.")
-    parser.add_argument("--compile", action="store_true", help="Enable PyTorch model compilation.")
-    parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    # Structural Dimensions
+    parser.add_argument("--d_model", type=int, default=1024)
+    parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--num_layers", type=int, default=32)
+    parser.add_argument("--chunk_size", type=int, default=32)
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--seq_len", type=int, default=2048)
     
-    # 5. Monitoring & Saving Checkpoints
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log step intervals.")
-    parser.add_argument("--save_steps", type=int, default=2000, help="Save checkpoint step intervals.")
-    parser.add_argument("--eval_steps", type=int, default=500, help="Run validation step intervals.")
+    # Engine Configurations
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--grad_checkpointing", action="store_true")
+    parser.add_argument("--logging_steps", type=int, default=2000)
+    parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument("--eval_steps", type=int, default=2000)
     
     args = parser.parse_args()
 
-    logger.info(f"Initializing BareTorch Engine. Selected Model Type: {args.model_type}")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank == 0:
+        logger.info(f"Initializing BareTorch Engine. Selected Architecture: {args.model_type}")
 
-    # 1. Load the Tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     vocab_size = len(tokenizer)
 
-    # 2. Build Config Args dynamically from parameters
     config_cls, model_cls = MODEL_MAP[args.model_type]
     
     config_args = {
@@ -143,97 +236,96 @@ def main():
         "eos_token_id": tokenizer.eos_token_id,
     }
     
-    # Check if the master hybrid is selected
     if args.model_type == "baretorch":
-        # Parse sequence and tile it cleanly up to args.num_layers
         raw_sequence = [s.strip().lower() for s in args.layer_sequence.split(",") if s.strip()]
         layer_types = [raw_sequence[i % len(raw_sequence)] for i in range(args.num_layers)]
         config_args["layer_types"] = layer_types
-        logger.info(f"Assembled Hybrid Sequence ({args.num_layers} layers): {layer_types}")
+        if local_rank == 0:
+            logger.info(f"Assembled Hybrid Sequence ({args.num_layers} layers): {layer_types}")
         
-    # Inject context bounds and GQA allocations where supported
     if "transformer" in args.model_type or args.model_type == "baretorch":
         config_args["max_seq_len"] = args.seq_len
-        # Allocate Grouped-Query Attention (GQA) with 1/4th key-value head divisor
         config_args["num_kv_heads"] = max(1, args.num_heads // 4)
 
-    # Instantiate Config and Model
     config = config_cls(**config_args)
     model = model_cls(config)
     
-    # Print parameter count for validation
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model initialized successfully. Total parameters: {total_params / 1e6:.2f}M")
+    if local_rank == 0:
+        logger.info(f"Model initialized successfully. Total parameters: {total_params / 1e6:.2f}M")
 
-    # 3. Stream the Curated High-Density Pre-training Dataset
-    logger.info("Loading streaming shards of HuggingFaceFW/dclm_100BT-shuffled...")
-    raw_dataset = load_dataset("HuggingFaceFW/dclm_100BT-shuffled", split="train", streaming=True)
+    # Fast memory-mapped dataset loading
+    train_dataset, val_dataset = prepare_dataset(args)
 
-    # Dedicate the first 1,000 raw documents to our static validation set.
-    logger.info("Slicing dataset stream into isolated train and validation subsets...")
-    raw_val_dataset = raw_dataset.take(1000)
-    raw_train_dataset = raw_dataset.skip(1000)
-
-    # Map both datasets through our fast-chunking pipeline
-    processed_train_dataset = raw_train_dataset.map(
-        tokenize_and_chunk(tokenizer, max_length=args.seq_len),
-        batched=True,
-        batch_size=1000,
-        remove_columns=["text"]
-    )
-    
-    processed_val_dataset = raw_val_dataset.map(
-        tokenize_and_chunk(tokenizer, max_length=args.seq_len),
-        batched=True,
-        batch_size=1000,
-        remove_columns=["text"]
-    )
-
-    # 4. Configure our unified Hugging Face Training Arguments
     training_args = TrainingArguments(
-        output_dir=f"./output_{args.model_type}",
+        output_dir=f"{args.output_dir}_{args.model_type}",
         max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.scheduler,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
-        bf16=True,                          # Utilize native cluster/4090 BF16 precision
+        bf16=True,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        
-        # DYNAMIC EVALUATION CONFIGURATION
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        
-        save_total_limit=2,
+        save_total_limit=3,
         report_to="tensorboard",
         logging_dir=f"./runs/{args.model_type}",
         torch_compile=args.compile,
+        gradient_checkpointing=args.grad_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
     )
 
-    # 5. Initialize the Trainer
+    # Detect optional Azure credentials for cloud checkpoint syncing
+    azure_blob_url = os.environ.get("AZURE_BLOB_URL", "").strip()
+    azure_sas_token = os.environ.get("AZURE_SAS_TOKEN", "").strip()
+
+    callbacks = []
+    if azure_blob_url and azure_sas_token:
+        if local_rank == 0:
+            logger.info("Azure Blob credentials detected. Background checkpoint cloud sync activated.")
+        callbacks.append(AzureBlobCheckpointCallback(azure_blob_url, azure_sas_token))
+    else:
+        if local_rank == 0:
+            logger.info("No Azure Blob credentials detected. Running in local mode (disk checkpoints only).")
+
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=processed_train_dataset,
-        eval_dataset=processed_val_dataset,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         data_collator=default_data_collator,
+        callbacks=callbacks,
     )
 
-    # 6. Execute Training
-    logger.info(f"Starting pre-training run...")
-    trainer.train()
-    logger.info("Pre-training run successfully completed!")
+    # Automatic Checkpoint Resumption Logic
+    checkpoint_to_resume = None
+    if os.path.exists(training_args.output_dir):
+        existing_checkpoints = [
+            d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")
+        ]
+        if existing_checkpoints:
+            checkpoint_to_resume = True
+            if local_rank == 0:
+                logger.info(f"Found existing checkpoint in '{training_args.output_dir}'. Resuming training...")
 
-    # 7. Clean Distributed Process Group & Hard Exit
+    if local_rank == 0:
+        logger.info("Starting pre-training run...")
+    trainer.train(resume_from_checkpoint=checkpoint_to_resume)
+    
+    if local_rank == 0:
+        logger.info("Pre-training run successfully completed!")
+
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
-    import os
-    logger.info("Exiting cleanly...")
     os._exit(0)
 
 

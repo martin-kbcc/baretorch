@@ -39,20 +39,46 @@ class GatedMLP(nn.Module):
 
 class RotaryEmbedding(nn.Module):
     """
-    Implements Rotary Position Embeddings (RoPE) natively in PyTorch.
-    Rotates Query and Key feature pairs based on relative token distance.
+    Implements Rotary Position Embeddings (RoPE) natively in PyTorch with
+    meta-device compatibility, dynamic buffer sanitization, and lazy cache computation.
     """
     def __init__(self, dim, max_position_embeddings=4096, base=10000):
         super().__init__()
         self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.max_seq_len_cached = max_position_embeddings
+
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq)
+        # Meta-compatible placeholder buffers
+        self.register_buffer("cos_cached", torch.empty(0), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0), persistent=False)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        if device.type == "meta":
+            return
+            
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def _is_cache_invalid(self, target_device, target_dtype, required_seq_len):
+        if self.cos_cached is None or self.cos_cached.numel() == 0 or self.cos_cached.is_meta:
+            return True
+        if self.cos_cached.device != target_device or self.cos_cached.dtype != target_dtype:
+            return True
+        if required_seq_len > self.max_seq_len_cached:
+            return True
+        if torch.isnan(self.cos_cached).any() or torch.isinf(self.cos_cached).any():
+            return True
+        return False
 
     def _rotate_half(self, x):
         x1 = x[..., :self.dim // 2]
@@ -60,12 +86,23 @@ class RotaryEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x, seq_len=None):
+        if seq_len is None:
+            seq_len = x.shape[1]
+
+        if self._is_cache_invalid(x.device, x.dtype, seq_len):
+            self._set_cos_sin_cache(seq_len=max(seq_len, self.max_position_embeddings), device=x.device, dtype=x.dtype)
+
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
     def apply_rope(self, q, k, position_ids):
+        max_pos = position_ids.max().item() + 1 if position_ids.numel() > 0 else 1
+
+        if self._is_cache_invalid(q.device, q.dtype, max_pos):
+            self._set_cos_sin_cache(seq_len=max(max_pos, self.max_position_embeddings), device=q.device, dtype=q.dtype)
+
         cos = self.cos_cached[position_ids].unsqueeze(1) # [B, 1, L, d_h]
         sin = self.sin_cached[position_ids].unsqueeze(1) # [B, 1, L, d_h]
-        
+
         q_embed = (q * cos) + (self._rotate_half(q) * sin)
         k_embed = (k * cos) + (self._rotate_half(k) * sin)
         return q_embed, k_embed
@@ -119,8 +156,6 @@ class CausalSelfAttention(nn.Module):
             k = torch.repeat_interleave(k, self.num_queries_per_kv, dim=1)
             v = torch.repeat_interleave(v, self.num_queries_per_kv, dim=1)
             
-        # If past_kv is None, we run a full prefill/parallel causal attention step.
-        # Otherwise, we are decoding a single token where the key/value contain the full history.
         is_causal_mask = (past_kv is None)
         
         out = F.scaled_dot_product_attention(
@@ -266,7 +301,6 @@ class TransformerModel(TransformerPreTrainedModel):
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
         
-        # Calculate Position IDs dynamically if not provided
         if position_ids is None:
             past_length = past_key_values[0][0].size(-2) if past_key_values is not None else 0
             position_ids = torch.arange(

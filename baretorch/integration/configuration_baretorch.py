@@ -56,6 +56,7 @@ class BareTorchConfig(PretrainedConfig):
         self.dropout = dropout
         self.max_seq_len = max_seq_len
         self.use_grad_checkpointing = use_grad_checkpointing
+        self.use_cache = kwargs.get("use_cache", True)
 
         # If no explicit layer order is specified, default to an alternating rotation
         if layer_types is None:

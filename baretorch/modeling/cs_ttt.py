@@ -95,7 +95,7 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.v_norm = RMSNorm(self.head_dim)
         
-        # Learnable inner-loop learning rate (sigmoid bounded to safe scaling [0.0, 1.0])
+        # Learnable inner-loop learning rate
         self.ttt_lr = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x, past_state=None, use_cache=False):
@@ -105,9 +105,9 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
         C = self.chunk_size
         
         # 1. Project to Head Space
-        q = self.q_proj(x).view(B, L, H, D).transpose(1, 2) # (B, H, L, D)
-        k = self.k_proj(x).view(B, L, H, D).transpose(1, 2) # (B, H, L, D)
-        v = self.v_proj(x).view(B, L, H, D).transpose(1, 2) # (B, H, L, D)
+        q = self.q_proj(x).view(B, L, H, D).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, H, D).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, H, D).transpose(1, 2)
         
         # 2. Regularize projection variances
         q = self.q_norm(q)
@@ -120,23 +120,25 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
         if is_step_inference:
             S = past_state if past_state is not None else torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
             
-            # Single-step gradient update
-            preds = torch.matmul(k, S) # (B, H, 1, D)
-            error = preds - v          # (B, H, 1, D)
-            grad = torch.matmul(k.transpose(-1, -2), error) # (B, H, D, D)
+            # 1. Prediction using state S BEFORE current step update (matching prefill order)
+            out = torch.matmul(q, S)
+            out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
+            out = self.out_proj(out)
             
-            # NLMS-style learning rate normalization
-            k_norm_sq = torch.sum(k * k, dim=(-1, -2), keepdim=True) # (B, H, 1, 1)
+            # 2. Compute step gradient update (scaled by chunk_size C for prefill alignment)
+            preds = torch.matmul(k, S)
+            error = preds - v
+            grad = torch.matmul(k.transpose(-1, -2), error) / C
+            
+            # 3. NLMS learning rate divisor
+            k_norm_sq = torch.sum(k * k, dim=(-1, -2), keepdim=True)
             scaled_lr = torch.sigmoid(self.ttt_lr) * 1.0
             effective_lr = scaled_lr / (k_norm_sq + 1e-5)
             
-            S = S - effective_lr * grad
+            # 4. State update for next step
+            next_S = S - effective_lr * grad
             
-            # Forward prediction
-            out = torch.matmul(q, S) # (B, H, 1, D)
-            out = out.transpose(1, 2).contiguous().view(B, L, self.d_model)
-            out = self.out_proj(out)
-            return out, S
+            return out, next_S
             
         # ----------------- PARALLEL PREFILL PATH -----------------
         else:
@@ -149,7 +151,6 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
             total_len = L + pad_len
             num_chunks = total_len // C
             
-            # Divide into chunks along sequence dimension: (B, H, num_chunks, C, D)
             q_chunks = q.view(B, H, num_chunks, C, D)
             k_chunks = k.view(B, H, num_chunks, C, D)
             v_chunks = v.view(B, H, num_chunks, C, D)
@@ -158,29 +159,24 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
             outputs_list = []
             scaled_lr = torch.sigmoid(self.ttt_lr) * 1.0
             
-            # Process chunks sequentially to track dynamic adaptation state
             for i in range(num_chunks):
-                K_i = k_chunks[:, :, i] # (B, H, C, D)
-                V_i = v_chunks[:, :, i] # (B, H, C, D)
-                Q_i = q_chunks[:, :, i] # (B, H, C, D)
+                K_i = k_chunks[:, :, i]
+                V_i = v_chunks[:, :, i]
+                Q_i = q_chunks[:, :, i]
                 
-                # Fetch prediction under current adapted weights S
-                out_i = torch.matmul(Q_i, S) # (B, H, C, D)
+                out_i = torch.matmul(Q_i, S)
                 outputs_list.append(out_i)
                 
-                # Perform in-context training step on current chunk
-                preds = torch.matmul(K_i, S) # (B, H, C, D)
-                error = preds - V_i          # (B, H, C, D)
-                grad = torch.matmul(K_i.transpose(-1, -2), error) / C # (B, H, D, D)
+                preds = torch.matmul(K_i, S)
+                error = preds - V_i
+                grad = torch.matmul(K_i.transpose(-1, -2), error) / C
                 
-                # Compute NLMS-style divisor to keep the update contraction stable
-                k_norm_sq = torch.sum(K_i * K_i, dim=(-1, -2), keepdim=True) # (B, H, 1, 1)
+                k_norm_sq = torch.sum(K_i * K_i, dim=(-1, -2), keepdim=True)
                 effective_lr = scaled_lr / (k_norm_sq + 1e-5)
                 
                 S = S - effective_lr * grad
                 
-            # Flatten outputs
-            out = torch.stack(outputs_list, dim=2) # (B, H, num_chunks, C, D)
+            out = torch.stack(outputs_list, dim=2)
             out = out.view(B, H, total_len, D)
             
             if pad_len > 0:
@@ -190,10 +186,6 @@ class ChunkwiseTestTimeTrainingEngine(nn.Module):
             out = self.out_proj(out)
             return out, S
 
-
-# ==========================================
-# 3. Model Architecture Assemblers
-# ==========================================
 
 class TTTDecoderBlock(nn.Module):
     def __init__(self, d_model, num_heads, chunk_size=32, rank=8, dropout=0.1, use_grad_checkpointing=False):
@@ -205,7 +197,6 @@ class TTTDecoderBlock(nn.Module):
         self.mlp = GatedMLP(d_model, dropout)
 
     def forward(self, x, past_state=None, use_cache=False):
-        # TTT sequence adaptation pass
         residual = x
         normed_x = self.norm1(x)
         if self.use_grad_checkpointing and self.training:
@@ -214,7 +205,6 @@ class TTTDecoderBlock(nn.Module):
             ttt_out, next_state = self.ttt(normed_x, past_state, use_cache)
         x = residual + ttt_out
 
-        # Standard gated SwiGLU MLP pass
         residual = x
         x = residual + self.mlp(self.norm2(x))
         return x, next_state
@@ -407,7 +397,7 @@ class CSTTTForCausalLM(CSTTTPreTrainedModel):
 
     def _reorder_cache(self, past_key_values, beam_idx):
         reordered_past = ()
-        for i, layer_past in enumerate(past_key_values):
+        for layer_past in past_key_values:
             if layer_past is None:
                 reordered_past += (None,)
             else:

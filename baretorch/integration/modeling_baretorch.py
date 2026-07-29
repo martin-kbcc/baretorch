@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM
+from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
 # Absolute imports of our modular layer-specific configs and architectures
@@ -31,6 +31,8 @@ class BareTorchPreTrainedModel(PreTrainedModel):
     config_class = BareTorchConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_cache_class = False
+    _supports_static_cache = False
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -39,6 +41,28 @@ class BareTorchPreTrainedModel(PreTrainedModel):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _set_gradient_checkpointing(self, module, value=True, **kwargs):
+        """
+        Hugging Face registration hook to enable/disable gradient checkpointing 
+        dynamically across BareTorch's custom layer architectures.
+        """
+        if isinstance(module, (BareTorchModel, BareTorchForCausalLM)):
+            module.gradient_checkpointing = value
+            if hasattr(module, "config"):
+                module.config.use_grad_checkpointing = value
+        if hasattr(module, "use_grad_checkpointing"):
+            module.use_grad_checkpointing = value
+            module.gradient_checkpointing = value
+
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        """
+        Bypasses Hugging Face's default DynamicCache initialization to allow
+        BareTorch's heterogeneous sequence mixers (Transformer, CS-LRAD, CS-TTT)
+        to handle state caching using native tuple/tensor state lists.
+        """
+        if "past_key_values" not in model_kwargs:
+            model_kwargs["past_key_values"] = None
 
 
 class BareTorchModel(BareTorchPreTrainedModel):
@@ -166,6 +190,10 @@ class BareTorchModel(BareTorchPreTrainedModel):
             # Heterogeneous routing logic based on block architecture
             if isinstance(layer, TransformerDecoderBlock):
                 h, next_state = layer(h, past_kv=past_state, position_ids=position_ids)
+                # Trim KV cache vectors produced by chunk-padding during prefill
+                if not is_step_inference and pad_len > 0 and next_state is not None:
+                    k, v = next_state
+                    next_state = (k[:, :, :seq_length, :], v[:, :, :seq_length, :])
             elif isinstance(layer, LRADDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
             elif isinstance(layer, TTTDecoderBlock):
@@ -193,7 +221,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         )
 
 
-class BareTorchForCausalLM(BareTorchPreTrainedModel):
+class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.token_embedding.weight"}
 
     def __init__(self, config):
@@ -295,10 +323,7 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel):
 # 2. Global Hugging Face Model Registration
 # ==========================================
 
-# Register to global AutoModel registry
 AutoModel.register(BareTorchConfig, BareTorchModel)
-
-# Register all model classes to standard AutoModelForCausalLM registry
 AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM)
 AutoModelForCausalLM.register(CSLRADConfig, CSLRADForCausalLM)
 AutoModelForCausalLM.register(TransformerConfig, TransformerForCausalLM)

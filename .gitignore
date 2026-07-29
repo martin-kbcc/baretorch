@@ -1,5 +1,6 @@
 # --- Large Model Checkpoints & Shards ---
 output_*/
+checkpoints_*/
 runs/
 *.pt
 *.pth
@@ -11,6 +12,8 @@ runs/
 .cache/
 huggingface/
 data/
+raw_dclm_parquet/
+tokenized_bin/
 
 # --- Python & Environment Files ---
 __pycache__/
