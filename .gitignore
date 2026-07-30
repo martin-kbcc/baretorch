@@ -25,3 +25,8 @@ venv/
 env/
 miniconda3/
 baretorch.egg-info/
+
+# --- Ignore local configs and secrets
+*.conf
+.env
+rclone.conf

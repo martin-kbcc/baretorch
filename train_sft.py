@@ -1,6 +1,7 @@
 import os
 import argparse
 import logging
+import subprocess
 import torch
 import numpy as np
 from datasets import load_dataset
@@ -9,6 +10,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorForSeq2Seq,
+    TrainerCallback,
 )
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
@@ -22,6 +24,40 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
+
+
+# ==============================================================================
+#                     Cloudflare R2 Background Sync Callback
+# ==============================================================================
+class R2CheckpointCallback(TrainerCallback):
+    """
+    Hugging Face Trainer Callback that automatically syncs newly saved 
+    checkpoints to Cloudflare R2 asynchronously using rclone.
+    Does not block active GPU training execution.
+    """
+    def __init__(self, bucket_name: str = "baretorch-data", remote_name: str = "r2", prefix: str = "checkpoints"):
+        self.bucket_name = bucket_name
+        self.remote_name = remote_name
+        self.prefix = prefix.strip("/")
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            checkpoint_dir = f"checkpoint-{state.global_step}"
+            local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
+            
+            if os.path.exists(local_ckpt_path):
+                rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+                target_r2_path = f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
+                
+                logger.info(f"\n[R2 Sync] Uploading {checkpoint_dir} to Cloudflare R2 ({target_r2_path}) in background...")
+                cmd = [
+                    "rclone", "copy",
+                    local_ckpt_path,
+                    target_r2_path,
+                    "--transfers", "4",
+                    "--s3-chunk-size", "64M"
+                ]
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def preprocess_chatml_example(example, tokenizer, max_seq_len=2048):
@@ -95,6 +131,11 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--seq_len", type=int, default=2048)
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    
+    # Cloud Storage / Sync
+    parser.add_argument("--r2_sync", action="store_true", help="Enable background checkpoint syncing to Cloudflare R2 via rclone.")
+    parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="Cloudflare R2 bucket name.")
+    parser.add_argument("--r2_prefix", type=str, default="checkpoints", help="Prefix path inside R2 bucket.")
     
     args = parser.parse_args()
 
@@ -183,6 +224,20 @@ def main():
         dataloader_pin_memory=True,
     )
 
+    # Detect R2 sync activation via argument or environment variables
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
+    r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
+
+    callbacks = []
+    if enable_r2_sync:
+        if local_rank == 0:
+            logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'")
+        callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
+    else:
+        if local_rank == 0:
+            logger.info("R2 sync disabled. Running in local mode (disk checkpoints only).")
+
     # Sequence padding collator guaranteed to pad to multiples of 32 for CS-LRAD/CS-TTT
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
@@ -198,6 +253,7 @@ def main():
         train_dataset=train_data,
         eval_dataset=val_data,
         data_collator=data_collator,
+        callbacks=callbacks,
     )
 
     # 5. Launch Supervised Fine-Tuning
@@ -212,6 +268,20 @@ def main():
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         logger.info("✅ Stage 1: Supervised Fine-Tuning completed successfully!")
+
+        if enable_r2_sync:
+            rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+            target_r2_path = f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}"
+            logger.info(f"📤 Syncing final SFT model weights to Cloudflare R2 ({target_r2_path})...")
+            cmd = [
+                "rclone", "copy",
+                args.output_dir,
+                target_r2_path,
+                "--transfers", "8",
+                "--s3-chunk-size", "64M"
+            ]
+            subprocess.run(cmd, check=False)
+            logger.info("✅ Final SFT weights successfully uploaded to Cloudflare R2!")
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

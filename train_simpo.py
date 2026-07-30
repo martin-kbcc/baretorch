@@ -28,7 +28,7 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 # ==============================================================================
-#                             DDP Environment Setup
+#                              DDP Environment Setup
 # ==============================================================================
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -47,25 +47,27 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def sync_azure_checkpoint(local_ckpt_path: str, output_dir: str):
-    """Asynchronously syncs checkpoint to Azure Blob Storage if credentials exist."""
-    blob_url = os.environ.get("AZURE_BLOB_URL", "").strip().rstrip("/")
-    sas_token = os.environ.get("AZURE_SAS_TOKEN", "").strip().lstrip("?")
-    
-    if blob_url and sas_token and os.path.exists(local_ckpt_path):
-        ckpt_name = os.path.basename(os.path.normpath(local_ckpt_path))
-        rel_output_dir = os.path.basename(os.path.normpath(output_dir))
-        target_blob_url = f"{blob_url}/{rel_output_dir}/{ckpt_name}?{sas_token}"
+def sync_r2_checkpoint(local_ckpt_path: str, output_dir: str, r2_bucket: str = "baretorch-data", r2_prefix: str = "checkpoints", sync_async: bool = True):
+    """Syncs checkpoint to Cloudflare R2 via rclone."""
+    if not os.path.exists(local_ckpt_path):
+        return
         
-        logger.info(f"[Azure Sync] Syncing {ckpt_name} to Azure Blob Storage...")
-        cmd = [
-            "azcopy", "copy",
-            local_ckpt_path,
-            target_blob_url,
-            "--recursive=true",
-            "--overwrite=true"
-        ]
+    ckpt_name = os.path.basename(os.path.normpath(local_ckpt_path))
+    rel_output_dir = os.path.basename(os.path.normpath(output_dir))
+    target_r2_path = f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}/{ckpt_name}"
+    
+    logger.info(f"[R2 Sync] Syncing {ckpt_name} to Cloudflare R2 ({target_r2_path})...")
+    cmd = [
+        "rclone", "copy",
+        local_ckpt_path,
+        target_r2_path,
+        "--transfers", "4",
+        "--s3-chunk-size", "64M"
+    ]
+    if sync_async:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd, check=False)
 
 # ==============================================================================
 #                       Preference Dataset (ChatML Format)
@@ -140,7 +142,7 @@ def pad_collate(batch, pad_id, pad_to_multiple_of=32):
     }
 
 # ==============================================================================
-#                  Length-Normalized Log Probability Computation
+#                 Length-Normalized Log Probability Computation
 # ==============================================================================
 def compute_log_probs(model, input_ids, labels):
     """Computes length-normalized per-sequence log probabilities in bf16 autocast context."""
@@ -162,7 +164,7 @@ def compute_log_probs(model, input_ids, labels):
         return avg_log_probs
 
 # ==============================================================================
-#                      Distributed Validation Evaluation Loop
+#                     Distributed Validation Evaluation Loop
 # ==============================================================================
 @torch.no_grad()
 def evaluate_simpo(model, val_loader, args, local_rank, world_size):
@@ -218,14 +220,27 @@ def main():
     parser.add_argument("--save_steps", type=int, default=100, help="Save intermediate checkpoint every N optimization steps.")
     parser.add_argument("--seq_len", type=int, default=2048, help="Maximum sequence length cap.")
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    
+    # Cloud Storage / Sync
+    parser.add_argument("--r2_sync", action="store_true", help="Enable background checkpoint syncing to Cloudflare R2 via rclone.")
+    parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="Cloudflare R2 bucket name.")
+    parser.add_argument("--r2_prefix", type=str, default="checkpoints", help="Prefix path inside R2 bucket.")
+    
     args = parser.parse_args()
 
     local_rank, global_rank, world_size = setup_ddp()
     is_main = (global_rank == 0)
 
+    # Detect R2 sync configuration
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
+    r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
+
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         logger.info(f"🚀 Initializing BareTorch SimPO DDP Training across {world_size} GPU(s)...")
+        if enable_r2_sync:
+            logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'")
 
     # 1. Tokenizer Setup with ChatML Special Tokens
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -357,7 +372,8 @@ def main():
                     logger.info(f"💾 Saving intermediate checkpoint to '{ckpt_dir}'...")
                     unwrapped_model.save_pretrained(ckpt_dir)
                     tokenizer.save_pretrained(ckpt_dir)
-                    sync_azure_checkpoint(ckpt_dir, args.output_dir)
+                    if enable_r2_sync:
+                        sync_r2_checkpoint(ckpt_dir, args.output_dir, r2_bucket, r2_prefix, sync_async=True)
 
     # Save final aligned checkpoint and tokenizer
     if is_main:
@@ -366,7 +382,8 @@ def main():
         unwrapped_model.save_pretrained(final_path)
         tokenizer.save_pretrained(final_path)
         
-        sync_azure_checkpoint(final_path, args.output_dir)
+        if enable_r2_sync:
+            sync_r2_checkpoint(final_path, args.output_dir, r2_bucket, r2_prefix, sync_async=False)
         logger.info("✅ Stage 2: SimPO Preference Alignment completed successfully!")
 
     cleanup_ddp()

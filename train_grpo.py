@@ -31,7 +31,7 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 # ==============================================================================
-#                             DDP Environment Setup
+#                              DDP Environment Setup
 # ==============================================================================
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -50,28 +50,30 @@ def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def sync_azure_checkpoint(local_ckpt_path: str, output_dir: str):
-    """Asynchronously syncs checkpoint to Azure Blob Storage if credentials exist."""
-    blob_url = os.environ.get("AZURE_BLOB_URL", "").strip().rstrip("/")
-    sas_token = os.environ.get("AZURE_SAS_TOKEN", "").strip().lstrip("?")
-    
-    if blob_url and sas_token and os.path.exists(local_ckpt_path):
-        ckpt_name = os.path.basename(os.path.normpath(local_ckpt_path))
-        rel_output_dir = os.path.basename(os.path.normpath(output_dir))
-        target_blob_url = f"{blob_url}/{rel_output_dir}/{ckpt_name}?{sas_token}"
+def sync_r2_checkpoint(local_ckpt_path: str, output_dir: str, r2_bucket: str = "baretorch-data", r2_prefix: str = "checkpoints", sync_async: bool = True):
+    """Syncs checkpoint to Cloudflare R2 via rclone."""
+    if not os.path.exists(local_ckpt_path):
+        return
         
-        logger.info(f"[Azure Sync] Syncing {ckpt_name} to Azure Blob Storage...")
-        cmd = [
-            "azcopy", "copy",
-            local_ckpt_path,
-            target_blob_url,
-            "--recursive=true",
-            "--overwrite=true"
-        ]
+    ckpt_name = os.path.basename(os.path.normpath(local_ckpt_path))
+    rel_output_dir = os.path.basename(os.path.normpath(output_dir))
+    target_r2_path = f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}/{ckpt_name}"
+    
+    logger.info(f"[R2 Sync] Syncing {ckpt_name} to Cloudflare R2 ({target_r2_path})...")
+    cmd = [
+        "rclone", "copy",
+        local_ckpt_path,
+        target_r2_path,
+        "--transfers", "4",
+        "--s3-chunk-size", "64M"
+    ]
+    if sync_async:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd, check=False)
 
 # ==============================================================================
-#                       CSV Metric Logger Utility
+#                        CSV Metric Logger Utility
 # ==============================================================================
 def log_csv_metrics(csv_path: str, step: int, epoch: int, loss: float, train_acc: float, train_fmt: float, lr: float, val_acc: float = None, val_fmt: float = None):
     """Appends training and validation metrics to a structured CSV file."""
@@ -271,14 +273,27 @@ def main():
     parser.add_argument("--max_prompt_len", type=int, default=512, help="Prompt context token cap.")
     parser.add_argument("--max_completion_len", type=int, default=512, help="Max new rollout completion tokens.")
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    
+    # Cloud Storage / Sync
+    parser.add_argument("--r2_sync", action="store_true", help="Enable background checkpoint syncing to Cloudflare R2 via rclone.")
+    parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="Cloudflare R2 bucket name.")
+    parser.add_argument("--r2_prefix", type=str, default="checkpoints", help="Prefix path inside R2 bucket.")
+    
     args = parser.parse_args()
 
     local_rank, global_rank, world_size = setup_ddp()
     is_main = (global_rank == 0)
 
+    # Detect R2 sync activation
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
+    r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
+
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         logger.info(f"🚀 Initializing BareTorch GRPO DDP Training across {world_size} GPU(s)...")
+        if enable_r2_sync:
+            logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'")
 
     # Metrics CSV File Path
     csv_metrics_path = os.path.join(args.output_dir, "metrics.csv")
@@ -559,7 +574,8 @@ def main():
                     with open(os.path.join(ckpt_dir, "training_state.json"), "w", encoding="utf-8") as f:
                         json.dump({"global_step": global_step, "epoch": epoch + 1}, f, indent=2)
 
-                    sync_azure_checkpoint(ckpt_dir, args.output_dir)
+                    if enable_r2_sync:
+                        sync_r2_checkpoint(ckpt_dir, args.output_dir, r2_bucket, r2_prefix, sync_async=True)
 
     # Save final aligned model
     if is_main:
@@ -573,7 +589,8 @@ def main():
         with open(os.path.join(final_path, "training_state.json"), "w", encoding="utf-8") as f:
             json.dump({"global_step": global_step, "epoch": args.num_epochs}, f, indent=2)
 
-        sync_azure_checkpoint(final_path, args.output_dir)
+        if enable_r2_sync:
+            sync_r2_checkpoint(final_path, args.output_dir, r2_bucket, r2_prefix, sync_async=False)
         logger.info("✅ Stage 3: Rule-Based RL (GRPO) Alignment completed successfully!")
 
     cleanup_ddp()

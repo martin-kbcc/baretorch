@@ -47,17 +47,18 @@ MODEL_MAP = {
 
 
 # ==============================================================================
-#                        Azure Blob Storage Sync Callback
+#                     Cloudflare R2 Background Sync Callback
 # ==============================================================================
-class AzureBlobCheckpointCallback(TrainerCallback):
+class R2CheckpointCallback(TrainerCallback):
     """
     Hugging Face Trainer Callback that automatically syncs newly saved 
-    checkpoints to Azure Blob Storage asynchronously using azcopy.
-    Does nothing if Azure credentials are not configured.
+    checkpoints to Cloudflare R2 asynchronously using rclone.
+    Does not block active GPU training execution.
     """
-    def __init__(self, blob_url: str, sas_token: str):
-        self.blob_url = blob_url.rstrip("/")
-        self.sas_token = sas_token.lstrip("?")
+    def __init__(self, bucket_name: str = "baretorch-data", remote_name: str = "r2", prefix: str = "checkpoints"):
+        self.bucket_name = bucket_name
+        self.remote_name = remote_name
+        self.prefix = prefix.strip("/")
 
     def on_save(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -66,21 +67,21 @@ class AzureBlobCheckpointCallback(TrainerCallback):
             
             if os.path.exists(local_ckpt_path):
                 rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
-                target_blob_url = f"{self.blob_url}/{rel_output_dir}/{checkpoint_dir}?{self.sas_token}"
+                target_r2_path = f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
                 
-                logger.info(f"\n[Azure Sync] Uploading {checkpoint_dir} to Azure Blob Storage in background...")
+                logger.info(f"\n[R2 Sync] Uploading {checkpoint_dir} to Cloudflare R2 ({target_r2_path}) in background...")
                 cmd = [
-                    "azcopy", "copy",
+                    "rclone", "copy",
                     local_ckpt_path,
-                    target_blob_url,
-                    "--recursive=true",
-                    "--overwrite=true"
+                    target_r2_path,
+                    "--transfers", "4",
+                    "--s3-chunk-size", "64M"
                 ]
                 subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ==============================================================================
-#                  Zero-Copy Memory-Mapped Binary Dataset
+#                 Zero-Copy Memory-Mapped Binary Dataset
 # ==============================================================================
 class MemmapDataset(Dataset):
     """
@@ -203,6 +204,11 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--seq_len", type=int, default=2048)
     
+    # Cloud Storage / Sync
+    parser.add_argument("--r2_sync", action="store_true", help="Enable background checkpoint syncing to Cloudflare R2 via rclone.")
+    parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="Cloudflare R2 bucket name.")
+    parser.add_argument("--r2_prefix", type=str, default="checkpoints", help="Prefix path inside R2 bucket.")
+    
     # Engine Configurations
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--grad_checkpointing", action="store_true")
@@ -283,18 +289,19 @@ def main():
         dataloader_pin_memory=True,
     )
 
-    # Detect optional Azure credentials for cloud checkpoint syncing
-    azure_blob_url = os.environ.get("AZURE_BLOB_URL", "").strip()
-    azure_sas_token = os.environ.get("AZURE_SAS_TOKEN", "").strip()
+    # Detect R2 sync activation via argument or environment variables
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
+    r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
 
     callbacks = []
-    if azure_blob_url and azure_sas_token:
+    if enable_r2_sync:
         if local_rank == 0:
-            logger.info("Azure Blob credentials detected. Background checkpoint cloud sync activated.")
-        callbacks.append(AzureBlobCheckpointCallback(azure_blob_url, azure_sas_token))
+            logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'")
+        callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
     else:
         if local_rank == 0:
-            logger.info("No Azure Blob credentials detected. Running in local mode (disk checkpoints only).")
+            logger.info("R2 sync disabled. Running in local mode (disk checkpoints only).")
 
     trainer = Trainer(
         model=model,
