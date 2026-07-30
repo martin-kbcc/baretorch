@@ -27,7 +27,7 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 
 
 # ==============================================================================
-#                     Cloudflare R2 Background Sync Callback
+#                        Cloudflare R2 Background Sync Callback
 # ==============================================================================
 class R2CheckpointCallback(TrainerCallback):
     """
@@ -130,6 +130,7 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--compile", action="store_true", help="Enable targeted torch.compile for CS-LRAD sub-modules.")
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     
     # Cloud Storage / Sync
@@ -167,6 +168,19 @@ def main():
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = False  # Disable KV caching during training
     model.config.use_grad_checkpointing = args.grad_checkpointing
+
+    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
+    if args.compile:
+        if local_rank == 0:
+            logger.info("⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules...")
+        compiled_blocks = 0
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+        if local_rank == 0:
+            logger.info(f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s).")
 
     # 3. Load & Process Dataset
     if local_rank == 0:
@@ -217,6 +231,7 @@ def main():
         save_steps=200,
         save_total_limit=2,
         report_to="tensorboard",
+        torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
         gradient_checkpointing=args.grad_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,

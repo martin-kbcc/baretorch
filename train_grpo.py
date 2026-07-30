@@ -31,7 +31,7 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 # ==============================================================================
-#                              DDP Environment Setup
+#                                DDP Environment Setup
 # ==============================================================================
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -183,7 +183,7 @@ def pad_collate_grpo(batch, pad_id):
     }
 
 # ==============================================================================
-#                  Per-Token Log Probabilities Computation
+#                 Per-Token Log Probabilities Computation
 # ==============================================================================
 def compute_per_token_log_probs(model, input_ids, prompt_len, pad_token_id):
     """Computes log probabilities strictly for completion tokens (left-padding aligned)."""
@@ -252,7 +252,7 @@ def evaluate_grpo(model, val_loader, tokenizer, args, local_rank, world_size):
     return avg_acc, avg_fmt
 
 # ==============================================================================
-#                           Main Training Routine
+#                            Main Training Routine
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(description="BareTorch Stage 3: Rule-Based RL (GRPO / RLVR) Engine")
@@ -272,6 +272,7 @@ def main():
     parser.add_argument("--save_steps", type=int, default=50, help="Save intermediate checkpoint every N steps.")
     parser.add_argument("--max_prompt_len", type=int, default=512, help="Prompt context token cap.")
     parser.add_argument("--max_completion_len", type=int, default=512, help="Max new rollout completion tokens.")
+    parser.add_argument("--compile", action="store_true", help="Enable targeted torch.compile for CS-LRAD sub-modules.")
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     
     # Cloud Storage / Sync
@@ -324,6 +325,25 @@ def main():
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
+
+    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
+    if args.compile:
+        if is_main:
+            logger.info("⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules...")
+        compiled_blocks = 0
+        for name, module in actor_model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+
+        for name, module in ref_model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+
+        if is_main:
+            logger.info(f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s) across models.")
 
     if world_size > 1:
         actor_model = DDP(actor_model, device_ids=[local_rank], find_unused_parameters=False)

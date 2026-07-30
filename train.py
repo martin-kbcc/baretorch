@@ -47,7 +47,7 @@ MODEL_MAP = {
 
 
 # ==============================================================================
-#                     Cloudflare R2 Background Sync Callback
+#                        Cloudflare R2 Background Sync Callback
 # ==============================================================================
 class R2CheckpointCallback(TrainerCallback):
     """
@@ -81,7 +81,7 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 # ==============================================================================
-#                 Zero-Copy Memory-Mapped Binary Dataset
+#                Zero-Copy Memory-Mapped Binary Dataset
 # ==============================================================================
 class MemmapDataset(Dataset):
     """
@@ -255,6 +255,19 @@ def main():
 
     config = config_cls(**config_args)
     model = model_cls(config)
+
+    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
+    if args.compile:
+        if local_rank == 0:
+            logger.info("⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules...")
+        compiled_blocks = 0
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+        if local_rank == 0:
+            logger.info(f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s).")
     
     total_params = sum(p.numel() for p in model.parameters())
     if local_rank == 0:
@@ -281,7 +294,7 @@ def main():
         save_total_limit=3,
         report_to="tensorboard",
         logging_dir=f"./runs/{args.model_type}",
-        torch_compile=args.compile,
+        torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
         gradient_checkpointing=args.grad_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,

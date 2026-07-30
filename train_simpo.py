@@ -28,7 +28,7 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 
 # ==============================================================================
-#                              DDP Environment Setup
+#                                DDP Environment Setup
 # ==============================================================================
 def setup_ddp():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -70,7 +70,7 @@ def sync_r2_checkpoint(local_ckpt_path: str, output_dir: str, r2_bucket: str = "
         subprocess.run(cmd, check=False)
 
 # ==============================================================================
-#                       Preference Dataset (ChatML Format)
+#                        Preference Dataset (ChatML Format)
 # ==============================================================================
 class PreferenceDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length=2048):
@@ -202,7 +202,7 @@ def evaluate_simpo(model, val_loader, args, local_rank, world_size):
     return avg_loss, avg_margin
 
 # ==============================================================================
-#                           Main Training Routine
+#                            Main Training Routine
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(description="BareTorch Stage 2: SimPO Preference Alignment Engine")
@@ -219,6 +219,7 @@ def main():
     parser.add_argument("--eval_steps", type=int, default=50, help="Run validation evaluation every N optimization steps.")
     parser.add_argument("--save_steps", type=int, default=100, help="Save intermediate checkpoint every N optimization steps.")
     parser.add_argument("--seq_len", type=int, default=2048, help="Maximum sequence length cap.")
+    parser.add_argument("--compile", action="store_true", help="Enable targeted torch.compile for CS-LRAD sub-modules.")
     parser.add_argument("--grad_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     
     # Cloud Storage / Sync
@@ -258,6 +259,19 @@ def main():
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = False  # Disable KV cache during training
     model.config.use_grad_checkpointing = args.grad_checkpointing
+
+    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
+    if args.compile:
+        if is_main:
+            logger.info("⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules...")
+        compiled_blocks = 0
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+        if is_main:
+            logger.info(f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s).")
 
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
