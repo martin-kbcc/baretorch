@@ -3,7 +3,7 @@ set -e
 
 # ==============================================================================
 #      BareTorch Stage 2.5: Cold-Start CoT SFT Warmup Launcher (Cloud 0.5B)
-#             Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
+#              Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
 # ==============================================================================
 
 # CUDA Memory Management & Distributed NCCL Tuning
@@ -13,7 +13,7 @@ export TORCH_CPP_MIN_LOG_LEVEL=2
 export NCCL_DEBUG=WARN
 
 # ==============================================================================
-#                             Hardware & Cluster Config
+#                               Hardware & Cluster Config
 # ==============================================================================
 NUM_GPUS=4
 
@@ -24,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PRETRAINED_CKPT="${BASE_DIR}/checkpoints_500m_simpo/checkpoint-simpo-final"
 OUTPUT_DIR="${BASE_DIR}/checkpoints_500m_sft_cold_start"
+TOKENIZER_NAME="HuggingFaceTB/SmolLM2-360M"
 
 # Cloudflare R2 Configurations
 R2_BUCKET="baretorch-data"
@@ -31,7 +32,7 @@ R2_PREFIX="checkpoints"
 R2_REMOTE_SIMPO_PATH="r2:${R2_BUCKET}/${R2_PREFIX}/checkpoints_500m_simpo/checkpoint-simpo-final"
 
 # ==============================================================================
-#                   Hyperparameters (Cold-Start CoT SFT)
+#                    Hyperparameters (Cold-Start CoT SFT)
 # ==============================================================================
 NUM_EPOCHS=2
 PER_GPU_BATCH_SIZE=16     # Per-GPU batch size
@@ -51,6 +52,7 @@ echo "==========================================================================
 echo "🚀 LAUNCHING COLD-START CoT SFT WARMUP ON ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
 echo "================================================================================"
 echo "• Base Checkpoint   : ${PRETRAINED_CKPT}"
+echo "• Tokenizer         : ${TOKENIZER_NAME}"
 echo "• Output Directory  : ${OUTPUT_DIR}"
 echo "• Active GPUs       : ${NUM_GPUS}x H100 (Distributed DDP)"
 echo "• Context Length    : ${SEQ_LEN} tokens"
@@ -89,6 +91,7 @@ torchrun \
     "${BASE_DIR}/train_sft_cold_start.py" \
     --pretrained_model_path "${PRETRAINED_CKPT}" \
     --output_dir "${OUTPUT_DIR}" \
+    --tokenizer_name "${TOKENIZER_NAME}" \
     --num_epochs "${NUM_EPOCHS}" \
     --batch_size "${PER_GPU_BATCH_SIZE}" \
     --grad_accum "${GRAD_ACCUM}" \

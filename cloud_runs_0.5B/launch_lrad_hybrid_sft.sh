@@ -2,8 +2,8 @@
 set -e
 
 # ==============================================================================
-#                 BareTorch Stage 1: SFT Launcher (Cloud 0.5B)
-#             Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
+#                  BareTorch Stage 1: SFT Launcher (Cloud 0.5B)
+#              Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
 # ==============================================================================
 
 # CUDA Memory Management & Distributed NCCL Tuning
@@ -13,19 +13,20 @@ export TORCH_CPP_MIN_LOG_LEVEL=2
 export NCCL_DEBUG=WARN
 
 # ==============================================================================
-#                             Hardware & Cluster Config
+#                               Hardware & Cluster Config
 # ==============================================================================
 NUM_GPUS=4
 
 # ==============================================================================
 #                        Checkpoint & Cloud Sync Config
 # ==============================================================================
-PRETRAINED_CHECKPOINT="./checkpoints_500m_hybrid_baretorch/checkpoint-47683"
+PRETRAINED_CHECKPOINT="./checkpoints_500m_hybrid_baretorch/checkpoint-240326"
 OUTPUT_DIR="./checkpoints_500m_sft"
+TOKENIZER_NAME="HuggingFaceTB/SmolLM2-360M"
 
 R2_BUCKET="baretorch-data"
 R2_PREFIX="checkpoints"
-R2_REMOTE_PATH="r2:${R2_BUCKET}/${R2_PREFIX}/checkpoints_500m_hybrid_baretorch/checkpoint-47683"
+R2_REMOTE_PATH="r2:${R2_BUCKET}/${R2_PREFIX}/checkpoints_500m_hybrid_baretorch/checkpoint-240326"
 
 # ==============================================================================
 #                   Dataset & Hyperparameters (Stage 1 SFT)
@@ -34,9 +35,9 @@ DATASET_NAME="HuggingFaceTB/smoltalk"
 DATASET_CONFIG="all"
 MAX_SAMPLES=0             # 0 = Use full dataset (~1M samples)
 
-PER_GPU_BATCH_SIZE=16     # Per-GPU batch size
-GRAD_ACCUM=2              # Global batch size = 4 GPUs * 16 batch * 2 accum = 128 sequences
-LEARNING_RATE=5e-5        # Optimal SFT learning rate for 500M parameter models
+PER_GPU_BATCH_SIZE=32     # Per-GPU batch size
+GRAD_ACCUM=2              # Global batch size = 4 GPUs * 32 batch * 2 accum = 256 sequences
+LEARNING_RATE=1.5e-4      # Optimal LR for sub-1B SFT to maximize instruction adherence
 WARMUP_STEPS=100
 WEIGHT_DECAY=0.01
 NUM_EPOCHS=1
@@ -51,10 +52,12 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 echo "======================================================================"
 echo "🚀 Launching BareTorch Stage 1: Supervised Fine-Tuning (SFT)..."
 echo "  ├─ Pre-trained Checkpoint : ${PRETRAINED_CHECKPOINT}"
+echo "  ├─ Tokenizer             : ${TOKENIZER_NAME}"
 echo "  ├─ Target Output Dir      : ${OUTPUT_DIR}"
 echo "  ├─ Hardware Config        : ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
 echo "  ├─ Dataset                : ${DATASET_NAME} (${DATASET_CONFIG})"
 echo "  ├─ Context Length         : ${SEQ_LEN} tokens"
+echo "  ├─ Learning Rate          : ${LEARNING_RATE}"
 echo "  ├─ Per-GPU Batch Size     : ${PER_GPU_BATCH_SIZE}"
 echo "  └─ Global Batch Size      : ${GLOBAL_BATCH_SEQS} seqs/step (${TOKENS_PER_STEP} tokens/step)"
 echo "======================================================================"
@@ -80,6 +83,7 @@ fi
 torchrun --nproc_per_node=${NUM_GPUS} train_sft.py \
     --pretrained_model_path "${PRETRAINED_CHECKPOINT}" \
     --output_dir "${OUTPUT_DIR}" \
+    --tokenizer_name "${TOKENIZER_NAME}" \
     --dataset_name "${DATASET_NAME}" \
     --dataset_config "${DATASET_CONFIG}" \
     --max_samples ${MAX_SAMPLES} \

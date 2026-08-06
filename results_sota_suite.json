@@ -1,0 +1,732 @@
+[
+  {
+    "hf_baseline": {
+      "model_name": "meta-llama/Llama-3.2-1B",
+      "param_count_m": 1235.81,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 58.3,
+          "tokens_per_sec": 89.41,
+          "peak_vram_mb": 3004.68,
+          "cache_memory_mb": 64.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.19,
+            "qualcomm_8_gen3": 25.38,
+            "iphone_16_pro": 63.44,
+            "apple_m3_max": 126.88
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 112.89,
+          "tokens_per_sec": 94.85,
+          "peak_vram_mb": 3640.7,
+          "cache_memory_mb": 128.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.0,
+            "qualcomm_8_gen3": 24.72,
+            "iphone_16_pro": 61.81,
+            "apple_m3_max": 123.62
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 244.69,
+          "tokens_per_sec": 85.54,
+          "peak_vram_mb": 4914.73,
+          "cache_memory_mb": 256.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 6.66,
+            "qualcomm_8_gen3": 23.51,
+            "iphone_16_pro": 58.78,
+            "apple_m3_max": 117.56
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 588.5,
+          "tokens_per_sec": 89.94,
+          "peak_vram_mb": 7462.79,
+          "cache_memory_mb": 512.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 6.07,
+            "qualcomm_8_gen3": 21.41,
+            "iphone_16_pro": 53.54,
+            "apple_m3_max": 107.07
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1423.79,
+          "tokens_per_sec": 96.14,
+          "peak_vram_mb": 12558.91,
+          "cache_memory_mb": 1024.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.15,
+            "qualcomm_8_gen3": 18.17,
+            "iphone_16_pro": 45.43,
+            "apple_m3_max": 90.86
+          }
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1237.1M)",
+      "param_count_m": 1237.1,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 44.36,
+          "tokens_per_sec": 245.5,
+          "peak_vram_mb": 3022.96,
+          "cache_memory_mb": 11.38,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.34,
+            "qualcomm_8_gen3": 25.91,
+            "iphone_16_pro": 64.78,
+            "apple_m3_max": 129.57
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 84.79,
+          "tokens_per_sec": 253.61,
+          "peak_vram_mb": 3569.61,
+          "cache_memory_mb": 22.44,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.31,
+            "qualcomm_8_gen3": 25.79,
+            "iphone_16_pro": 64.48,
+            "apple_m3_max": 128.97
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 167.98,
+          "tokens_per_sec": 253.52,
+          "peak_vram_mb": 4667.29,
+          "cache_memory_mb": 44.57,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.24,
+            "qualcomm_8_gen3": 25.56,
+            "iphone_16_pro": 63.89,
+            "apple_m3_max": 127.78
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 364.23,
+          "tokens_per_sec": 220.11,
+          "peak_vram_mb": 6865.33,
+          "cache_memory_mb": 88.82,
+          "roofline_fps": {
+            "raspberry_pi_5": 7.11,
+            "qualcomm_8_gen3": 25.09,
+            "iphone_16_pro": 62.73,
+            "apple_m3_max": 125.47
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 794.21,
+          "tokens_per_sec": 170.43,
+          "peak_vram_mb": 11260.96,
+          "cache_memory_mb": 177.32,
+          "roofline_fps": {
+            "raspberry_pi_5": 6.86,
+            "qualcomm_8_gen3": 24.22,
+            "iphone_16_pro": 60.55,
+            "apple_m3_max": 121.09
+          }
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+      "param_count_m": 1543.71,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 70.67,
+          "tokens_per_sec": 52.27,
+          "peak_vram_mb": 3679.26,
+          "cache_memory_mb": 56.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.8,
+            "qualcomm_8_gen3": 20.48,
+            "iphone_16_pro": 51.19,
+            "apple_m3_max": 102.39
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 146.36,
+          "tokens_per_sec": 54.07,
+          "peak_vram_mb": 4377.36,
+          "cache_memory_mb": 112.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.7,
+            "qualcomm_8_gen3": 20.1,
+            "iphone_16_pro": 50.26,
+            "apple_m3_max": 100.51
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 308.48,
+          "tokens_per_sec": 52.48,
+          "peak_vram_mb": 5799.38,
+          "cache_memory_mb": 224.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.49,
+            "qualcomm_8_gen3": 19.39,
+            "iphone_16_pro": 48.48,
+            "apple_m3_max": 96.96
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 731.86,
+          "tokens_per_sec": 54.2,
+          "peak_vram_mb": 8645.09,
+          "cache_memory_mb": 448.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.13,
+            "qualcomm_8_gen3": 18.11,
+            "iphone_16_pro": 45.28,
+            "apple_m3_max": 90.56
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1861.84,
+          "tokens_per_sec": 51.8,
+          "peak_vram_mb": 14337.21,
+          "cache_memory_mb": 896.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.53,
+            "qualcomm_8_gen3": 16.0,
+            "iphone_16_pro": 40.0,
+            "apple_m3_max": 79.99
+          }
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1543.5M)",
+      "param_count_m": 1543.52,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 60.87,
+          "tokens_per_sec": 140.16,
+          "peak_vram_mb": 3735.67,
+          "cache_memory_mb": 19.62,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.87,
+            "qualcomm_8_gen3": 20.73,
+            "iphone_16_pro": 51.83,
+            "apple_m3_max": 103.66
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 118.07,
+          "tokens_per_sec": 142.46,
+          "peak_vram_mb": 4402.33,
+          "cache_memory_mb": 38.75,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.84,
+            "qualcomm_8_gen3": 20.6,
+            "iphone_16_pro": 51.5,
+            "apple_m3_max": 102.99
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 238.52,
+          "tokens_per_sec": 141.21,
+          "peak_vram_mb": 5732.17,
+          "cache_memory_mb": 77.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.76,
+            "qualcomm_8_gen3": 20.34,
+            "iphone_16_pro": 50.84,
+            "apple_m3_max": 101.69
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 536.12,
+          "tokens_per_sec": 142.28,
+          "peak_vram_mb": 8389.49,
+          "cache_memory_mb": 153.5,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.62,
+            "qualcomm_8_gen3": 19.84,
+            "iphone_16_pro": 49.59,
+            "apple_m3_max": 99.18
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1201.43,
+          "tokens_per_sec": 107.58,
+          "peak_vram_mb": 13703.62,
+          "cache_memory_mb": 306.5,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.36,
+            "qualcomm_8_gen3": 18.9,
+            "iphone_16_pro": 47.25,
+            "apple_m3_max": 94.51
+          }
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+      "param_count_m": 1711.38,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 76.72,
+          "tokens_per_sec": 62.14,
+          "peak_vram_mb": 4241.58,
+          "cache_memory_mb": 384.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.77,
+            "qualcomm_8_gen3": 16.84,
+            "iphone_16_pro": 42.1,
+            "apple_m3_max": 84.21
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 154.17,
+          "tokens_per_sec": 63.87,
+          "peak_vram_mb": 5209.6,
+          "cache_memory_mb": 768.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.32,
+            "qualcomm_8_gen3": 15.24,
+            "iphone_16_pro": 38.09,
+            "apple_m3_max": 76.19
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 356.35,
+          "tokens_per_sec": 60.8,
+          "peak_vram_mb": 7145.62,
+          "cache_memory_mb": 1536.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.63,
+            "qualcomm_8_gen3": 12.8,
+            "iphone_16_pro": 32.0,
+            "apple_m3_max": 64.0
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 830.03,
+          "tokens_per_sec": 59.71,
+          "peak_vram_mb": 11017.72,
+          "cache_memory_mb": 3072.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 2.75,
+            "qualcomm_8_gen3": 9.7,
+            "iphone_16_pro": 24.24,
+            "apple_m3_max": 48.48
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": "OOM",
+          "tokens_per_sec": "OOM",
+          "peak_vram_mb": "OOM",
+          "cache_memory_mb": "OOM",
+          "roofline_fps": {
+            "raspberry_pi_5": "OOM",
+            "qualcomm_8_gen3": "OOM",
+            "iphone_16_pro": "OOM",
+            "apple_m3_max": "OOM"
+          }
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1709.4M)",
+      "param_count_m": 1709.41,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 63.48,
+          "tokens_per_sec": 154.46,
+          "peak_vram_mb": 3683.01,
+          "cache_memory_mb": 24.56,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.3,
+            "qualcomm_8_gen3": 18.7,
+            "iphone_16_pro": 46.76,
+            "apple_m3_max": 93.52
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 128.39,
+          "tokens_per_sec": 154.09,
+          "peak_vram_mb": 3943.76,
+          "cache_memory_mb": 48.56,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.26,
+            "qualcomm_8_gen3": 18.57,
+            "iphone_16_pro": 46.42,
+            "apple_m3_max": 92.84
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 264.29,
+          "tokens_per_sec": 151.79,
+          "peak_vram_mb": 4503.79,
+          "cache_memory_mb": 96.56,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.19,
+            "qualcomm_8_gen3": 18.3,
+            "iphone_16_pro": 45.76,
+            "apple_m3_max": 91.51
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 607.83,
+          "tokens_per_sec": 138.54,
+          "peak_vram_mb": 5623.87,
+          "cache_memory_mb": 192.56,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.04,
+            "qualcomm_8_gen3": 17.79,
+            "iphone_16_pro": 44.48,
+            "apple_m3_max": 88.97
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1278.61,
+          "tokens_per_sec": 100.42,
+          "peak_vram_mb": 7864.01,
+          "cache_memory_mb": 384.56,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.78,
+            "qualcomm_8_gen3": 16.86,
+            "iphone_16_pro": 42.14,
+            "apple_m3_max": 84.28
+          }
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+      "param_count_m": 1777.09,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 71.2,
+          "tokens_per_sec": 54.51,
+          "peak_vram_mb": 4113.59,
+          "cache_memory_mb": 56.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.05,
+            "qualcomm_8_gen3": 17.83,
+            "iphone_16_pro": 44.58,
+            "apple_m3_max": 89.16
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 147.43,
+          "tokens_per_sec": 53.97,
+          "peak_vram_mb": 4822.12,
+          "cache_memory_mb": 112.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.97,
+            "qualcomm_8_gen3": 17.55,
+            "iphone_16_pro": 43.87,
+            "apple_m3_max": 87.73
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 308.33,
+          "tokens_per_sec": 54.08,
+          "peak_vram_mb": 6244.15,
+          "cache_memory_mb": 224.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.82,
+            "qualcomm_8_gen3": 17.0,
+            "iphone_16_pro": 42.51,
+            "apple_m3_max": 85.01
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 733.79,
+          "tokens_per_sec": 53.06,
+          "peak_vram_mb": 9090.21,
+          "cache_memory_mb": 448.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.54,
+            "qualcomm_8_gen3": 16.01,
+            "iphone_16_pro": 40.03,
+            "apple_m3_max": 80.05
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1877.12,
+          "tokens_per_sec": 54.36,
+          "peak_vram_mb": 14782.33,
+          "cache_memory_mb": 896.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.06,
+            "qualcomm_8_gen3": 14.34,
+            "iphone_16_pro": 35.84,
+            "apple_m3_max": 71.68
+          }
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1775.1M)",
+      "param_count_m": 1775.1,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 68.52,
+          "tokens_per_sec": 116.42,
+          "peak_vram_mb": 4268.29,
+          "cache_memory_mb": 26.1,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.1,
+            "qualcomm_8_gen3": 18.01,
+            "iphone_16_pro": 45.02,
+            "apple_m3_max": 90.04
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 139.51,
+          "tokens_per_sec": 117.26,
+          "peak_vram_mb": 4935.99,
+          "cache_memory_mb": 51.6,
+          "roofline_fps": {
+            "raspberry_pi_5": 5.06,
+            "qualcomm_8_gen3": 17.87,
+            "iphone_16_pro": 44.69,
+            "apple_m3_max": 89.37
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 284.17,
+          "tokens_per_sec": 115.9,
+          "peak_vram_mb": 6301.95,
+          "cache_memory_mb": 102.6,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.99,
+            "qualcomm_8_gen3": 17.61,
+            "iphone_16_pro": 44.03,
+            "apple_m3_max": 88.07
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 628.25,
+          "tokens_per_sec": 117.72,
+          "peak_vram_mb": 9038.24,
+          "cache_memory_mb": 204.6,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.85,
+            "qualcomm_8_gen3": 17.11,
+            "iphone_16_pro": 42.78,
+            "apple_m3_max": 85.56
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1389.13,
+          "tokens_per_sec": 86.44,
+          "peak_vram_mb": 14501.12,
+          "cache_memory_mb": 408.6,
+          "roofline_fps": {
+            "raspberry_pi_5": 4.59,
+            "qualcomm_8_gen3": 16.19,
+            "iphone_16_pro": 40.48,
+            "apple_m3_max": 80.96
+          }
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "google/gemma-2-2b-it",
+      "param_count_m": 2614.34,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 122.74,
+          "tokens_per_sec": 42.67,
+          "peak_vram_mb": 7427.6,
+          "cache_memory_mb": 208.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.35,
+            "qualcomm_8_gen3": 11.83,
+            "iphone_16_pro": 29.57,
+            "apple_m3_max": 59.14
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 276.07,
+          "tokens_per_sec": 41.81,
+          "peak_vram_mb": 9845.41,
+          "cache_memory_mb": 416.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.22,
+            "qualcomm_8_gen3": 11.37,
+            "iphone_16_pro": 28.43,
+            "apple_m3_max": 56.86
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 665.89,
+          "tokens_per_sec": 40.6,
+          "peak_vram_mb": 14487.42,
+          "cache_memory_mb": 832.0,
+          "roofline_fps": {
+            "raspberry_pi_5": 2.99,
+            "qualcomm_8_gen3": 10.56,
+            "iphone_16_pro": 26.4,
+            "apple_m3_max": 52.8
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": "OOM",
+          "tokens_per_sec": "OOM",
+          "peak_vram_mb": "OOM",
+          "cache_memory_mb": "OOM",
+          "roofline_fps": {
+            "raspberry_pi_5": "OOM",
+            "qualcomm_8_gen3": "OOM",
+            "iphone_16_pro": "OOM",
+            "apple_m3_max": "OOM"
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": "OOM",
+          "tokens_per_sec": "OOM",
+          "peak_vram_mb": "OOM",
+          "cache_memory_mb": "OOM",
+          "roofline_fps": {
+            "raspberry_pi_5": "OOM",
+            "qualcomm_8_gen3": "OOM",
+            "iphone_16_pro": "OOM",
+            "apple_m3_max": "OOM"
+          }
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (2612.2M)",
+      "param_count_m": 2612.2,
+      "executorch_arena_mb": "N/A",
+      "runs": [
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 83.2,
+          "tokens_per_sec": 174.21,
+          "peak_vram_mb": 6217.27,
+          "cache_memory_mb": 19.19,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.48,
+            "qualcomm_8_gen3": 12.28,
+            "iphone_16_pro": 30.71,
+            "apple_m3_max": 61.42
+          }
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 162.87,
+          "tokens_per_sec": 166.58,
+          "peak_vram_mb": 7280.85,
+          "cache_memory_mb": 37.94,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.47,
+            "qualcomm_8_gen3": 12.24,
+            "iphone_16_pro": 30.6,
+            "apple_m3_max": 61.19
+          }
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 356.08,
+          "tokens_per_sec": 150.82,
+          "peak_vram_mb": 9433.87,
+          "cache_memory_mb": 75.44,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.44,
+            "qualcomm_8_gen3": 12.15,
+            "iphone_16_pro": 30.37,
+            "apple_m3_max": 60.74
+          }
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 732.97,
+          "tokens_per_sec": 128.61,
+          "peak_vram_mb": 13738.89,
+          "cache_memory_mb": 150.44,
+          "roofline_fps": {
+            "raspberry_pi_5": 3.39,
+            "qualcomm_8_gen3": 11.97,
+            "iphone_16_pro": 29.93,
+            "apple_m3_max": 59.85
+          }
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": "OOM",
+          "tokens_per_sec": "OOM",
+          "peak_vram_mb": "OOM",
+          "cache_memory_mb": "OOM",
+          "roofline_fps": {
+            "raspberry_pi_5": "OOM",
+            "qualcomm_8_gen3": "OOM",
+            "iphone_16_pro": "OOM",
+            "apple_m3_max": "OOM"
+          }
+        }
+      ]
+    }
+  }
+]

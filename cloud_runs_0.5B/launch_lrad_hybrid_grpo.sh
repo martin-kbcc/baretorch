@@ -3,7 +3,7 @@ set -e
 
 # ==============================================================================
 #      BareTorch Stage 3: GRPO Reasoning Alignment Launcher (Cloud 0.5B)
-#             Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
+#              Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
 # ==============================================================================
 
 # CUDA Memory Management & Distributed NCCL Tuning
@@ -13,7 +13,7 @@ export TORCH_CPP_MIN_LOG_LEVEL=2
 export NCCL_DEBUG=WARN
 
 # ==============================================================================
-#                             Hardware & Cluster Config
+#                               Hardware & Cluster Config
 # ==============================================================================
 NUM_GPUS=4
 
@@ -24,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CHECKPOINT_DIR="${BASE_DIR}/checkpoints_500m_sft_cold_start"
 OUTPUT_DIR="${BASE_DIR}/checkpoints_500m_grpo"
+TOKENIZER_NAME="HuggingFaceTB/SmolLM2-360M"
 
 # Cloudflare R2 Configurations
 R2_BUCKET="baretorch-data"
@@ -69,6 +70,7 @@ echo "==========================================================================
 echo "🚀 LAUNCHING RULE-BASED RL (GRPO) REASONING ALIGNMENT ON ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
 echo "================================================================================"
 echo "• Base Checkpoint    : ${CHECKPOINT_DIR}"
+echo "• Tokenizer          : ${TOKENIZER_NAME}"
 if [ -n "${RESUME_CHECKPOINT}" ]; then
     echo "• Resuming From      : ${RESUME_CHECKPOINT}"
 else
@@ -114,6 +116,7 @@ torchrun \
     "${BASE_DIR}/train_grpo.py" \
     --checkpoint_dir "${CHECKPOINT_DIR}" \
     --output_dir "${OUTPUT_DIR}" \
+    --tokenizer_name "${TOKENIZER_NAME}" \
     --num_epochs "${NUM_EPOCHS}" \
     --batch_size "${PER_GPU_BATCH_SIZE}" \
     --num_generations "${NUM_GENERATIONS}" \

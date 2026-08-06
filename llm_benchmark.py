@@ -9,7 +9,7 @@ import lm_eval
 from lm_eval.models.huggingface import HFLM
 from lm_eval.evaluator import simple_evaluate
 
-# Import BareTorch framework to ensure AutoClasses and model mappings are registered
+# Import BareTorch framework
 import baretorch
 from baretorch import (
     BareTorchConfig,
@@ -33,53 +33,79 @@ def parse_args():
         help="Path to saved HuggingFace checkpoint directory or PyTorch state_dict file."
     )
     parser.add_argument(
-        "--model_type", 
-        type=str, 
-        default="baretorch", 
-        choices=["baretorch", "cs_lrad", "transformer"],
-        help="Architecture key used if initializing manually from config."
-    )
-    parser.add_argument(
         "--tokenizer_name", 
         type=str, 
         default="gpt2", 
-        help="Tokenizer checkpoint to use."
+        help="Tokenizer checkpoint/name to use (if not found in checkpoint dir)."
     )
+    
+    # Architecture Overrides (Matching launch_lrad_hybrid.sh defaults for 1B model)
+    parser.add_argument("--d_model", type=int, default=1536, help="Model hidden dimension.")
+    parser.add_argument("--num_heads", type=int, default=16, help="Number of attention/mixer heads.")
+    parser.add_argument("--num_layers", type=int, default=24, help="Total transformer/mixer layers.")
+    parser.add_argument(
+        "--layer_sequence", 
+        type=str, 
+        default="cs_lrad,cs_lrad,cs_lrad,transformer", 
+        help="Comma-separated layer pattern sequence."
+    )
+    parser.add_argument("--chunk_size", type=int, default=32, help="CS-LRAD chunk size.")
+    parser.add_argument("--rank", type=int, default=8, help="CS-LRAD projection rank.")
     
     # Task Selection
     parser.add_argument(
         "--tasks", 
         type=str, 
         default="gsm8k,mmlu,arc_challenge,hellaswag,winogrande",
-        help="Comma-separated list of lm-eval tasks (e.g., 'gsm8k,mmlu,arc_challenge')."
+        help="Comma-separated list of lm-eval tasks."
     )
-    parser.add_argument(
-        "--num_fewshot", 
-        type=int, 
-        default=0, 
-        help="Number of few-shot examples (default: 0 for zero-shot)."
-    )
-    parser.add_argument(
-        "--limit", 
-        type=float, 
-        default=None, 
-        help="Limit number of samples per task (useful for fast smoke-testing, e.g., 50 or 0.1)."
-    )
+    parser.add_argument("--num_fewshot", type=int, default=0, help="Few-shot count (0 for zero-shot).")
+    parser.add_argument("--limit", type=float, default=None, help="Sample limit per task for smoke testing.")
     
     # Execution & Precision
-    parser.add_argument("--batch_size", type=int, default=16, help="Evaluation batch size.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Evaluation batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on.")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
-    parser.add_argument("--output_file", type=str, default="benchmark_results.json", help="Path to save output JSON.")
+    parser.add_argument("--output_file", type=str, default="benchmark_results_1b.json", help="Path to save output JSON.")
     
     return parser.parse_args()
 
 
-def load_baretorch_model(checkpoint_path: str, device: str, dtype: torch.dtype):
+def build_baretorch_config(args, config_file: str = None) -> BareTorchConfig:
+    """Builds BareTorchConfig from file if available, otherwise constructs from CLI args."""
+    if config_file and os.path.exists(config_file):
+        logger.info(f"Loading BareTorch configuration from '{config_file}'...")
+        try:
+            return AutoConfig.from_pretrained(config_file)
+        except Exception as e:
+            logger.warning(f"Failed to load via AutoConfig ({e}). Constructing BareTorchConfig manually...")
+
+    # Expand layer sequence pattern across total layers
+    pattern = [s.strip() for t in args.layer_sequence.split(",") if (s := t.strip())]
+    repeats = (args.num_layers + len(pattern) - 1) // len(pattern)
+    full_layer_types = (pattern * repeats)[:args.num_layers]
+
+    logger.info(
+        f"Constructing BareTorchConfig: d_model={args.d_model}, num_layers={args.num_layers}, "
+        f"num_heads={args.num_heads}, layer_pattern='{args.layer_sequence}'"
+    )
+    
+    return BareTorchConfig(
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        layer_types=full_layer_types,
+        chunk_size=args.chunk_size,
+        rank=args.rank,
+    )
+
+
+def load_baretorch_model(args, device: str, dtype: torch.dtype):
     """
-    Robust checkpoint loader that supports standard HuggingFace load directories 
-    or raw state_dict checkpoints.
+    Robust checkpoint loader supporting HuggingFace directories and raw state_dicts,
+    fully compliant with 1B parameter configurations.
     """
+    checkpoint_path = args.checkpoint_path
     logger.info(f"Loading BareTorch model from checkpoint: '{checkpoint_path}'")
     
     if os.path.isdir(checkpoint_path):
@@ -92,34 +118,40 @@ def load_baretorch_model(checkpoint_path: str, device: str, dtype: torch.dtype):
             )
             logger.info("Successfully loaded model via AutoModelForCausalLM.")
         except Exception as e:
-            logger.warning(f"AutoModel load failed ({e}). Falling back to manual config load...")
-            config = AutoConfig.from_pretrained(checkpoint_path)
+            logger.warning(f"AutoModel load failed ({e}). Attempting BareTorchForCausalLM load...")
+            config_file = os.path.join(checkpoint_path, "config.json")
+            config = build_baretorch_config(args, config_file)
+            
             model = BareTorchForCausalLM.from_pretrained(
                 checkpoint_path, 
                 config=config, 
                 torch_dtype=dtype
             )
+            
     elif os.path.isfile(checkpoint_path):
         # Raw PyTorch .pt or .bin state_dict file
-        logger.info("Detected raw state_dict file. Loading weights into BareTorch model...")
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        
-        # Look for accompanying config.json in the same directory
+        logger.info("Detected raw state_dict file. Initializing model structure...")
         ckpt_dir = os.path.dirname(checkpoint_path)
         config_file = os.path.join(ckpt_dir, "config.json")
-        if os.path.exists(config_file):
-            config = AutoConfig.from_pretrained(config_file)
-        else:
-            logger.warning("No config.json found in checkpoint dir. Initializing default BareTorch 100M Hybrid config.")
-            config = BareTorchConfig(
-                d_model=512,
-                num_heads=16,
-                num_layers=12,
-                layer_types=["cs_lrad", "cs_lrad", "cs_lrad", "transformer"] * 3,
-            )
         
+        config = build_baretorch_config(args, config_file)
         model = BareTorchForCausalLM(config)
-        model.load_state_dict(state_dict, strict=False)
+        
+        logger.info(f"Loading state dict from '{checkpoint_path}'...")
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Unwrap state_dict if saved inside a wrapper dictionary
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+        elif "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            logger.warning(f"Missing keys during load: {missing_keys[:5]} ... (total {len(missing_keys)})")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys during load: {unexpected_keys[:5]} ... (total {len(unexpected_keys)})")
+            
         model = model.to(dtype=dtype)
     else:
         raise FileNotFoundError(f"Checkpoint path not found: '{checkpoint_path}'")
@@ -139,13 +171,20 @@ def main():
     }
     eval_dtype = dtype_map[args.dtype]
     
-    # 2. Load Tokenizer
-    logger.info(f"Loading tokenizer: '{args.tokenizer_name}'")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    # 2. Resolve Tokenizer
+    tokenizer_path = args.checkpoint_path if os.path.isdir(args.checkpoint_path) else args.tokenizer_name
+    logger.info(f"Loading tokenizer from: '{tokenizer_path}'")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        logger.warning(f"Could not load tokenizer from '{tokenizer_path}' ({e}). Falling back to '{args.tokenizer_name}'.")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+        
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
     # 3. Load BareTorch Model
-    model = load_baretorch_model(args.checkpoint_path, args.device, eval_dtype)
+    model = load_baretorch_model(args, args.device, eval_dtype)
     
     # 4. Wrap Model into lm-evaluation-harness HFLM Class
     logger.info("Wrapping BareTorch model into lm-evaluation-harness interface...")
@@ -170,13 +209,12 @@ def main():
     
     # 7. Print Results Table
     print("\n" + "=" * 70)
-    print("📊 BARETORCH BENCHMARK EVALUATION RESULTS")
+    print("📊 BARETORCH 1B FOUNDATIONAL BENCHMARK EVALUATION RESULTS")
     print("=" * 70)
     
     formatted_summary = {}
     if "results" in results:
         for task_name, metrics in results["results"].items():
-            # Filter primary accuracy/match metrics
             primary_metric = (
                 metrics.get("acc,none") 
                 or metrics.get("exact_match,none") 

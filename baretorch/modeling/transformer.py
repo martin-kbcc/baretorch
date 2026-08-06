@@ -39,46 +39,39 @@ class GatedMLP(nn.Module):
 
 class RotaryEmbedding(nn.Module):
     """
-    Implements Rotary Position Embeddings (RoPE) natively in PyTorch with
-    meta-device compatibility, dynamic buffer sanitization, and lazy cache computation.
+    Export-friendly, dynamic Rotary Position Embeddings (RoPE).
+    Pre-computes static buffers for graph export, but dynamically extends cache 
+    if prompt + generated tokens exceed initial buffer bounds during runtime generation.
     """
-    def __init__(self, dim, max_position_embeddings=4096, base=10000):
+    def __init__(self, dim, max_position_embeddings=8192, base=10000):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        self.max_seq_len_cached = max_position_embeddings
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        
-        # Meta-compatible placeholder buffers
-        self.register_buffer("cos_cached", torch.empty(0), persistent=False)
-        self.register_buffer("sin_cached", torch.empty(0), persistent=False)
+
+        # Pre-compute static lookup table up to default max_position_embeddings
+        self._set_cos_sin_cache(seq_len=self.max_position_embeddings, device="cpu", dtype=torch.float32)
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
-        if device.type == "meta":
-            return
-            
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.float32)
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        
+        # Handle meta tensor initialization from Hugging Face from_pretrained
+        if getattr(self.inv_freq, "is_meta", False) or self.inv_freq.device.type == "meta":
+            inv_freq = 1.0 / (
+                self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+            )
+        else:
+            inv_freq = self.inv_freq.to(device)
+
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def _is_cache_invalid(self, target_device, target_dtype, required_seq_len):
-        if self.cos_cached is None or self.cos_cached.numel() == 0 or self.cos_cached.is_meta:
-            return True
-        if self.cos_cached.device != target_device or self.cos_cached.dtype != target_dtype:
-            return True
-        if required_seq_len > self.max_seq_len_cached:
-            return True
-        if torch.isnan(self.cos_cached).any() or torch.isinf(self.cos_cached).any():
-            return True
-        return False
 
     def _rotate_half(self, x):
         x1 = x[..., :self.dim // 2]
@@ -88,20 +81,26 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x, seq_len=None):
         if seq_len is None:
             seq_len = x.shape[1]
-
-        if self._is_cache_invalid(x.device, x.dtype, seq_len):
-            self._set_cos_sin_cache(seq_len=max(seq_len, self.max_position_embeddings), device=x.device, dtype=x.dtype)
-
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
     def apply_rope(self, q, k, position_ids):
-        max_pos = position_ids.max().item() + 1 if position_ids.numel() > 0 else 1
+        # Bypass .item() evaluation during torch.export / ExecuTorch tracing
+        if not torch.compiler.is_compiling():
+            try:
+                max_pos = int(position_ids.max().item()) if position_ids.numel() > 0 else 0
+                if (
+                    self.cos_cached is None 
+                    or max_pos >= self.cos_cached.size(0) 
+                    or self.cos_cached.device != q.device
+                    or self.cos_cached.dtype != q.dtype
+                ):
+                    new_len = max(max_pos + 1024, self.max_position_embeddings)
+                    self._set_cos_sin_cache(seq_len=new_len, device=q.device, dtype=q.dtype)
+            except Exception:
+                pass
 
-        if self._is_cache_invalid(q.device, q.dtype, max_pos):
-            self._set_cos_sin_cache(seq_len=max(max_pos, self.max_position_embeddings), device=q.device, dtype=q.dtype)
-
-        cos = self.cos_cached[position_ids].unsqueeze(1) # [B, 1, L, d_h]
-        sin = self.sin_cached[position_ids].unsqueeze(1) # [B, 1, L, d_h]
+        cos = self.cos_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
+        sin = self.sin_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
 
         q_embed = (q * cos) + (self._rotate_half(q) * sin)
         k_embed = (k * cos) + (self._rotate_half(k) * sin)

@@ -2,6 +2,7 @@
 output_*/
 checkpoints_*/
 runs/
+pte_models/*
 *.pt
 *.pth
 *.bin
@@ -14,6 +15,7 @@ huggingface/
 data/
 raw_dclm_parquet/
 tokenized_bin/
+smollm-corpus/
 
 # --- Python & Environment Files ---
 __pycache__/
