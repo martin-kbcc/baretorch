@@ -420,8 +420,6 @@ def main():
       eval_strategy="steps",
       eval_steps=args.eval_steps,
       save_total_limit=3,
-      report_to="tensorboard",
-      logging_dir=f"./runs/{args.model_type}",
       torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
       gradient_checkpointing=args.grad_checkpointing,
       gradient_checkpointing_kwargs={"use_reentrant": False},
