@@ -32,15 +32,15 @@ DROPOUT=0.0
 SEQ_LEN=2048
 
 # ==============================================================================
-#           Optimization & Hyperparameters (3 Epochs / ~756B Token Runway)
+#           Optimization & Hyperparameters (1 Full Epoch / ~252B Token Runway)
 # ==============================================================================
-PER_GPU_BATCH_SIZE=64
-GRAD_ACCUM=4           # Set to 4 so global batch size remains 1024 seqs/step on 4 GPUs
-LEARNING_RATE=6e-4     # Optimal peak LR for ~500M params across multi-epoch run
+PER_GPU_BATCH_SIZE=16
+GRAD_ACCUM=4           # Global batch size = 256 seqs/step (~524k tokens/step)
+LEARNING_RATE=6e-4     # Optimal peak LR for ~500M params across 1-epoch run
 SCHEDULER="cosine"
-WARMUP_STEPS=2000      # 2,000 steps warmup (~4.2B tokens) for longer runway stability
+WARMUP_STEPS=2000      # 2,000 steps warmup (~1.05B tokens)
 WEIGHT_DECAY=0.1
-MAX_STEPS=360489       # (252B tokens * 3 epochs) / (4 GPUs * 64 batch * 4 accum * 2048 seq_len)
+MAX_STEPS=480664       # 252B tokens / 524,288 tokens per step
 MAX_VAL_SAMPLES=5000
 
 # ==============================================================================
@@ -53,8 +53,12 @@ R2_BUCKET="baretorch-data"
 R2_PREFIX="checkpoints"
 
 LOGGING_STEPS=1000
-SAVE_STEPS=10000       # Checkpoint every ~20.97B tokens
+SAVE_STEPS=10000       # Checkpoint every ~5.24B tokens
 EVAL_STEPS=10000
+
+# Ensure log and output directories exist prior to run
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "./runs/${MODEL_TYPE}"
 
 # ==============================================================================
 #                                Startup Summary
@@ -65,23 +69,22 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 echo "======================================================================"
 echo "🚀 Launching BareTorch Cloud Pre-Training (500M 3:1 Hybrid)..."
 echo "  ├─ Tokenizer        : ${TOKENIZER_NAME}"
-echo "  ├─ Target Runway    : 3 Epochs (~756.0 Billion Tokens)"
+echo "  ├─ Target Runway    : 1 Full Epoch (~252.0 Billion Tokens)"
 echo "  ├─ Total Steps      : ${MAX_STEPS} steps"
 echo "  ├─ Hardware Config  : ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
 echo "  ├─ Context Length   : ${SEQ_LEN} tokens"
 echo "  ├─ Batch Setup      : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
-echo "  ├─ Step Throughput  : ${TOKENS_PER_STEP} tokens/step (~2.10M tokens/step)"
+echo "  ├─ Step Throughput  : ${TOKENS_PER_STEP} tokens/step (~524k tokens/step)"
 echo "  ├─ Peak Learning Rate: ${LEARNING_RATE}"
 echo "  ├─ Architecture     : ${NUM_LAYERS} Layers (d_model=${D_MODEL}, heads=${NUM_HEADS}, rank=${RANK})"
 echo "  ├─ Layer Sequence   : ${LAYER_SEQUENCE}"
-echo "  ├─ Checkpoint Freq  : Every ${SAVE_STEPS} steps (~20.97B tokens)"
+echo "  ├─ Checkpoint Freq  : Every ${SAVE_STEPS} steps (~5.24B tokens)"
 echo "  ├─ Cloud Sync       : Cloudflare R2 (r2:${R2_BUCKET}/${R2_PREFIX})"
 echo "======================================================================"
 
 # Check Cloudflare R2 for existing checkpoints to enable auto-resume on fresh nodes
 if command -v rclone &> /dev/null; then
     echo "🔍 Checking Cloudflare R2 for existing checkpoints..."
-    mkdir -p "$OUTPUT_DIR"
     rclone copy "r2:${R2_BUCKET}/${R2_PREFIX}/$(basename "$OUTPUT_DIR")" "$OUTPUT_DIR" --transfers 8 || true
     
     LATEST_CKPT=$(ls -d ${OUTPUT_DIR}/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)
@@ -117,7 +120,6 @@ torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --dropout ${DROPOUT} \
     --seq_len ${SEQ_LEN} \
     --compile \
-    --grad_checkpointing \
     --logging_steps ${LOGGING_STEPS} \
     --save_steps ${SAVE_STEPS} \
     --eval_steps ${EVAL_STEPS} \
