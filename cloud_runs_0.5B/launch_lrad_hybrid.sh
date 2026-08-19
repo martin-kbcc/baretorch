@@ -3,7 +3,7 @@ set -e
 
 # ==============================================================================
 #                 BareTorch Foundational Pre-Training Launcher
-#           Scale Configuration: ~500M Hybrid on 8x NVIDIA H100
+#           Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
 # ==============================================================================
 
 # CUDA Memory Management & Distributed NCCL Tuning
@@ -15,7 +15,7 @@ export NCCL_DEBUG=WARN
 # ==============================================================================
 #                                Hardware & Cluster Config
 # ==============================================================================
-NUM_GPUS=8
+NUM_GPUS=4
 
 # ==============================================================================
 #                               Model Architecture Config
@@ -35,16 +35,16 @@ SEQ_LEN=2048
 #           Optimization & Hyperparameters (3 Epochs / ~756B Token Runway)
 # ==============================================================================
 PER_GPU_BATCH_SIZE=64
-GRAD_ACCUM=2
+GRAD_ACCUM=4           # Set to 4 so global batch size remains 1024 seqs/step on 4 GPUs
 LEARNING_RATE=6e-4     # Optimal peak LR for ~500M params across multi-epoch run
 SCHEDULER="cosine"
 WARMUP_STEPS=2000      # 2,000 steps warmup (~4.2B tokens) for longer runway stability
 WEIGHT_DECAY=0.1
-MAX_STEPS=360489       # (252B tokens * 3 epochs) / (8 GPUs * 64 batch * 2 accum * 2048 seq_len)
+MAX_STEPS=360489       # (252B tokens * 3 epochs) / (4 GPUs * 64 batch * 4 accum * 2048 seq_len)
 MAX_VAL_SAMPLES=5000
 
 # ==============================================================================
-#                             Paths & Cloud Sync Config
+#                               Paths & Cloud Sync Config
 # ==============================================================================
 OUTPUT_DIR="./checkpoints_500m_hybrid_baretorch"
 DATA_CACHE_DIR="./tokenized_bin"
@@ -94,7 +94,7 @@ else
     echo "⚠️  rclone not found. Skipping remote checkpoint restore check."
 fi
 
-# Run across 8x H100 GPUs via torchrun (~500M Parameter Foundational Model)
+# Run across 4x H100 GPUs via torchrun (~500M Parameter Foundational Model)
 torchrun --nproc_per_node=${NUM_GPUS} train.py \
     --model_type ${MODEL_TYPE} \
     --layer_sequence ${LAYER_SEQUENCE} \
