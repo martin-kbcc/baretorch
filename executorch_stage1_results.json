@@ -3,90 +3,22 @@
     "hf_baseline": {
       "model_name": "meta-llama/Llama-3.2-1B",
       "param_count_m": 1235.81,
-      "pte_file_size_mb": 4714.54,
+      "quant_type": "int8",
+      "backend_delegate": "coreml",
+      "pte_file_size_mb": 4714.29,
       "tensor_arena_ram_mb": 1065.62,
       "status": "success",
-      "pte_path": "./pte_models/baseline_meta_llama_llama_3.2_1b.pte"
+      "pte_path": "./pte_models_apple/baseline_meta_llama_llama_3.2_1b_int8_coreml.pte"
     },
     "baretorch_matched": {
       "model_name": "BareTorch Matched (1237.1M)",
       "param_count_m": 1237.1,
+      "quant_type": "int8",
+      "backend_delegate": "coreml",
       "pte_file_size_mb": 4748.86,
       "tensor_arena_ram_mb": 987.27,
       "status": "success",
-      "pte_path": "./pte_models/baretorch_meta_llama_llama_3.2_1b.pte"
-    }
-  },
-  {
-    "hf_baseline": {
-      "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
-      "param_count_m": 1543.71,
-      "pte_file_size_mb": 5889.3,
-      "tensor_arena_ram_mb": 965.19,
-      "status": "success",
-      "pte_path": "./pte_models/baseline_qwen_qwen2.5_1.5b_instruct.pte"
-    },
-    "baretorch_matched": {
-      "model_name": "BareTorch Matched (1543.5M)",
-      "param_count_m": 1543.52,
-      "pte_file_size_mb": 5905.43,
-      "tensor_arena_ram_mb": 1020.88,
-      "status": "success",
-      "pte_path": "./pte_models/baretorch_qwen_qwen2.5_1.5b_instruct.pte"
-    }
-  },
-  {
-    "hf_baseline": {
-      "model_name": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-      "param_count_m": 1711.38,
-      "pte_file_size_mb": 6528.75,
-      "tensor_arena_ram_mb": 409.0,
-      "status": "success",
-      "pte_path": "./pte_models/baseline_huggingfacetb_smollm2_1.7b_instruct.pte"
-    },
-    "baretorch_matched": {
-      "model_name": "BareTorch Matched (1709.4M)",
-      "param_count_m": 1709.41,
-      "pte_file_size_mb": 6553.16,
-      "tensor_arena_ram_mb": 409.0,
-      "status": "success",
-      "pte_path": "./pte_models/baretorch_huggingfacetb_smollm2_1.7b_instruct.pte"
-    }
-  },
-  {
-    "hf_baseline": {
-      "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-      "param_count_m": 1777.09,
-      "pte_file_size_mb": 6779.55,
-      "tensor_arena_ram_mb": 965.19,
-      "status": "success",
-      "pte_path": "./pte_models/baseline_deepseek_ai_deepseek_r1_distill_qwen_1.5b.pte"
-    },
-    "baretorch_matched": {
-      "model_name": "BareTorch Matched (1775.1M)",
-      "param_count_m": 1775.1,
-      "pte_file_size_mb": 6797.42,
-      "tensor_arena_ram_mb": 1020.88,
-      "status": "success",
-      "pte_path": "./pte_models/baretorch_deepseek_ai_deepseek_r1_distill_qwen_1.5b.pte"
-    }
-  },
-  {
-    "hf_baseline": {
-      "model_name": "google/gemma-2-2b-it",
-      "param_count_m": 2614.34,
-      "pte_file_size_mb": 9973.45,
-      "tensor_arena_ram_mb": 2376.12,
-      "status": "success",
-      "pte_path": "./pte_models/baseline_google_gemma_2_2b_it.pte"
-    },
-    "baretorch_matched": {
-      "model_name": "BareTorch Matched (2612.2M)",
-      "param_count_m": 2612.2,
-      "pte_file_size_mb": 9989.9,
-      "tensor_arena_ram_mb": 2469.92,
-      "status": "success",
-      "pte_path": "./pte_models/baretorch_google_gemma_2_2b_it.pte"
+      "pte_path": "./pte_models_apple/baretorch_meta_llama_llama_3.2_1b_int8_coreml.pte"
     }
   }
 ]

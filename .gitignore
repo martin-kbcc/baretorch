@@ -2,12 +2,13 @@
 output_*/
 checkpoints_*/
 runs/
-pte_models/*
+pte_models_apple/*
 *.pt
 *.pth
 *.bin
 *.safetensors
 *.ckpt
+*.pte
 
 # --- Dataset Caches & Tokenizer Outputs ---
 .cache/

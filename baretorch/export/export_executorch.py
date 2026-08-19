@@ -1,3 +1,4 @@
+# baretorch/export/export_executorch.py
 import os
 import gc
 import json
@@ -6,28 +7,17 @@ import argparse
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
-
-
-class ModelExportWrapper(nn.Module):
-    """
-    Wraps CausalLM models to return ONLY logits tensor for clean EXIR graph export,
-    stripping Hugging Face DynamicCache dataclasses.
-    """
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        out = self.model(input_ids, use_cache=False, return_dict=False)
-        return out[0] if isinstance(out, (tuple, list)) else out
+from baretorch.export.wrappers import ModelExportWrapper
+from baretorch.export.quantization import apply_quantization
+from baretorch.export.partitioners import get_backend_partitioner
 
 
 def clear_host_memory():
-    """Flushes Python garbage collection and clears CUDA cache."""
+    """Flushes Python garbage collection and clears CUDA/RAM allocations."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -41,26 +31,17 @@ def count_baretorch_params_fast(
     rank: int = 8,
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer"
 ) -> float:
-    """
-    Computes exact BareTorch model parameter count in pure Python integer arithmetic.
-    Matched 1-to-1 with actual PyTorch module instantiations.
-    """
+    """Computes exact BareTorch model parameter count in pure Python integer math."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
     full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(num_layers)]
 
     num_kv_heads = max(1, num_heads // 4)
     while num_heads % num_kv_heads != 0:
         num_kv_heads -= 1
-    head_dim = d_model // num_heads
     d_ff = int(d_model * 3.5)
 
-    # 1. Embeddings (Token Embedding + Un-tied LM Head)
     embed_params = 2 * vocab_size * d_model
-
-    # 2. Final Norm (RMSNorm)
     final_norm = d_model
-
-    # 3. Layer Parameters
     layer_params = 0
 
     for l_type in full_layer_types:
@@ -70,6 +51,7 @@ def count_baretorch_params_fast(
         if l_type == "cs_lrad":
             attn = (5 * (d_model ** 2)) + (2 * d_model * num_heads * rank) + (2 * (d_model * num_heads + num_heads))
         else:
+            head_dim = d_model // num_heads
             attn = (2 * (d_model ** 2)) + (2 * d_model * (num_kv_heads * head_dim))
 
         layer_params += (norms + mlp + attn)
@@ -99,7 +81,7 @@ def find_matching_baretorch_config(
                 head_dim = d // nh
                 if head_dim < 64 or head_dim > 128:
                     continue
-                if head_dim % 2 != 0:  # RoPE requires even head_dim
+                if head_dim % 2 != 0:
                     continue
 
                 num_kv_heads = max(1, nh // 4)
@@ -143,41 +125,56 @@ def export_single_model_to_pte(
     model_name: str,
     vocab_size: int,
     seq_len: int,
-    output_pte_path: str
+    output_pte_path: str,
+    quant_type: str = "fp32",
+    backend_delegate: str = "none"
 ) -> Dict[str, Any]:
-    """Exports model to ExecuTorch (.pte) and runs AOT MemoryPlanningPass."""
+    """
+    Exports a model to ExecuTorch (.pte) format using graph capture, optional AOT 
+    quantization (FP32/INT8), backend partitioning (CoreML, QNN, Vulkan, XNNPACK), 
+    and AOT MemoryPlanningPass.
+    """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
 
-    # Wrap model to isolate pure Tensor logits
+    # 1. Wrap model for pure Tensor logits output
     wrapper = ModelExportWrapper(model).eval().cpu()
     param_count_m = sum(p.numel() for p in wrapper.parameters()) / 1e6
     example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long),)
 
-    print(f"📦 Exporting '{model_name}' ({param_count_m:.2f}M params) to ExecuTorch graph...")
+    print(f"\n📦 Exporting '{model_name}' ({param_count_m:.2f}M params) | Quant: {quant_type.upper()} | Backend: {backend_delegate.upper()}...")
 
     try:
         from torch.export import export
         from executorch.exir import to_edge, EdgeCompileConfig, ExecutorchBackendConfig
         from executorch.exir.passes import MemoryPlanningPass
 
-        # 1. Capture PyTorch ExportedProgram
-        with torch.no_grad():
-            exported_prog = export(wrapper, example_inputs)
+        # 2. Apply AOT Quantization (FP32 or INT8 W8A8)
+        prepared_model = apply_quantization(wrapper, example_inputs, quant_type=quant_type)
 
-        # 2. Lower to ExecuTorch Edge Dialect
+        # 3. Capture PyTorch ExportedProgram
+        with torch.no_grad():
+            exported_prog = export(prepared_model, example_inputs)
+
+        # 4. Lower to ExecuTorch Edge Dialect
         edge_prog = to_edge(
             exported_prog,
             compile_config=EdgeCompileConfig(_check_ir_validity=False)
         )
 
-        # 3. Lower to ExecuTorch Program with AOT Memory Planning
+        # 5. Resolve & Apply Hardware Partitioner (CoreML, QNN, Vulkan, XNNPACK)
+        partitioners = get_backend_partitioner(backend_delegate)
+        if partitioners:
+            print("  🧩 Lowering graph through backend delegate partitioner...")
+            edge_prog = edge_prog.to_backend(partitioners[0])
+
+        # 6. Lower to ExecuTorch Program with AOT Memory Planning
         et_prog = edge_prog.to_executorch(
             ExecutorchBackendConfig(
                 memory_planning_pass=MemoryPlanningPass()
             )
         )
 
-        # 4. Serialize to ExecuTorch .pte binary
+        # 7. Serialize to .pte binary file
         buf = getattr(et_prog, "buffer", None)
         raw_bytes = buf if isinstance(buf, (bytes, bytearray)) else (buf() if callable(buf) else et_prog.buffer)
         with open(output_pte_path, "wb") as f:
@@ -185,7 +182,7 @@ def export_single_model_to_pte(
 
         file_size_mb = round(os.path.getsize(output_pte_path) / (1024.0 ** 2), 2)
 
-        # 5. Extract Tensor Arena Memory Allocation from ExecuTorch Execution Plan
+        # 8. Extract Tensor Arena Memory Allocation from ExecuTorch Plan
         arena_bytes = 0
         try:
             program_flatbuffer = getattr(et_prog, "executorch_program", None)
@@ -194,17 +191,19 @@ def export_single_model_to_pte(
                 if len(plans) > 0 and hasattr(plans[0], "non_const_buffer_sizes"):
                     arena_bytes = sum(plans[0].non_const_buffer_sizes)
         except Exception as read_err:
-            print(f"   ⚠️ Could not extract non_const_buffer_sizes ({read_err})")
+            print(f"    ⚠️ Could not extract non_const_buffer_sizes ({read_err})")
 
         arena_ram_mb = round(arena_bytes / (1024.0 ** 2), 2)
 
-        print(f"   ✅ ExecuTorch export successful:")
-        print(f"      • .pte File Size    : {file_size_mb} MB")
-        print(f"      • Tensor Arena RAM  : {arena_ram_mb} MB")
+        print(f"    ✅ ExecuTorch export successful:")
+        print(f"       • .pte File Size    : {file_size_mb} MB")
+        print(f"       • Tensor Arena RAM  : {arena_ram_mb} MB")
 
         return {
             "model_name": model_name,
             "param_count_m": round(param_count_m, 2),
+            "quant_type": quant_type,
+            "backend_delegate": backend_delegate,
             "pte_file_size_mb": file_size_mb,
             "tensor_arena_ram_mb": arena_ram_mb,
             "status": "success",
@@ -213,10 +212,12 @@ def export_single_model_to_pte(
 
     except Exception as e:
         err_msg = f"{type(e).__name__}: {str(e)[:120]}"
-        print(f"   ⚠️ ExecuTorch export failed for '{model_name}' ({err_msg})")
+        print(f"    ⚠️ ExecuTorch export failed for '{model_name}' ({err_msg})")
         return {
             "model_name": model_name,
             "param_count_m": round(param_count_m, 2),
+            "quant_type": quant_type,
+            "backend_delegate": backend_delegate,
             "pte_file_size_mb": "N/A",
             "tensor_arena_ram_mb": "N/A",
             "status": f"failed ({type(e).__name__})",
@@ -227,7 +228,7 @@ def export_single_model_to_pte(
 def print_stage1_export_report(export_results: List[Dict[str, Any]]):
     """Prints summary table comparing ExecuTorch edge lowering metrics."""
     print("\n" + "=" * 135)
-    print("📱 STAGE 1: EXECUTORCH AOT EDGE LOWERING BENCHMARK REPORT")
+    print("📱 EXECUTORCH AOT EDGE LOWERING & HARDWARE DELEGATE REPORT")
     print("=" * 135)
 
     for idx, pair in enumerate(export_results, 1):
@@ -254,7 +255,7 @@ def export_to_csv(export_results: List[Dict[str, Any]], output_csv: str):
     """Saves structured comparative ExecuTorch metrics to CSV."""
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     fieldnames = [
-        "Baseline_Model_ID", "BareTorch_Params_M", "Baseline_Params_M",
+        "Baseline_Model_ID", "BareTorch_Params_M", "Baseline_Params_M", "Quant_Type", "Backend_Delegate",
         "BareTorch_PTE_Size_MB", "Baseline_PTE_Size_MB", "Disk_Reduction_Pct",
         "BareTorch_Tensor_Arena_MB", "Baseline_Tensor_Arena_MB", "Arena_RAM_Reduction_Pct"
     ]
@@ -274,7 +275,7 @@ def export_to_csv(export_results: List[Dict[str, Any]], output_csv: str):
             a_pct = f"{((a_h - a_b) / a_h) * 100:.2f}%" if (isinstance(a_h, (int, float)) and isinstance(a_b, (int, float)) and a_h > 0) else "N/A"
 
             writer.writerow([
-                hf["model_name"], bt["param_count_m"], hf["param_count_m"],
+                hf["model_name"], bt["param_count_m"], hf["param_count_m"], bt["quant_type"], bt["backend_delegate"],
                 f_b, f_h, f_pct,
                 a_b, a_h, a_pct
             ])
@@ -284,6 +285,9 @@ def run_stage1_export_suite(
     hf_model_ids: List[str],
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     seq_len: int = 128,
+    quant_type: str = "fp32",
+    backend_delegate: str = "none",
+    dummy_weights: bool = False,
     output_dir: str = "./pte_models",
     output_json: str = "./executorch_stage1_results.json",
     output_csv: str = "./executorch_stage1_results.csv"
@@ -291,6 +295,8 @@ def run_stage1_export_suite(
     print("\n======================================================================")
     print(f"🚀 STAGE 1: EXECUTORCH AOT EDGE LOWERING & MEMORY SUITE")
     print(f"   • Baseline Target Models ({len(hf_model_ids)}) : {', '.join(hf_model_ids)}")
+    print(f"   • Quantization: {quant_type.upper()} | Backend Delegate: {backend_delegate.upper()}")
+    print(f"   • Weight Initialization Mode: {'DUMMY (Random Weights)' if dummy_weights else 'PRETRAINED'}")
     print("======================================================================\n")
 
     export_results = []
@@ -301,16 +307,22 @@ def run_stage1_export_suite(
         print(f"\n📦 Processing Hugging Face baseline model: '{model_id}'...")
 
         try:
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch.float32,
-                trust_remote_code=True
-            )
+            if dummy_weights:
+                print(f"  ⚡ Instantiating dummy randomly initialized model for '{model_id}'...")
+                hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+                hf_model = AutoModelForCausalLM.from_config(hf_config, trust_remote_code=True).to(dtype=torch.float32)
+            else:
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=torch.float32,
+                    trust_remote_code=True
+                )
             actual_model_id = model_id
         except Exception as e:
-            print(f"⚠️ Could not load '{model_id}' ({e}). Falling back to 'gpt2'...")
-            actual_model_id = f"gpt2 (fallback for {model_id})"
-            hf_model = AutoModelForCausalLM.from_pretrained("gpt2", torch_dtype=torch.float32)
+            print(f"⚠️ Could not load '{model_id}' ({e}). Falling back to dummy random 'gpt2'...")
+            actual_model_id = f"gpt2 (dummy fallback for {model_id})"
+            hf_config = AutoConfig.from_pretrained("gpt2")
+            hf_model = AutoModelForCausalLM.from_config(hf_config).to(dtype=torch.float32)
 
         cfg = getattr(hf_model, "config", None)
         cfg_dict = cfg.to_dict() if (cfg is not None and hasattr(cfg, "to_dict")) else {}
@@ -318,13 +330,15 @@ def run_stage1_export_suite(
         hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
 
         # 1. Export HF Baseline to .pte
-        hf_pte_path = os.path.join(output_dir, f"baseline_{sanitized_name}.pte")
+        hf_pte_path = os.path.join(output_dir, f"baseline_{sanitized_name}_{quant_type}_{backend_delegate}.pte")
         hf_res = export_single_model_to_pte(
             model=hf_model,
             model_name=actual_model_id,
             vocab_size=target_vocab_size,
             seq_len=seq_len,
-            output_pte_path=hf_pte_path
+            output_pte_path=hf_pte_path,
+            quant_type=quant_type,
+            backend_delegate=backend_delegate
         )
 
         del hf_model
@@ -339,21 +353,23 @@ def run_stage1_export_suite(
             max_seq_len=32768
         )
 
-        # 3. Instantiate BareTorch and verify actual parameter count
+        # 3. Instantiate BareTorch (untrained/dummy initialization)
         bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32)
         actual_bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
         print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual BareTorch Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
         print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}")
 
-        bt_pte_path = os.path.join(output_dir, f"baretorch_{sanitized_name}.pte")
+        bt_pte_path = os.path.join(output_dir, f"baretorch_{sanitized_name}_{quant_type}_{backend_delegate}.pte")
 
         bt_res = export_single_model_to_pte(
             model=bt_model,
             model_name=f"BareTorch Matched ({actual_bt_params_m:.1f}M)",
             vocab_size=target_vocab_size,
             seq_len=seq_len,
-            output_pte_path=bt_pte_path
+            output_pte_path=bt_pte_path,
+            quant_type=quant_type,
+            backend_delegate=backend_delegate
         )
 
         del bt_model
@@ -364,7 +380,6 @@ def run_stage1_export_suite(
             "baretorch_matched": bt_res
         })
 
-    # Output Terminal Summary & Files
     print_stage1_export_report(export_results)
 
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
@@ -384,14 +399,21 @@ def main():
         default=[
             "meta-llama/Llama-3.2-1B",
             "Qwen/Qwen2.5-1.5B-Instruct",
-            "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-            "google/gemma-2-2b-it"
+            "HuggingFaceTB/SmolLM2-1.7B-Instruct"
         ],
         help="Space-separated list of Hugging Face model IDs to export"
     )
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
     parser.add_argument("--seq_len", type=int, default=128)
+    parser.add_argument("--quant_type", type=str, choices=["fp32", "int8"], default="fp32", help="Quantization mode")
+    parser.add_argument(
+        "--backend", 
+        type=str, 
+        choices=["none", "xnnpack", "coreml", "qnn", "vulkan"], 
+        default="none", 
+        help="ExecuTorch delegate partitioner target"
+    )
+    parser.add_argument("--dummy_weights", action="store_true", help="Use randomly initialized weights (fast testing without downloading checkpoints)")
     parser.add_argument("--output_dir", type=str, default="./pte_models")
     parser.add_argument("--output_json", type=str, default="./executorch_stage1_results.json")
     parser.add_argument("--output_csv", type=str, default="./executorch_stage1_results.csv")
@@ -402,6 +424,9 @@ def main():
         hf_model_ids=args.hf_model_ids,
         layer_sequence=args.layer_sequence,
         seq_len=args.seq_len,
+        quant_type=args.quant_type,
+        backend_delegate=args.backend,
+        dummy_weights=args.dummy_weights,
         output_dir=args.output_dir,
         output_json=args.output_json,
         output_csv=args.output_csv
