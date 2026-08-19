@@ -32,15 +32,15 @@ DROPOUT=0.0
 SEQ_LEN=2048
 
 # ==============================================================================
-#           Optimization & Hyperparameters (1 Full Epoch / ~252B Token Runway)
+#           Optimization & Hyperparameters (~100B Token Runway / ~3.3 Days)
 # ==============================================================================
-PER_GPU_BATCH_SIZE=16
-GRAD_ACCUM=4           # Global batch size = 256 seqs/step (~524k tokens/step)
-LEARNING_RATE=6e-4     # Optimal peak LR for ~500M params across 1-epoch run
+PER_GPU_BATCH_SIZE=8    # Fits comfortably in ~38GB VRAM (No OOM)
+GRAD_ACCUM=8            # Global batch size = 256 seqs/step (~524k tokens/step)
+LEARNING_RATE=6e-4      # Peak LR for 500M model
 SCHEDULER="cosine"
-WARMUP_STEPS=2000      # 2,000 steps warmup (~1.05B tokens)
+WARMUP_STEPS=2000       # 2,000 steps warmup (~1.05B tokens)
 WEIGHT_DECAY=0.1
-MAX_STEPS=480664       # 252B tokens / 524,288 tokens per step
+MAX_STEPS=190735        # ~100B tokens total runway
 MAX_VAL_SAMPLES=5000
 
 # ==============================================================================
@@ -53,7 +53,7 @@ R2_BUCKET="baretorch-data"
 R2_PREFIX="checkpoints"
 
 LOGGING_STEPS=1000
-SAVE_STEPS=10000       # Checkpoint every ~5.24B tokens
+SAVE_STEPS=10000        # Checkpoint every ~5.24B tokens
 EVAL_STEPS=10000
 
 # Ensure log and output directories exist prior to run
@@ -69,7 +69,7 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 echo "======================================================================"
 echo "🚀 Launching BareTorch Cloud Pre-Training (500M 3:1 Hybrid)..."
 echo "  ├─ Tokenizer        : ${TOKENIZER_NAME}"
-echo "  ├─ Target Runway    : 1 Full Epoch (~252.0 Billion Tokens)"
+echo "  ├─ Target Runway    : Fast Benchmark Runway (~100.0 Billion Tokens)"
 echo "  ├─ Total Steps      : ${MAX_STEPS} steps"
 echo "  ├─ Hardware Config  : ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
 echo "  ├─ Context Length   : ${SEQ_LEN} tokens"
