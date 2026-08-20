@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM
+from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
-# Absolute imports of our modular layer-specific configs and architectures
+# Absolute imports of modular layer-specific configs and architectures
 from baretorch.integration.configuration_baretorch import (
     BareTorchConfig,
     CSLRADConfig,
@@ -44,10 +44,6 @@ class BareTorchPreTrainedModel(PreTrainedModel):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _set_gradient_checkpointing(self, module, value=True, **kwargs):
-        """
-        Hugging Face registration hook to enable/disable gradient checkpointing 
-        dynamically across BareTorch's custom layer architectures.
-        """
         if isinstance(module, (BareTorchModel, BareTorchForCausalLM)):
             module.gradient_checkpointing = value
             if hasattr(module, "config"):
@@ -57,11 +53,6 @@ class BareTorchPreTrainedModel(PreTrainedModel):
             module.gradient_checkpointing = value
 
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
-        """
-        Bypasses Hugging Face's default DynamicCache initialization to allow
-        BareTorch's heterogeneous sequence mixers (Transformer, CS-LRAD, CS-TTT)
-        to handle state caching using native tuple/tensor state lists.
-        """
         if "past_key_values" not in model_kwargs:
             model_kwargs["past_key_values"] = None
 
@@ -70,7 +61,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
     """
     The Dynamic Unified Sequence Engine of BareTorch.
     Assembles heterogeneous sequence mixers dynamically in runtime based on 
-    the config's layer_types list, remaining 100% kernel-free and GEMM-compliant.
+    the config's layer_types list.
     """
     def __init__(self, config):
         super().__init__(config)
@@ -78,7 +69,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(config.dropout)
         
-        # Assemble heterogeneous blocks on the fly based on configuration
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
             layer_type = config.layer_types[i]
@@ -158,7 +148,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
         
         is_step_inference = (past_key_values is not None) or (seq_length == 1)
         
-        # Determine dynamic block padding for sub-quadratic prefill loops
         pad_len = 0
         if not is_step_inference:
             chunk_size = self.config.chunk_size
@@ -168,7 +157,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
         
         effective_seq_len = seq_length + pad_len
         
-        # Dynamically evaluate positions for Multi-Query/Grouped-Query Attention Blocks
         if position_ids is None:
             past_length = 0
             if past_key_values is not None:
@@ -188,10 +176,8 @@ class BareTorchModel(BareTorchPreTrainedModel):
                 
             past_state = past_key_values[i] if past_key_values is not None else None
             
-            # Heterogeneous routing logic based on block architecture
             if isinstance(layer, TransformerDecoderBlock):
                 h, next_state = layer(h, past_kv=past_state, position_ids=position_ids)
-                # Trim KV cache vectors produced by chunk-padding during prefill
                 if not is_step_inference and pad_len > 0 and next_state is not None:
                     k, v = next_state
                     next_state = (k[:, :, :seq_length, :], v[:, :, :seq_length, :])
@@ -205,7 +191,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
 
         h = self.final_norm(h)
         
-        # Squeeze padding dimensions out of the final layer representations
         if not is_step_inference and pad_len > 0:
             h = h[:, :seq_length, :]
 
@@ -222,7 +207,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         )
 
 
-class BareTorchForCausalLM(BareTorchPreTrainedModel):
+class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.token_embedding.weight"}
     _supports_cache_class = False
     _supports_static_cache = False
@@ -305,11 +290,15 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel):
         self, input_ids, past_key_values=None, attention_mask=None, position_ids=None, **kwargs
     ):
         """
-        Formats inputs for Hugging Face autoregressive generate().
+        Formats input_ids for Hugging Face generate().
         During step decoding (past_key_values present), passes only the single newest token.
         """
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
+
+        cache_position = kwargs.get("cache_position", None)
+        if cache_position is not None and past_key_values is not None:
+            position_ids = cache_position[-1:].unsqueeze(0) if cache_position.dim() == 1 else cache_position
 
         return {
             "input_ids": input_ids,
@@ -320,11 +309,6 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel):
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        """
-        Reorders cache states for beam search. Handles:
-          - Transformer KV tuples: (k, v)
-          - CS-LRAD / CS-TTT state matrices: Tensor
-        """
         if past_key_values is None:
             return None
 

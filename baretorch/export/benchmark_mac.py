@@ -93,6 +93,7 @@ def main():
     parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", type=str, default="The future of edge artificial intelligence relies on efficient local architecture because")
     parser.add_argument("--device", type=str, choices=["mps", "cpu"], default="mps")
+    parser.add_argument("--skip_hf", action="store_true", help="Skip benchmarking Hugging Face model and use cached baseline metrics")
     args = parser.parse_args()
 
     token_scaling_steps = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
@@ -112,32 +113,48 @@ def main():
     bt_results = {}
 
     # --------------------------------------------------------------------------
-    # 2. Benchmark Hugging Face Baseline Model
+    # 2. Benchmark Hugging Face Baseline Model (or load cached baseline)
     # --------------------------------------------------------------------------
-    clear_memory()
-    print(f"\n📦 Loading Hugging Face Baseline: '{args.hf_model_id}'...")
-    try:
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            args.hf_model_id,
-            torch_dtype=torch.float32,
-            trust_remote_code=True
-        ).to(device).eval()
-        hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
-
-        for steps in token_scaling_steps:
-            print(f"  ├─ Benchmarking Baseline generating {steps:<4} tokens...", end="", flush=True)
-            try:
-                hf_results[steps] = benchmark_generation(hf_model, tokenizer, args.prompt, steps, device)
-                print(f" ✅ ({hf_results[steps]['throughput_tok_sec']} tok/s | VRAM: {hf_results[steps]['peak_vram_mb']} MB)")
-            except Exception as e_step:
-                print(f" ❌ Failed ({type(e_step).__name__})")
-                hf_results[steps] = {"throughput_tok_sec": "OOM/Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
-
-        del hf_model
-        clear_memory()
-    except Exception as e:
-        print(f"⚠️ Failed to initialize Hugging Face baseline ({e})")
+    if args.skip_hf:
+        print(f"\n⏩ Skipping Hugging Face Baseline benchmark (--skip_hf enabled). Loading cached metrics...")
         hf_params_m = 1235.81
+        cached_baseline = {
+            64: {"throughput_tok_sec": 24.18, "peak_vram_mb": 5212.69},
+            128: {"throughput_tok_sec": 24.67, "peak_vram_mb": 5148.69},
+            256: {"throughput_tok_sec": 24.58, "peak_vram_mb": 5452.69},
+            512: {"throughput_tok_sec": 23.74, "peak_vram_mb": 11732.69},
+            1024: {"throughput_tok_sec": 18.14, "peak_vram_mb": 15316.69},
+            2048: {"throughput_tok_sec": 19.59, "peak_vram_mb": 15316.69},
+            4096: {"throughput_tok_sec": 19.75, "peak_vram_mb": 15316.69},
+            8192: {"throughput_tok_sec": 18.32, "peak_vram_mb": 15316.69},
+        }
+        for steps in token_scaling_steps:
+            hf_results[steps] = cached_baseline.get(steps, {"throughput_tok_sec": "N/A", "peak_vram_mb": "N/A"})
+    else:
+        clear_memory()
+        print(f"\n📦 Loading Hugging Face Baseline: '{args.hf_model_id}'...")
+        try:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.hf_model_id,
+                torch_dtype=torch.float32,
+                trust_remote_code=True
+            ).to(device).eval()
+            hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
+
+            for steps in token_scaling_steps:
+                print(f"  ├─ Benchmarking Baseline generating {steps:<4} tokens...", end="", flush=True)
+                try:
+                    hf_results[steps] = benchmark_generation(hf_model, tokenizer, args.prompt, steps, device)
+                    print(f" ✅ ({hf_results[steps]['throughput_tok_sec']} tok/s | VRAM: {hf_results[steps]['peak_vram_mb']} MB)")
+                except Exception as e_step:
+                    print(f" ❌ Failed ({type(e_step).__name__})")
+                    hf_results[steps] = {"throughput_tok_sec": "OOM/Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
+
+            del hf_model
+            clear_memory()
+        except Exception as e:
+            print(f"⚠️ Failed to initialize Hugging Face baseline ({e})")
+            hf_params_m = 1235.81
 
     # --------------------------------------------------------------------------
     # 3. Benchmark BareTorch Matched Model
