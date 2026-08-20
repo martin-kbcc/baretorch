@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM, GenerationMixin
+from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
 # Absolute imports of our modular layer-specific configs and architectures
@@ -24,7 +24,7 @@ from baretorch.modeling.cs_lrad_cs_ttt_transformer import CSLRADCSTTTTransformer
 
 
 # ==========================================
-# 1. Master Dynamic Unified Model Model
+# 1. Master Dynamic Unified Model
 # ==========================================
 
 class BareTorchPreTrainedModel(PreTrainedModel):
@@ -33,6 +33,7 @@ class BareTorchPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _supports_cache_class = False
     _supports_static_cache = False
+    _supports_quantized_cache = False
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -221,8 +222,11 @@ class BareTorchModel(BareTorchPreTrainedModel):
         )
 
 
-class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
+class BareTorchForCausalLM(BareTorchPreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.token_embedding.weight"}
+    _supports_cache_class = False
+    _supports_static_cache = False
+    _supports_quantized_cache = False
 
     def __init__(self, config):
         super().__init__(config)
@@ -297,25 +301,44 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, position_ids=None, **kwargs
+    ):
+        """
+        Formats inputs for Hugging Face autoregressive generate().
+        During step decoding (past_key_values present), passes only the single newest token.
+        """
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
+
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "use_cache": kwargs.get("use_cache", True),
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
+        """
+        Reorders cache states for beam search. Handles:
+          - Transformer KV tuples: (k, v)
+          - CS-LRAD / CS-TTT state matrices: Tensor
+        """
+        if past_key_values is None:
+            return None
+
         reordered_past = ()
-        for i, layer_past in enumerate(past_key_values):
+        for layer_past in past_key_values:
             if layer_past is None:
                 reordered_past += (None,)
-            elif isinstance(layer_past, tuple):  # Is a Transformer cache (k, v)
+            elif isinstance(layer_past, tuple):  # Transformer KV cache
                 k, v = layer_past
                 reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
-            else:  # Is a sub-quadratic state tensor (CS-LRAD or CS-TTT state matrix)
+            elif isinstance(layer_past, torch.Tensor):  # Recurrent state matrix
                 reordered_past += (layer_past.index_select(0, beam_idx),)
+            else:
+                reordered_past += (layer_past,)
         return reordered_past
 
 
