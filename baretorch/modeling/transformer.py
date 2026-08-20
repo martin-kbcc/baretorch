@@ -129,7 +129,7 @@ class CausalSelfAttention(nn.Module):
         
         self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len)
         
-        self.dropout_p = dropout if self.training else 0.0
+        self.dropout_p = dropout
         self.W_out = nn.Linear(d_model, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
 
@@ -158,8 +158,11 @@ class CausalSelfAttention(nn.Module):
             
         is_causal_mask = (past_kv is None)
         
+        # Dynamically evaluate dropout based on training mode
+        dropout_p = self.dropout_p if self.training else 0.0
+
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=self.dropout_p, is_causal=is_causal_mask
+            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=is_causal_mask
         )
         
         out_flat = out.transpose(1, 2).contiguous().view(B, L, D)
