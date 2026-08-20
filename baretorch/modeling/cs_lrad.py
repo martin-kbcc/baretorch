@@ -6,6 +6,35 @@ import torch.utils.checkpoint as checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
+
+def safe_coreml_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Computes cumulative sum safely for CoreML export by temporarily flattening 
+    tensors with rank > 4 down to 3D. Prevents coremltools MIL 5D operator failure 
+    without altering parameters or numerical outputs.
+    """
+    orig_shape = x.shape
+    if dim < 0:
+        dim = len(orig_shape) + dim
+
+    if x.dim() > 4:
+        pre_dim_size = 1
+        for s in orig_shape[:dim]:
+            pre_dim_size *= s
+
+        post_dim_size = 1
+        for s in orig_shape[dim + 1:]:
+            post_dim_size *= s
+
+        target_dim_size = orig_shape[dim]
+
+        x_3d = x.reshape(pre_dim_size, target_dim_size, post_dim_size)
+        out_3d = torch.cumsum(x_3d, dim=1)
+        return out_3d.reshape(orig_shape)
+    else:
+        return torch.cumsum(x, dim=dim)
+
+
 # ==========================================
 # 1. Pure GEMM-Compliant Core Utilities
 # ==========================================
@@ -77,7 +106,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
         
         log_gate = torch.log(gate)
-        Lambda = torch.cumsum(log_gate, dim=-2)
+        Lambda = safe_coreml_cumsum(log_gate, dim=-2)
         exp_Lambda = torch.exp(Lambda)  
         
         causal_mask = torch.tril(torch.ones(C, C, device=x.device)).view(1, 1, 1, C, C)
@@ -87,7 +116,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         Y_local = torch.matmul(torch.matmul(Q, K.transpose(-1, -2)) * scaling * M_links, V)  
         
         chunk_decay_log = torch.sum(log_gate, dim=-2).squeeze(-1) 
-        Lambda_chunks = torch.cumsum(chunk_decay_log, dim=2)  
+        Lambda_chunks = safe_coreml_cumsum(chunk_decay_log, dim=2)  
         log_M_chunks = (Lambda_chunks.unsqueeze(-1) - Lambda_chunks.unsqueeze(-2)) - chunk_decay_log.unsqueeze(-1)
         
         causal_mask_chunks = torch.tril(torch.ones(N, N, device=x.device), diagonal=-1)
