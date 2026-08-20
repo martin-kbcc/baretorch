@@ -28,17 +28,23 @@ def get_backend_partitioner(backend_name: str) -> Optional[List[Any]]:
 
     elif backend in ["coreml", "metal", "ane"]:
         print("  🎯 Backend Delegate: CoreML / Metal (Apple Neural Engine & Apple GPU)")
+        
+        # 1. Primary ExecuTorch CoreML Partitioner import path
         try:
-            from executorch.backends.apple.coreml.compiler import CoreMLPartitioner
+            from executorch.backends.apple.coreml.partition import CoreMLPartitioner
             return [CoreMLPartitioner()]
         except ImportError:
+            # 2. Alternative module subpath fallback
             try:
-                from executorch.backends.apple.mps import MPSPartitioner
-                print("  ℹ️ Falling back to MPSPartitioner (Metal Performance Shaders)...")
-                return [MPSPartitioner()]
+                from executorch.backends.apple.coreml.partition.coreml_partitioner import CoreMLPartitioner
+                return [CoreMLPartitioner()]
             except ImportError:
-                print("  ⚠️ CoreML/MPS Partitioner not available. Install Apple ExecuTorch SDK bindings.")
-                return None
+                try:
+                    from executorch.backends.apple.coreml.compiler import CoreMLPartitioner
+                    return [CoreMLPartitioner()]
+                except ImportError:
+                    print("  ⚠️ CoreML Partitioner not available. Install coremltools and ExecuTorch Apple bindings.")
+                    return None
 
     elif backend in ["qnn", "qualcomm", "hexagon"]:
         print("  🎯 Backend Delegate: Qualcomm QNN (Hexagon NPU & Adreno GPU)")
