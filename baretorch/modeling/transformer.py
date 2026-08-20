@@ -99,6 +99,7 @@ class RotaryEmbedding(nn.Module):
             except Exception:
                 pass
 
+        position_ids = position_ids.to(q.device)
         cos = self.cos_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
         sin = self.sin_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
 
@@ -152,8 +153,8 @@ class CausalSelfAttention(nn.Module):
         current_kv = (k, v)
         
         if H_kv != H_q:
-            k = torch.repeat_interleave(k, self.num_queries_per_kv, dim=1)
-            v = torch.repeat_interleave(v, self.num_queries_per_kv, dim=1)
+            k = torch.repeat_interleave(k, self.num_queries_per_kv, dim=1).contiguous()
+            v = torch.repeat_interleave(v, self.num_queries_per_kv, dim=1).contiguous()
             
         is_causal_mask = (past_kv is None)
         

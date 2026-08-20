@@ -300,6 +300,9 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         if cache_position is not None and past_key_values is not None:
             position_ids = cache_position[-1:].unsqueeze(0) if cache_position.dim() == 1 else cache_position
 
+        if position_ids is not None:
+            position_ids = position_ids.to(input_ids.device)
+
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,

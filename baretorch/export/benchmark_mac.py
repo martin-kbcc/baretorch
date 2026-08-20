@@ -2,6 +2,7 @@
 import time
 import gc
 import argparse
+import traceback
 import psutil
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -34,62 +35,71 @@ def get_vram_mb() -> float:
     return process.memory_info().rss / (1024.0 ** 2)
 
 
-def benchmark_generation(
+def benchmark_generation_manual(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     prompt: str,
     gen_tokens: int,
     device: torch.device
 ) -> dict:
-    """Runs a single generation pass for a specific token count with accurate VRAM profiling."""
+    """
+    Runs a manual autoregressive decode loop matching profiler.py.
+    Bypasses Hugging Face GenerationMixin wrapper logic for pure hardware benchmarking.
+    """
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    input_length = inputs["input_ids"].shape[1]
+    input_ids = inputs["input_ids"]
+    vocab_size = getattr(model.config, "vocab_size", 50257)
+    curr_token = torch.randint(0, vocab_size, (1, 1), device=device)
 
-    # Warmup pass to allocate MPS GPU kernels
+    # 1. Warmup Pass to allocate MPS GPU kernels
     with torch.no_grad():
-        _ = model.generate(**inputs, max_new_tokens=5, do_sample=False)
+        w_out = model(input_ids, use_cache=True)
+        w_kv = getattr(w_out, "past_key_values", None)
+        for _ in range(3):
+            w_out = model(curr_token, past_key_values=w_kv, use_cache=True)
+            w_kv = getattr(w_out, "past_key_values", None)
+
     if device.type == "mps":
         torch.mps.synchronize()
 
-    # Time-To-First-Token (TTFT) / Prefill Latency
+    # 2. Time-To-First-Token (TTFT) / Prefill Latency
     ttft_start = time.perf_counter()
     with torch.no_grad():
-        _ = model(inputs["input_ids"])
+        outputs = model(input_ids, use_cache=True)
     if device.type == "mps":
         torch.mps.synchronize()
     ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
 
-    # Total Decode Generation Pass
+    past_key_values = getattr(outputs, "past_key_values", None)
+    curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+
+    # 3. Autoregressive Decode Loop
     gen_start = time.perf_counter()
     with torch.no_grad():
-        output_ids = model.generate(
-            **inputs, 
-            max_new_tokens=gen_tokens, 
-            do_sample=False, 
-            use_cache=True
-        )
+        for _ in range(gen_tokens):
+            outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
+            past_key_values = getattr(outputs, "past_key_values", None)
+            if hasattr(outputs, "logits"):
+                curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+
     if device.type == "mps":
         torch.mps.synchronize()
-    gen_total_sec = time.perf_counter() - gen_start
+    decode_sec = max(time.perf_counter() - gen_start, 1e-5)
 
-    # Synchronize to capture peak VRAM after total context expansion
     peak_vram_mb = get_vram_mb()
-
-    actual_gen_tokens = output_ids.shape[1] - input_length
-    decode_sec = max(gen_total_sec - (ttft_ms / 1000.0), 1e-5)
-    tokens_per_sec = actual_gen_tokens / decode_sec
+    tokens_per_sec = gen_tokens / decode_sec
 
     return {
-        "gen_tokens": actual_gen_tokens,
+        "gen_tokens": gen_tokens,
         "ttft_ms": round(ttft_ms, 2),
-        "total_time_sec": round(gen_total_sec, 3),
+        "total_time_sec": round(decode_sec, 3),
         "throughput_tok_sec": round(tokens_per_sec, 2),
         "peak_vram_mb": round(peak_vram_mb, 2)
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Context Length VRAM & Latency Benchmarker")
+    parser = argparse.ArgumentParser(description="BareTorch Manual Context Length Benchmarker")
     parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", type=str, default="The future of edge artificial intelligence relies on efficient local architecture because")
     parser.add_argument("--device", type=str, choices=["mps", "cpu"], default="mps")
@@ -144,10 +154,11 @@ def main():
             for steps in token_scaling_steps:
                 print(f"  ├─ Benchmarking Baseline generating {steps:<4} tokens...", end="", flush=True)
                 try:
-                    hf_results[steps] = benchmark_generation(hf_model, tokenizer, args.prompt, steps, device)
+                    hf_results[steps] = benchmark_generation_manual(hf_model, tokenizer, args.prompt, steps, device)
                     print(f" ✅ ({hf_results[steps]['throughput_tok_sec']} tok/s | VRAM: {hf_results[steps]['peak_vram_mb']} MB)")
                 except Exception as e_step:
                     print(f" ❌ Failed ({type(e_step).__name__})")
+                    traceback.print_exc()
                     hf_results[steps] = {"throughput_tok_sec": "OOM/Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
 
             del hf_model
@@ -172,15 +183,15 @@ def main():
         layer_types=["cs_lrad", "cs_lrad", "cs_lrad", "transformer"] * 3 + ["cs_lrad", "cs_lrad"]
     )
     bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32).to(device).eval()
-    bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
     for steps in token_scaling_steps:
         print(f"  ├─ Benchmarking BareTorch generating {steps:<4} tokens...", end="", flush=True)
         try:
-            bt_results[steps] = benchmark_generation(bt_model, tokenizer, args.prompt, steps, device)
+            bt_results[steps] = benchmark_generation_manual(bt_model, tokenizer, args.prompt, steps, device)
             print(f" ✅ ({bt_results[steps]['throughput_tok_sec']} tok/s | VRAM: {bt_results[steps]['peak_vram_mb']} MB)")
         except Exception as e_step:
             print(f" ❌ Failed ({type(e_step).__name__})")
+            traceback.print_exc()
             bt_results[steps] = {"throughput_tok_sec": "Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
 
     del bt_model
