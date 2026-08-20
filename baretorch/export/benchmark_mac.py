@@ -17,8 +17,19 @@ def clear_memory():
         torch.mps.empty_cache()
 
 
-def get_process_ram_mb() -> float:
-    """Returns current host RAM usage for the active process in MB."""
+def get_vram_mb() -> float:
+    """
+    Returns actual Apple Silicon GPU VRAM allocated on MPS in MB, 
+    falling back to host CPU RSS if MPS is unavailable.
+    """
+    if torch.backends.mps.is_available():
+        try:
+            return torch.mps.driver_allocated_memory() / (1024.0 ** 2)
+        except AttributeError:
+            try:
+                return torch.mps.current_allocated_memory() / (1024.0 ** 2)
+            except AttributeError:
+                pass
     process = psutil.Process()
     return process.memory_info().rss / (1024.0 ** 2)
 
@@ -30,11 +41,11 @@ def benchmark_generation(
     gen_tokens: int,
     device: torch.device
 ) -> dict:
-    """Runs a single generation pass for a specific token count."""
+    """Runs a single generation pass for a specific token count with accurate VRAM profiling."""
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_length = inputs["input_ids"].shape[1]
 
-    # Warmup pass
+    # Warmup pass to allocate MPS GPU kernels
     with torch.no_grad():
         _ = model.generate(**inputs, max_new_tokens=5, do_sample=False)
     if device.type == "mps":
@@ -61,6 +72,9 @@ def benchmark_generation(
         torch.mps.synchronize()
     gen_total_sec = time.perf_counter() - gen_start
 
+    # Synchronize to capture peak VRAM after total context expansion
+    peak_vram_mb = get_vram_mb()
+
     actual_gen_tokens = output_ids.shape[1] - input_length
     decode_sec = max(gen_total_sec - (ttft_ms / 1000.0), 1e-5)
     tokens_per_sec = actual_gen_tokens / decode_sec
@@ -70,12 +84,12 @@ def benchmark_generation(
         "ttft_ms": round(ttft_ms, 2),
         "total_time_sec": round(gen_total_sec, 3),
         "throughput_tok_sec": round(tokens_per_sec, 2),
-        "peak_ram_mb": round(get_process_ram_mb(), 2)
+        "peak_vram_mb": round(peak_vram_mb, 2)
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Scaling Context Length Benchmarker")
+    parser = argparse.ArgumentParser(description="BareTorch Context Length VRAM & Latency Benchmarker")
     parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--prompt", type=str, default="The future of edge artificial intelligence relies on efficient local architecture because")
     parser.add_argument("--device", type=str, choices=["mps", "cpu"], default="mps")
@@ -94,7 +108,6 @@ def main():
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M")
 
-    # Storage for results
     hf_results = {}
     bt_results = {}
 
@@ -115,10 +128,10 @@ def main():
             print(f"  ├─ Benchmarking Baseline generating {steps:<4} tokens...", end="", flush=True)
             try:
                 hf_results[steps] = benchmark_generation(hf_model, tokenizer, args.prompt, steps, device)
-                print(f" ✅ ({hf_results[steps]['throughput_tok_sec']} tok/s | RAM: {hf_results[steps]['peak_ram_mb']} MB)")
+                print(f" ✅ ({hf_results[steps]['throughput_tok_sec']} tok/s | VRAM: {hf_results[steps]['peak_vram_mb']} MB)")
             except Exception as e_step:
                 print(f" ❌ Failed ({type(e_step).__name__})")
-                hf_results[steps] = {"throughput_tok_sec": "OOM/Fail", "peak_ram_mb": "N/A", "ttft_ms": "N/A"}
+                hf_results[steps] = {"throughput_tok_sec": "OOM/Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
 
         del hf_model
         clear_memory()
@@ -148,10 +161,10 @@ def main():
         print(f"  ├─ Benchmarking BareTorch generating {steps:<4} tokens...", end="", flush=True)
         try:
             bt_results[steps] = benchmark_generation(bt_model, tokenizer, args.prompt, steps, device)
-            print(f" ✅ ({bt_results[steps]['throughput_tok_sec']} tok/s | RAM: {bt_results[steps]['peak_ram_mb']} MB)")
+            print(f" ✅ ({bt_results[steps]['throughput_tok_sec']} tok/s | VRAM: {bt_results[steps]['peak_vram_mb']} MB)")
         except Exception as e_step:
             print(f" ❌ Failed ({type(e_step).__name__})")
-            bt_results[steps] = {"throughput_tok_sec": "Fail", "peak_ram_mb": "N/A", "ttft_ms": "N/A"}
+            bt_results[steps] = {"throughput_tok_sec": "Fail", "peak_vram_mb": "N/A", "ttft_ms": "N/A"}
 
     del bt_model
     clear_memory()
@@ -160,9 +173,9 @@ def main():
     # 4. Comparative Scaling Summary Table
     # --------------------------------------------------------------------------
     print("\n" + "=" * 115)
-    print("📊 BARETORCH vs. LLAMA 3.2 1B CONTEXT LENGTH SCALING REPORT")
+    print("📊 BARETORCH vs. LLAMA 3.2 1B CONTEXT SCALING REPORT (APPLE SILICON MPS)")
     print("=" * 115)
-    print(f"{'Gen Length':<12} | {'BareTorch (tok/s)':<20} | {'Llama 3.2 (tok/s)':<20} | {'Throughput Δ':<16} | {'BareTorch RAM':<15} | {'Llama RAM':<15}")
+    print(f"{'Gen Length':<12} | {'BareTorch (tok/s)':<20} | {'Llama 3.2 (tok/s)':<20} | {'Throughput Δ':<16} | {'BareTorch VRAM':<15} | {'Llama VRAM':<15}")
     print("-" * 115)
 
     for steps in token_scaling_steps:
@@ -172,8 +185,8 @@ def main():
         bt_spd = bt.get("throughput_tok_sec", "N/A")
         hf_spd = hf.get("throughput_tok_sec", "N/A")
 
-        bt_ram = bt.get("peak_ram_mb", "N/A")
-        hf_ram = hf.get("peak_ram_mb", "N/A")
+        bt_vram = bt.get("peak_vram_mb", "N/A")
+        hf_vram = hf.get("peak_vram_mb", "N/A")
 
         if isinstance(bt_spd, (int, float)) and isinstance(hf_spd, (int, float)) and hf_spd > 0:
             diff_pct = ((bt_spd - hf_spd) / hf_spd) * 100
@@ -183,10 +196,10 @@ def main():
 
         bt_spd_str = f"{bt_spd} tok/s" if isinstance(bt_spd, (int, float)) else str(bt_spd)
         hf_spd_str = f"{hf_spd} tok/s" if isinstance(hf_spd, (int, float)) else str(hf_spd)
-        bt_ram_str = f"{bt_ram} MB" if isinstance(bt_ram, (int, float)) else str(bt_ram)
-        hf_ram_str = f"{hf_ram} MB" if isinstance(hf_ram, (int, float)) else str(hf_ram)
+        bt_vram_str = f"{bt_vram} MB" if isinstance(bt_vram, (int, float)) else str(bt_vram)
+        hf_vram_str = f"{hf_vram} MB" if isinstance(hf_vram, (int, float)) else str(hf_vram)
 
-        print(f"{steps:<12} | {bt_spd_str:<20} | {hf_spd_str:<20} | {diff_str:<16} | {bt_ram_str:<15} | {hf_ram_str:<15}")
+        print(f"{steps:<12} | {bt_spd_str:<20} | {hf_spd_str:<20} | {diff_str:<16} | {bt_vram_str:<15} | {hf_vram_str:<15}")
 
     print("=" * 115)
 
