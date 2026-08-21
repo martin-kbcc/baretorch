@@ -56,7 +56,6 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
-        self.num_queries_per_kv = num_heads // num_kv_heads
 
         self.W_q = nn.Linear(d_model, num_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
@@ -84,21 +83,12 @@ class CausalSelfAttention(nn.Module):
             v = mx.concatenate([pv, v], axis=-2)
         current_kv = (k, v)
 
-        if H_kv != H_q:
-            k = mx.repeat(k, self.num_queries_per_kv, axis=1)
-            v = mx.repeat(v, self.num_queries_per_kv, axis=1)
-
         scale = 1.0 / math.sqrt(d_h)
-        scores = (q @ mx.transpose(k, (0, 1, 3, 2))) * scale
+        mask_arg = "causal" if (past_kv is None and L > 1) else None
 
-        if past_kv is None and L > 1:
-            indices = mx.arange(L)
-            mask = indices[:, None] < indices[None, :]
-            mask = mx.reshape(mask, (1, 1, L, L))
-            scores = mx.where(mask, -1e9, scores)
+        # Apple Metal Fast SDPA Kernel (Eliminates O(L^2) 34GB single-buffer allocation)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask_arg)
 
-        attn_weights = mx.softmax(scores, axis=-1)
-        out = attn_weights @ v
         out_flat = mx.reshape(mx.transpose(out, (0, 2, 1, 3)), (B, L, D))
         return self.W_out(out_flat), current_kv
 
@@ -128,7 +118,6 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         self.d_head = d_model // num_heads
         self.inner_dim = self.num_heads * self.d_head
 
-        # Split projections into 2 smaller, memory-contiguous Linear layers
         self.W_qkv_swish = nn.Linear(d_model, self.inner_dim * 4, bias=False)
         self.W_gates = nn.Linear(d_model, (self.num_heads * self.r * 2) + (self.num_heads * 2), bias=True)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
