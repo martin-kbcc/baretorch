@@ -21,13 +21,25 @@ except ImportError:
 def clear_memory():
     """Flushes Python garbage collection and resets MLX Metal peak memory tracking."""
     gc.collect()
-    mx.metal.clear_cache()
-    mx.metal.reset_peak_memory()
+    
+    if hasattr(mx, "clear_cache"):
+        mx.clear_cache()
+    elif hasattr(mx.metal, "clear_cache"):
+        mx.metal.clear_cache()
+
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    elif hasattr(mx.metal, "reset_peak_memory"):
+        mx.metal.reset_peak_memory()
 
 
 def get_peak_vram_mb() -> float:
     """Returns actual Metal GPU peak allocated memory in MB."""
-    return mx.metal.get_peak_memory() / (1024.0 ** 2)
+    if hasattr(mx, "get_peak_memory"):
+        return mx.get_peak_memory() / (1024.0 ** 2)
+    elif hasattr(mx.metal, "get_peak_memory"):
+        return mx.metal.get_peak_memory() / (1024.0 ** 2)
+    return 0.0
 
 
 def benchmark_mlx_model(
@@ -38,10 +50,10 @@ def benchmark_mlx_model(
     is_mlx_lm: bool = False
 ) -> dict:
     """
-    Standardized Compiled MLX benchmark matching CUDA profiler:
+    Standardized MLX benchmark matching CUDA profiler:
     1. Un-timed warmup pass
     2. Prefill phase (TTFT ms for prompt_len)
-    3. Decode phase with compiled step function (steady-state tok/s)
+    3. Decode phase (steady-state tok/s)
     """
     clear_memory()
 
@@ -49,7 +61,7 @@ def benchmark_mlx_model(
     curr_token = mx.random.randint(0, vocab_size, (1, 1))
 
     if is_mlx_lm:
-        # 1. Warmup Pass
+        # 1. Warmup Pass (mlx_lm)
         w_cache = make_prompt_cache(model)
         w_out = model(prompt, cache=w_cache)
         mx.eval(w_out)
@@ -69,22 +81,16 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Compiled Decode Phase
-        def decode_step(tok, c_cache):
-            logits = model(tok, cache=c_cache)
-            next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-            return next_tok
-
-        compiled_step = mx.compile(decode_step)
-
+        # 3. Decode Phase (mlx_lm uses internal C++ cache state)
         gen_start = time.perf_counter()
         for _ in range(gen_len):
-            curr_token = compiled_step(curr_token, cache)
-            mx.eval(curr_token)
+            outputs = model(curr_token, cache=cache)
+            mx.eval(outputs)
+            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
     else:
-        # 1. Warmup Pass
+        # 1. Warmup Pass (BareTorch MLX)
         w_out, w_cache = model(prompt)
         mx.eval(w_out)
         w_curr = mx.argmax(w_out[:, -1:, :], axis=-1)
@@ -102,7 +108,7 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Compiled Decode Phase
+        # 3. Compiled Decode Phase for BareTorch (Lists/Tuples of mx.array are valid PyTrees)
         def decode_step_bt(tok, p_kv):
             logits, n_kv = model(tok, past_key_values=p_kv)
             next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
