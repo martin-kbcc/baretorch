@@ -35,11 +35,10 @@ class RotaryEmbedding(nn.Module):
         self.inv_freq = inv_freq
 
     def apply_rope(self, q: mx.array, k: mx.array, position_ids: mx.array) -> tuple[mx.array, mx.array]:
-        t = position_ids.astype(mx.float32)
-        freqs = mx.outer(t.squeeze(0), self.inv_freq)
+        freqs = mx.expand_dims(position_ids.astype(mx.float32), axis=-1) * self.inv_freq
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.expand_dims(mx.cos(emb), axis=(0, 1))
-        sin = mx.expand_dims(mx.sin(emb), axis=(0, 1))
+        cos = mx.expand_dims(mx.cos(emb), axis=1)
+        sin = mx.expand_dims(mx.sin(emb), axis=1)
 
         def _rotate_half(x):
             half = self.dim // 2
@@ -187,7 +186,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         chunk_decay_last = exp_Lambda[:, :, -1, -1:, :]
         S_historical_last = S_historical[:, :, -1]
         S_local_last = mx.transpose(U_decayed[:, :, -1], (0, 1, 3, 2)) @ V[:, :, -1]
-        S_final = (mx.squeeze(chunk_decay_last, axis=2) * S_historical_last) + S_local_last
+        S_final = (chunk_decay_last * S_historical_last) + S_local_last
 
         return self.W_out(Out * nn.silu(self.W_swish_gate(x))), S_final
 
@@ -248,8 +247,8 @@ class BareTorchModelMLX(nn.Module):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.layers = []
-
+        
+        layers = []
         for layer_type in config.layer_types:
             if layer_type == "transformer":
                 block = TransformerDecoderBlock(
@@ -267,8 +266,9 @@ class BareTorchModelMLX(nn.Module):
                 )
             else:
                 raise ValueError(f"Unsupported MLX layer type '{layer_type}'")
-            self.layers.append(block)
+            layers.append(block)
 
+        self.layers = layers
         self.final_norm = RMSNorm(config.d_model)
 
     def __call__(self, input_ids: mx.array, past_key_values: list | None = None):

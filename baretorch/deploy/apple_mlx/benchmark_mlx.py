@@ -13,6 +13,7 @@ from baretorch.deploy.apple_mlx.modeling_mlx import BareTorchForCausalLMMLX
 
 try:
     from mlx_lm import load as mlx_lm_load
+    from mlx_lm.models.cache import make_prompt_cache
     HAS_MLX_LM = True
 except ImportError:
     HAS_MLX_LM = False
@@ -30,11 +31,12 @@ def get_ram_mb() -> float:
     return process.memory_info().rss / (1024.0 ** 2)
 
 
-def benchmark_mlx_inference_standardized(
+def benchmark_mlx_model(
     model: nn.Module,
     prompt_len: int,
     gen_len: int,
-    vocab_size: int
+    vocab_size: int,
+    is_mlx_lm: bool = False
 ) -> dict:
     """
     Standardized MLX benchmark matching NVIDIA CUDA profiler:
@@ -45,29 +47,59 @@ def benchmark_mlx_inference_standardized(
     prompt = mx.random.randint(0, vocab_size, (1, prompt_len))
     curr_token = mx.random.randint(0, vocab_size, (1, 1))
 
-    # 1. Warmup Pass
-    w_out, w_cache = model(prompt)
-    mx.eval(w_out)
-    for _ in range(3):
-        w_out, w_cache = model(curr_token, past_key_values=w_cache)
+    if is_mlx_lm:
+        # 1. Warmup Pass (mlx_lm)
+        w_cache = make_prompt_cache(model)
+        w_out = model(prompt, cache=w_cache)
         mx.eval(w_out)
+        w_curr = mx.argmax(w_out[:, -1:, :], axis=-1)
+        for _ in range(3):
+            w_out = model(w_curr, cache=w_cache)
+            mx.eval(w_out)
 
-    # 2. Prefill Phase (TTFT ms)
-    ttft_start = time.perf_counter()
-    outputs, past_key_values = model(prompt)
-    mx.eval(outputs)
-    ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
-
-    curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
-
-    # 3. Decode Phase (gen_len tokens)
-    gen_start = time.perf_counter()
-    for _ in range(gen_len):
-        outputs, past_key_values = model(curr_token, past_key_values=past_key_values)
+        # 2. Prefill Phase (TTFT ms)
+        cache = make_prompt_cache(model)
+        ttft_start = time.perf_counter()
+        outputs = model(prompt, cache=cache)
         mx.eval(outputs)
+        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-    decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+        # 3. Decode Phase (gen_len tokens)
+        gen_start = time.perf_counter()
+        for _ in range(gen_len):
+            outputs = model(curr_token, cache=cache)
+            mx.eval(outputs)
+            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+
+        decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+    else:
+        # 1. Warmup Pass (BareTorch MLX)
+        w_out, w_cache = model(prompt)
+        mx.eval(w_out)
+        w_curr = mx.argmax(w_out[:, -1:, :], axis=-1)
+        for _ in range(3):
+            w_out, w_cache = model(w_curr, past_key_values=w_cache)
+            mx.eval(w_out)
+
+        # 2. Prefill Phase (TTFT ms)
+        ttft_start = time.perf_counter()
+        outputs, past_key_values = model(prompt)
+        mx.eval(outputs)
+        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+
+        curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+
+        # 3. Decode Phase (gen_len tokens)
+        gen_start = time.perf_counter()
+        for _ in range(gen_len):
+            outputs, past_key_values = model(curr_token, past_key_values=past_key_values)
+            mx.eval(outputs)
+            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+
+        decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+
     peak_ram_mb = get_ram_mb()
     tokens_per_sec = gen_len / decode_sec
 
@@ -110,7 +142,7 @@ def main():
             for ctx in args.prompt_lens:
                 print(f"  ├─ Benchmarking Baseline (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
                 try:
-                    hf_results[ctx] = benchmark_mlx_inference_standardized(hf_model, ctx, args.gen_len, hf_vocab_size)
+                    hf_results[ctx] = benchmark_mlx_model(hf_model, ctx, args.gen_len, hf_vocab_size, is_mlx_lm=True)
                     print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | RAM: {hf_results[ctx]['peak_ram_mb']} MB)")
                 except Exception as e_step:
                     print(f" ❌ Failed ({type(e_step).__name__})")
@@ -142,7 +174,7 @@ def main():
     for ctx in args.prompt_lens:
         print(f"  ├─ Benchmarking BareTorch (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
         try:
-            bt_results[ctx] = benchmark_mlx_inference_standardized(bt_model, ctx, args.gen_len, vocab_size)
+            bt_results[ctx] = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
             print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | RAM: {bt_results[ctx]['peak_ram_mb']} MB)")
         except Exception as e_step:
             print(f" ❌ Failed ({type(e_step).__name__})")
