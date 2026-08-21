@@ -1,4 +1,7 @@
 # baretorch/deploy/apple_mlx/benchmark_mlx.py
+import os
+import csv
+import json
 import time
 import gc
 import argparse
@@ -161,157 +164,258 @@ def benchmark_mlx_model(
     clear_memory()
     prompt = mx.random.randint(0, vocab_size, (1, prompt_len))
 
-    if is_mlx_lm:
-        w_cache = make_prompt_cache(model)
-        w_out = model(prompt, cache=w_cache)
-        mx.eval(w_out)
+    try:
+        if is_mlx_lm:
+            w_cache = make_prompt_cache(model)
+            w_out = model(prompt, cache=w_cache)
+            mx.eval(w_out)
 
-        clear_memory()
+            clear_memory()
 
-        cache = make_prompt_cache(model)
-        ttft_start = time.perf_counter()
-        outputs = model(prompt, cache=cache)
-        mx.eval(outputs)
-        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
-
-        clear_memory()
-        curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
-
-        gen_start = time.perf_counter()
-        for _ in range(gen_len):
-            outputs = model(curr_token, cache=cache)
+            cache = make_prompt_cache(model)
+            ttft_start = time.perf_counter()
+            outputs = model(prompt, cache=cache)
             mx.eval(outputs)
+            ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+
+            clear_memory()
             curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        decode_sec = max(time.perf_counter() - gen_start, 1e-5)
-        decode_vram_mb = get_peak_vram_mb()
-    else:
-        w_out, w_cache = model(prompt)
-        mx.eval(w_out, w_cache)
+            gen_start = time.perf_counter()
+            for _ in range(gen_len):
+                outputs = model(curr_token, cache=cache)
+                mx.eval(outputs)
+                curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
+            decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+            decode_vram_mb = get_peak_vram_mb()
+        else:
+            w_out, w_cache = model(prompt)
+            mx.eval(w_out, w_cache)
+
+            clear_memory()
+
+            ttft_start = time.perf_counter()
+            outputs, past_key_values = model(prompt)
+            mx.eval(outputs, past_key_values)
+            ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+
+            clear_memory()
+            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+
+            def decode_step_bt(tok, p_kv):
+                logits, n_kv = model(tok, past_key_values=p_kv)
+                next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+                return next_tok, n_kv
+
+            compiled_step = mx.compile(decode_step_bt)
+
+            dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
+            mx.eval(dummy_tok, past_key_values)
+
+            gen_start = time.perf_counter()
+            for _ in range(gen_len):
+                curr_token, past_key_values = compiled_step(curr_token, past_key_values)
+                mx.eval(curr_token, past_key_values)
+
+            decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+            decode_vram_mb = get_peak_vram_mb()
+
+        tokens_per_sec = gen_len / decode_sec
+
+        return {
+            "prompt_len": prompt_len,
+            "ttft_ms": round(ttft_ms, 2),
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "decode_vram_mb": round(decode_vram_mb, 2),
+            "status": "success"
+        }
+    except Exception as e:
         clear_memory()
+        return {
+            "prompt_len": prompt_len,
+            "ttft_ms": "OOM",
+            "tokens_per_sec": "OOM",
+            "decode_vram_mb": "OOM",
+            "status": f"OOM ({type(e).__name__})"
+        }
 
-        ttft_start = time.perf_counter()
-        outputs, past_key_values = model(prompt)
-        mx.eval(outputs, past_key_values)
-        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
 
-        clear_memory()
-        curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+def format_cell(val) -> str:
+    if str(val).startswith("OOM"):
+        return "💥 OOM"
+    elif isinstance(val, (int, float)):
+        return f"{val:.2f}"
+    return str(val)
 
-        def decode_step_bt(tok, p_kv):
-            logits, n_kv = model(tok, past_key_values=p_kv)
-            next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-            return next_tok, n_kv
 
-        compiled_step = mx.compile(decode_step_bt)
+def export_to_csv(paired_results: list, output_csv: str):
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    fieldnames = [
+        "Baseline_Model_ID", "Context_Length", "Metric",
+        "BareTorch_Matched_Value", "Baseline_Value", "BareTorch_Advantage"
+    ]
 
-        dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
-        mx.eval(dummy_tok, past_key_values)
+    with open(output_csv, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(fieldnames)
 
-        gen_start = time.perf_counter()
-        for _ in range(gen_len):
-            curr_token, past_key_values = compiled_step(curr_token, past_key_values)
-            mx.eval(curr_token, past_key_values)
+        for pair in paired_results:
+            hf_res = pair["hf_baseline"]
+            bt_res = pair["baretorch_matched"]
+            baseline_id = hf_res["model_name"]
 
-        decode_sec = max(time.perf_counter() - gen_start, 1e-5)
-        decode_vram_mb = get_peak_vram_mb()
+            prompt_lens = [r["prompt_len"] for r in bt_res["runs"]]
 
-    tokens_per_sec = gen_len / decode_sec
+            for run_idx, ctx in enumerate(prompt_lens):
+                b_run = bt_res["runs"][run_idx]
+                h_run = hf_res["runs"][run_idx]
 
-    return {
-        "prompt_len": prompt_len,
-        "ttft_ms": round(ttft_ms, 2),
-        "tokens_per_sec": round(tokens_per_sec, 2),
-        "decode_vram_mb": round(decode_vram_mb, 2)
-    }
+                t_b, t_h = b_run["ttft_ms"], h_run["ttft_ms"]
+                ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_b, (int, float)) and t_h > 0) else "N/A"
+                writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", t_b, t_h, ttft_adv])
+
+                s_b, s_h = b_run["tokens_per_sec"], h_run["tokens_per_sec"]
+                speed_adv = f"{s_b / s_h:.2f}x" if (isinstance(s_h, (int, float)) and isinstance(s_b, (int, float)) and s_h > 0) else "N/A"
+                writer.writerow([baseline_id, ctx, "Local_GPU_Decode_tok_s", s_b, s_h, speed_adv])
+
+                v_b, v_h = b_run["decode_vram_mb"], h_run["decode_vram_mb"]
+                vram_adv = f"-{((v_h - v_b) / v_h) * 100:.2f}%" if (isinstance(v_h, (int, float)) and isinstance(v_b, (int, float)) and v_h > 0) else "N/A"
+                writer.writerow([baseline_id, ctx, "Decode_VRAM_MB", v_b, v_h, vram_adv])
+
+    print(f"\n📊 MLX Multi-model CSV report saved to: {output_csv}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="BareTorch Apples-to-Apples MLX Suite")
-    parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
+    parser.add_argument(
+        "--hf_model_ids",
+        nargs="+",
+        type=str,
+        default=["meta-llama/Llama-3.2-1B"],
+        help="Space-separated list of Hugging Face/MLX model IDs to evaluate"
+    )
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
     parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192, 16384, 32768])
     parser.add_argument("--gen_len", type=int, default=32)
+    parser.add_argument("--output_json", type=str, default="./results_mlx_suite.json")
+    parser.add_argument("--output_csv", type=str, default="./results_mlx_suite.csv")
     args = parser.parse_args()
 
     print("==================================================================================================")
-    print("🍎 BARETORCH APPLES-TO-APPLES NATIVE MLX SUITE (DYNAMIC PARAMETER MATCHING)")
+    print(f"🍎 BARETORCH APPLES-TO-APPLES NATIVE MLX SUITE ({len(args.hf_model_ids)} Baseline Models)")
     print("==================================================================================================")
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.hf_model_id, trust_remote_code=True)
-        vocab_size = getattr(tokenizer, "vocab_size", 50257)
-    except Exception:
-        vocab_size = 50257
-
-    hf_results = {}
-    bt_results = {}
-
-    clear_memory()
-    print(f"\n📦 Loading Native MLX Baseline: '{args.hf_model_id}'...")
-    hf_params_m = 0.0
-    if HAS_MLX_LM:
-        try:
-            hf_model, _ = mlx_lm_load(args.hf_model_id)
-            hf_params_m = count_mlx_params_m(hf_model)
-            print(f"  • Baseline Parameters (MLX Measured): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
-
-            for ctx in args.prompt_lens:
-                print(f"  ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
-                hf_results[ctx] = benchmark_mlx_model(hf_model, ctx, args.gen_len, vocab_size, is_mlx_lm=True)
-                print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | VRAM: {hf_results[ctx]['decode_vram_mb']} MB)")
-            del hf_model
-            clear_memory()
-        except Exception as e:
-            print(f"⚠️ Failed to load baseline ({e}).")
-
-    if hf_params_m == 0.0:
-        hf_params_m = 1237.0
-
-    print(f"\n⚙️ Looking up BareTorch MLX blueprint matching ~{hf_params_m:.2f}M parameters...")
+    paired_results = []
     max_seq_len = max(args.prompt_lens) + args.gen_len + 1024
-    bt_config, bt_params_m_predicted = find_matching_baretorch_config(
-        target_params_m=hf_params_m,
-        target_vocab_size=vocab_size,
-        layer_sequence=args.layer_sequence,
-        max_seq_len=max_seq_len
-    )
 
-    bt_model = BareTorchForCausalLMMLX(bt_config)
-    bt_model.set_dtype(mx.float16)
-    actual_bt_params_m = count_mlx_params_m(bt_model)
+    for model_id in args.hf_model_ids:
+        print(f"\n" + "─" * 100)
+        print(f"📦 Evaluating Target Baseline Family: '{model_id}'")
+        print("─" * 100)
 
-    print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
-    print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}, head_dim={bt_config.d_model // bt_config.num_heads}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            vocab_size = getattr(tokenizer, "vocab_size", 50257)
+        except Exception:
+            vocab_size = 50257
 
-    for ctx in args.prompt_lens:
-        print(f"  ├─ Benchmarking BareTorch @ Context: {ctx:<5} tokens...", end="", flush=True)
-        bt_results[ctx] = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
-        print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | VRAM: {bt_results[ctx]['decode_vram_mb']} MB)")
+        hf_runs = []
+        bt_runs = []
 
-    del bt_model
-    clear_memory()
+        clear_memory()
+        hf_params_m = 0.0
 
+        if HAS_MLX_LM:
+            try:
+                print(f"  • Loading Baseline from MLX/HF Hub...")
+                hf_model, _ = mlx_lm_load(model_id)
+                hf_params_m = count_mlx_params_m(hf_model)
+                print(f"  • Baseline Parameters (MLX Measured): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
+
+                for ctx in args.prompt_lens:
+                    print(f"  ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
+                    res = benchmark_mlx_model(hf_model, ctx, args.gen_len, vocab_size, is_mlx_lm=True)
+                    hf_runs.append(res)
+                    print(f" ✅ (TTFT: {format_cell(res['ttft_ms'])} ms | Decode: {format_cell(res['tokens_per_sec'])} tok/s | VRAM: {format_cell(res['decode_vram_mb'])} MB)")
+
+                del hf_model
+                clear_memory()
+            except Exception as e:
+                print(f"⚠️ Could not benchmark baseline model '{model_id}' ({e}).")
+
+        if hf_params_m == 0.0:
+            hf_params_m = 1237.0
+
+        print(f"\n  ⚙️ Looking up BareTorch MLX blueprint matching ~{hf_params_m:.2f}M parameters...")
+        bt_config, bt_params_m_predicted = find_matching_baretorch_config(
+            target_params_m=hf_params_m,
+            target_vocab_size=vocab_size,
+            layer_sequence=args.layer_sequence,
+            max_seq_len=max_seq_len
+        )
+
+        bt_model = BareTorchForCausalLMMLX(bt_config)
+        bt_model.set_dtype(mx.float16)
+        actual_bt_params_m = count_mlx_params_m(bt_model)
+
+        print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
+        print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}, head_dim={bt_config.d_model // bt_config.num_heads}")
+
+        for ctx in args.prompt_lens:
+            print(f"  ├─ Benchmarking BareTorch @ Context: {ctx:<5} tokens...", end="", flush=True)
+            res = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
+            bt_runs.append(res)
+            print(f" ✅ (TTFT: {format_cell(res['ttft_ms'])} ms | Decode: {format_cell(res['tokens_per_sec'])} tok/s | VRAM: {format_cell(res['decode_vram_mb'])} MB)")
+
+        del bt_model
+        clear_memory()
+
+        paired_results.append({
+            "hf_baseline": {
+                "model_name": model_id,
+                "param_count_m": hf_params_m,
+                "runs": hf_runs
+            },
+            "baretorch_matched": {
+                "model_name": f"BareTorch Matched ({actual_bt_params_m:.1f}M)",
+                "param_count_m": actual_bt_params_m,
+                "runs": bt_runs
+            }
+        })
+
+    # Summary Report
     print("\n" + "=" * 145)
-    print(f"📊 STANDARDIZED BARETORCH ({actual_bt_params_m:.1f}M) vs. BASELINE ({hf_params_m:.1f}M) REPORT")
+    print("📊 APPLES-TO-APPLES MLX SUITE SUMMARY REPORT")
     print("=" * 145)
-    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Baseline TTFT':<16} | {'BareTorch Decode':<18} | {'Baseline Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
-    print("-" * 145)
 
-    for ctx in args.prompt_lens:
-        bt = bt_results.get(ctx, {})
-        hf = hf_results.get(ctx, {})
+    for pair in paired_results:
+        hf_res = pair["hf_baseline"]
+        bt_res = pair["baretorch_matched"]
 
-        bt_ttft = f"{bt.get('ttft_ms', 'N/A')} ms"
-        hf_ttft = f"{hf.get('ttft_ms', 'N/A')} ms"
-        bt_dec = f"{bt.get('tokens_per_sec', 'N/A')} tok/s"
-        hf_dec = f"{hf.get('tokens_per_sec', 'N/A')} tok/s"
-        vram_str = f"{bt.get('decode_vram_mb', 'N/A')} / {hf.get('decode_vram_mb', 'N/A')} MB"
+        print(f"\n🎯 BASELINE: {hf_res['model_name']} ({hf_res['param_count_m']:.1f}M) vs BARETORCH MATCHED ({bt_res['param_count_m']:.1f}M)")
+        print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Baseline TTFT':<16} | {'BareTorch Decode':<18} | {'Baseline Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
+        print("-" * 145)
 
-        print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<22}")
+        for run_idx in range(len(bt_res["runs"])):
+            b_run = bt_res["runs"][run_idx]
+            h_run = hf_res["runs"][run_idx] if run_idx < len(hf_res["runs"]) else {}
 
-    print("=" * 145)
+            ctx = b_run["prompt_len"]
+            bt_ttft = f"{format_cell(b_run.get('ttft_ms'))} ms"
+            hf_ttft = f"{format_cell(h_run.get('ttft_ms'))} ms"
+            bt_dec = f"{format_cell(b_run.get('tokens_per_sec'))} tok/s"
+            hf_dec = f"{format_cell(h_run.get('tokens_per_sec'))} tok/s"
+            vram_str = f"{format_cell(b_run.get('decode_vram_mb'))} / {format_cell(h_run.get('decode_vram_mb'))} MB"
+
+            print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<22}")
+
+    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
+    with open(args.output_json, "w") as f:
+        json.dump(paired_results, f, indent=2)
+
+    export_to_csv(paired_results, args.output_csv)
+    print(f"💾 MLX Multi-model JSON report saved to: {args.output_json}")
 
 
 if __name__ == "__main__":
