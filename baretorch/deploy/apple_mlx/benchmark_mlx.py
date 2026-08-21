@@ -3,7 +3,6 @@ import time
 import gc
 import argparse
 import traceback
-import psutil
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import AutoTokenizer
@@ -20,15 +19,15 @@ except ImportError:
 
 
 def clear_memory():
-    """Triggers Python garbage collection and clears MLX cache allocations."""
+    """Flushes Python garbage collection and resets MLX Metal peak memory tracking."""
     gc.collect()
-    mx.eval()
+    mx.metal.clear_cache()
+    mx.metal.reset_peak_memory()
 
 
-def get_ram_mb() -> float:
-    """Returns total active system memory usage in MB."""
-    process = psutil.Process()
-    return process.memory_info().rss / (1024.0 ** 2)
+def get_peak_vram_mb() -> float:
+    """Returns actual Metal GPU peak allocated memory in MB."""
+    return mx.metal.get_peak_memory() / (1024.0 ** 2)
 
 
 def benchmark_mlx_model(
@@ -39,16 +38,18 @@ def benchmark_mlx_model(
     is_mlx_lm: bool = False
 ) -> dict:
     """
-    Standardized MLX benchmark matching NVIDIA CUDA profiler:
+    Standardized Compiled MLX benchmark matching CUDA profiler:
     1. Un-timed warmup pass
     2. Prefill phase (TTFT ms for prompt_len)
-    3. Decode phase (steady-state tok/s over gen_len=32)
+    3. Decode phase with compiled step function (steady-state tok/s)
     """
+    clear_memory()
+
     prompt = mx.random.randint(0, vocab_size, (1, prompt_len))
     curr_token = mx.random.randint(0, vocab_size, (1, 1))
 
     if is_mlx_lm:
-        # 1. Warmup Pass (mlx_lm)
+        # 1. Warmup Pass
         w_cache = make_prompt_cache(model)
         w_out = model(prompt, cache=w_cache)
         mx.eval(w_out)
@@ -56,6 +57,8 @@ def benchmark_mlx_model(
         for _ in range(3):
             w_out = model(w_curr, cache=w_cache)
             mx.eval(w_out)
+
+        clear_memory()
 
         # 2. Prefill Phase (TTFT ms)
         cache = make_prompt_cache(model)
@@ -66,22 +69,30 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Decode Phase (gen_len tokens)
+        # 3. Compiled Decode Phase
+        def decode_step(tok, c_cache):
+            logits = model(tok, cache=c_cache)
+            next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+            return next_tok
+
+        compiled_step = mx.compile(decode_step)
+
         gen_start = time.perf_counter()
         for _ in range(gen_len):
-            outputs = model(curr_token, cache=cache)
-            mx.eval(outputs)
-            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+            curr_token = compiled_step(curr_token, cache)
+            mx.eval(curr_token)
 
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
     else:
-        # 1. Warmup Pass (BareTorch MLX)
+        # 1. Warmup Pass
         w_out, w_cache = model(prompt)
         mx.eval(w_out)
         w_curr = mx.argmax(w_out[:, -1:, :], axis=-1)
         for _ in range(3):
             w_out, w_cache = model(w_curr, past_key_values=w_cache)
             mx.eval(w_out)
+
+        clear_memory()
 
         # 2. Prefill Phase (TTFT ms)
         ttft_start = time.perf_counter()
@@ -91,23 +102,29 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Decode Phase (gen_len tokens)
+        # 3. Compiled Decode Phase
+        def decode_step_bt(tok, p_kv):
+            logits, n_kv = model(tok, past_key_values=p_kv)
+            next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+            return next_tok, n_kv
+
+        compiled_step = mx.compile(decode_step_bt)
+
         gen_start = time.perf_counter()
         for _ in range(gen_len):
-            outputs, past_key_values = model(curr_token, past_key_values=past_key_values)
-            mx.eval(outputs)
-            curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+            curr_token, past_key_values = compiled_step(curr_token, past_key_values)
+            mx.eval(curr_token)
 
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
 
-    peak_ram_mb = get_ram_mb()
+    peak_vram_mb = get_peak_vram_mb()
     tokens_per_sec = gen_len / decode_sec
 
     return {
         "prompt_len": prompt_len,
         "ttft_ms": round(ttft_ms, 2),
         "tokens_per_sec": round(tokens_per_sec, 2),
-        "peak_ram_mb": round(peak_ram_mb, 2)
+        "peak_vram_mb": round(peak_vram_mb, 2)
     }
 
 
@@ -143,11 +160,11 @@ def main():
                 print(f"  ├─ Benchmarking Baseline (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
                 try:
                     hf_results[ctx] = benchmark_mlx_model(hf_model, ctx, args.gen_len, hf_vocab_size, is_mlx_lm=True)
-                    print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | RAM: {hf_results[ctx]['peak_ram_mb']} MB)")
+                    print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | VRAM: {hf_results[ctx]['peak_vram_mb']} MB)")
                 except Exception as e_step:
                     print(f" ❌ Failed ({type(e_step).__name__})")
                     traceback.print_exc()
-                    hf_results[ctx] = {"ttft_ms": "OOM/Fail", "tokens_per_sec": "OOM/Fail", "peak_ram_mb": "N/A"}
+                    hf_results[ctx] = {"ttft_ms": "OOM/Fail", "tokens_per_sec": "OOM/Fail", "peak_vram_mb": "N/A"}
 
             del hf_model
             clear_memory()
@@ -175,11 +192,11 @@ def main():
         print(f"  ├─ Benchmarking BareTorch (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
         try:
             bt_results[ctx] = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
-            print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | RAM: {bt_results[ctx]['peak_ram_mb']} MB)")
+            print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | VRAM: {bt_results[ctx]['peak_vram_mb']} MB)")
         except Exception as e_step:
             print(f" ❌ Failed ({type(e_step).__name__})")
             traceback.print_exc()
-            bt_results[ctx] = {"ttft_ms": "Fail", "tokens_per_sec": "Fail", "peak_ram_mb": "N/A"}
+            bt_results[ctx] = {"ttft_ms": "Fail", "tokens_per_sec": "Fail", "peak_vram_mb": "N/A"}
 
     del bt_model
     clear_memory()
@@ -188,7 +205,7 @@ def main():
     print("\n" + "=" * 130)
     print("📊 STANDARDIZED BARETORCH vs. LLAMA 3.2 1B CONTEXT REPORT (NATIVE APPLE SILICON MLX)")
     print("=" * 130)
-    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18} | {'RAM (BT / HF)':<20}")
+    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18} | {'VRAM (BT / HF)':<20}")
     print("-" * 130)
 
     for ctx in args.prompt_lens:
@@ -199,9 +216,9 @@ def main():
         hf_ttft = f"{hf.get('ttft_ms', 'N/A')} ms"
         bt_dec = f"{bt.get('tokens_per_sec', 'N/A')} tok/s"
         hf_dec = f"{hf.get('tokens_per_sec', 'N/A')} tok/s"
-        ram_str = f"{bt.get('peak_ram_mb', 'N/A')} / {hf.get('peak_ram_mb', 'N/A')} MB"
+        vram_str = f"{bt.get('peak_vram_mb', 'N/A')} / {hf.get('peak_vram_mb', 'N/A')} MB"
 
-        print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {ram_str:<20}")
+        print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<20}")
 
     print("=" * 130)
 
