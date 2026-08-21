@@ -1,3 +1,4 @@
+# baretorch/benchmark/runner.py
 import os
 import json
 import csv
@@ -51,17 +52,12 @@ def count_baretorch_params_fast(
     layer_params = 0
 
     for l_type in full_layer_types:
-        # RMSNorms (ln1 + ln2)
         norms = 2 * d_model
-
-        # GatedMLP SwiGLU (w1 + w2 + w3)
         mlp = 3 * d_model * d_ff
 
         if l_type == "cs_lrad":
-            # CS-LRAD Engine (W_q, W_k, W_v, W_swish_gate, W_out + W_u, W_r + W_gate, W_beta_gate)
             attn = (5 * (d_model ** 2)) + (2 * d_model * num_heads * rank) + (2 * (d_model * num_heads + num_heads))
         else:
-            # Transformer Attention (W_q, W_k, W_v, W_out)
             attn = (2 * (d_model ** 2)) + (2 * d_model * (num_kv_heads * head_dim))
 
         layer_params += (norms + mlp + attn)
@@ -139,7 +135,8 @@ def profile_single_model(
     device: str,
     is_compiled: bool = False
 ) -> Dict[str, Any]:
-    cfg = getattr(model, "config", None)
+    raw_model = getattr(model, "_orig_mod", model)
+    cfg = getattr(raw_model, "config", None)
     cfg_dict = cfg.to_dict() if (cfg is not None and hasattr(cfg, "to_dict")) else {}
     vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", 50257))
 
@@ -150,7 +147,8 @@ def profile_single_model(
             with torch.no_grad():
                 _ = model(warmup_prompt, use_cache=True)
             torch.cuda.synchronize()
-        except Exception:
+        except Exception as w_err:
+            print(f"  ⚠️ Warmup pass warning ({w_err})")
             clear_gpu_memory(device)
 
     results = {
@@ -162,6 +160,10 @@ def profile_single_model(
 
     for ctx_len in prompt_lens:
         print(f"  🔍 Sweeping {model_name} @ Context Length: {ctx_len} tokens...")
+
+        # Reset GPU memory stats before starting sweep step
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         lat = LatencyProfiler.profile_inference(
             model=model,
@@ -279,7 +281,7 @@ def export_to_csv(paired_results: List[Dict[str, Any]], output_csv: str):
                 h_run = hf_res["runs"][run_idx]
 
                 t_b, t_h = b_run["ttft_ms"], h_run["ttft_ms"]
-                ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_b, (int, float)) and t_h > 0) else "N/A"
+                ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_h, (int, float)) and t_h > 0) else "N/A"
                 writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", t_b, t_h, ttft_adv])
 
                 s_b, s_h = b_run["tokens_per_sec"], h_run["tokens_per_sec"]
@@ -313,6 +315,7 @@ def run_comparative_benchmark(
     print("\n======================================================================")
     print(f"🚀 BareTorch Apples-to-Apples Vocab-Aware Benchmark Suite [{device.upper()}]")
     print(f"  • Baseline Target Models ({len(hf_model_ids)}) : {', '.join(hf_model_ids)}")
+    print(f"  • torch.compile Mode: {'ENABLED (Symmetric)' if compile_model else 'DISABLED'}")
     print("======================================================================\n")
 
     max_seq_len = max(prompt_lens) + gen_len + 1024
@@ -327,17 +330,27 @@ def run_comparative_benchmark(
                 model_id,
                 torch_dtype=dtype,
                 device_map=device,
+                attn_implementation="sdpa",
                 trust_remote_code=True
             )
             actual_model_id = model_id
         except Exception as e:
-            print(f"⚠️ Could not load '{model_id}' ({e}). Falling back to 'gpt2'...")
-            actual_model_id = f"gpt2 (fallback for {model_id})"
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                "gpt2",
-                torch_dtype=dtype,
-                device_map=device
-            )
+            try:
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    torch_dtype=dtype,
+                    device_map=device,
+                    trust_remote_code=True
+                )
+                actual_model_id = model_id
+            except Exception as e_fallback:
+                print(f"⚠️ Could not load '{model_id}' ({e_fallback}). Falling back to 'gpt2'...")
+                actual_model_id = f"gpt2 (fallback for {model_id})"
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    "gpt2",
+                    torch_dtype=dtype,
+                    device_map=device
+                )
 
         hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
         cfg = getattr(hf_model, "config", None)
@@ -346,6 +359,13 @@ def run_comparative_benchmark(
 
         print(f"  • Baseline Parameters (PyTorch Measured): {hf_params_m:.2f}M params (vocab_size={target_vocab_size})")
 
+        if compile_model and device == "cuda":
+            print(f"⚡ Fusing Hugging Face baseline ({actual_model_id}) kernels via torch.compile(dynamic=True)...")
+            try:
+                hf_model = torch.compile(hf_model, dynamic=True)
+            except Exception as comp_err:
+                print(f"⚠️ torch.compile failed for baseline ({comp_err}). Falling back to Eager execution...")
+
         hf_res = profile_single_model(
             model=hf_model,
             model_name=actual_model_id,
@@ -353,7 +373,7 @@ def run_comparative_benchmark(
             prompt_lens=prompt_lens,
             gen_len=gen_len,
             device=device,
-            is_compiled=False
+            is_compiled=compile_model
         )
 
         del hf_model

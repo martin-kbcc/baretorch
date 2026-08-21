@@ -126,12 +126,12 @@ def export_single_model_to_pte(
     vocab_size: int,
     seq_len: int,
     output_pte_path: str,
-    quant_type: str = "fp32",
+    quant_type: str = "int4",
     backend_delegate: str = "none"
 ) -> Dict[str, Any]:
     """
-    Exports a model to ExecuTorch (.pte) format using graph capture, optional AOT 
-    quantization (FP32/INT8), backend partitioning (CoreML, QNN, Vulkan, XNNPACK), 
+    Exports a model to ExecuTorch (.pte) format using graph capture, optional torchao
+    quantization (INT4/INT8/FP32), backend partitioning (CoreML, QNN, Vulkan, XNNPACK),
     and AOT MemoryPlanningPass.
     """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
@@ -148,8 +148,8 @@ def export_single_model_to_pte(
         from executorch.exir import to_edge, EdgeCompileConfig, ExecutorchBackendConfig
         from executorch.exir.passes import MemoryPlanningPass
 
-        # 2. Apply AOT Quantization (FP32 or INT8 W8A8)
-        prepared_model = apply_quantization(wrapper, example_inputs, quant_type=quant_type)
+        # 2. Apply torchao Native Quantization via centralized module
+        prepared_model = apply_quantization(wrapper, quant_type=quant_type)
 
         # 3. Capture PyTorch ExportedProgram
         with torch.no_grad():
@@ -196,8 +196,8 @@ def export_single_model_to_pte(
         arena_ram_mb = round(arena_bytes / (1024.0 ** 2), 2)
 
         print(f"    ✅ ExecuTorch export successful:")
-        print(f"       • .pte File Size    : {file_size_mb} MB")
-        print(f"       • Tensor Arena RAM  : {arena_ram_mb} MB")
+        print(f"        • .pte File Size    : {file_size_mb} MB")
+        print(f"        • Tensor Arena RAM  : {arena_ram_mb} MB")
 
         return {
             "model_name": model_name,
@@ -236,17 +236,17 @@ def print_stage1_export_report(export_results: List[Dict[str, Any]]):
         bt_res = pair["baretorch_matched"]
 
         print(f"\n🎯 PAIR {idx}: {hf_res['model_name']}")
-        print(f"   • Baseline Params         : {hf_res['param_count_m']:.2f}M")
-        print(f"   • BareTorch Matched Params: {bt_res['param_count_m']:.2f}M (Δ = {abs(bt_res['param_count_m'] - hf_res['param_count_m']):.2f}M)")
+        print(f"    • Baseline Params          : {hf_res['param_count_m']:.2f}M")
+        print(f"    • BareTorch Matched Params: {bt_res['param_count_m']:.2f}M (Δ = {abs(bt_res['param_count_m'] - hf_res['param_count_m']):.2f}M)")
         print("-" * 135)
 
         f_b, f_h = bt_res["pte_file_size_mb"], hf_res["pte_file_size_mb"]
         f_adv = f"-{((f_h - f_b) / f_h) * 100:.1f}% Disk" if (isinstance(f_h, (int, float)) and isinstance(f_b, (int, float)) and f_h > 0) else "N/A"
-        print(f"   .pte Binary Size (MB)    : BareTorch = {str(f_b):<12} | Baseline = {str(f_h):<12} | {f_adv}")
+        print(f"    .pte Binary Size (MB)    : BareTorch = {str(f_b):<12} | Baseline = {str(f_h):<12} | {f_adv}")
 
         a_b, a_h = bt_res["tensor_arena_ram_mb"], hf_res["tensor_arena_ram_mb"]
         a_adv = f"-{((a_h - a_b) / a_h) * 100:.1f}% RAM" if (isinstance(a_h, (int, float)) and isinstance(a_b, (int, float)) and a_h > 0) else "N/A"
-        print(f"   Tensor Arena RAM (MB)    : BareTorch = {str(a_b):<12} | Baseline = {str(a_h):<12} | {a_adv}")
+        print(f"    Tensor Arena RAM (MB)    : BareTorch = {str(a_b):<12} | Baseline = {str(a_h):<12} | {a_adv}")
 
         print("-" * 135)
 
@@ -285,7 +285,7 @@ def run_stage1_export_suite(
     hf_model_ids: List[str],
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     seq_len: int = 128,
-    quant_type: str = "fp32",
+    quant_type: str = "int4",
     backend_delegate: str = "none",
     dummy_weights: bool = False,
     output_dir: str = "./pte_models",
@@ -294,9 +294,9 @@ def run_stage1_export_suite(
 ):
     print("\n======================================================================")
     print(f"🚀 STAGE 1: EXECUTORCH AOT EDGE LOWERING & MEMORY SUITE")
-    print(f"   • Baseline Target Models ({len(hf_model_ids)}) : {', '.join(hf_model_ids)}")
-    print(f"   • Quantization: {quant_type.upper()} | Backend Delegate: {backend_delegate.upper()}")
-    print(f"   • Weight Initialization Mode: {'DUMMY (Random Weights)' if dummy_weights else 'PRETRAINED'}")
+    print(f"    • Baseline Target Models ({len(hf_model_ids)}) : {', '.join(hf_model_ids)}")
+    print(f"    • Quantization: {quant_type.upper()} (torchao) | Backend Delegate: {backend_delegate.upper()}")
+    print(f"    • Weight Initialization Mode: {'DUMMY (Random Weights)' if dummy_weights else 'PRETRAINED'}")
     print("======================================================================\n")
 
     export_results = []
@@ -353,7 +353,7 @@ def run_stage1_export_suite(
             max_seq_len=32768
         )
 
-        # 3. Instantiate BareTorch (untrained/dummy initialization)
+        # 3. Instantiate BareTorch
         bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32)
         actual_bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
@@ -405,7 +405,7 @@ def main():
     )
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--quant_type", type=str, choices=["fp32", "int8"], default="fp32", help="Quantization mode")
+    parser.add_argument("--quant_type", type=str, choices=["fp32", "int8", "int4"], default="int4", help="Quantization mode (via torchao)")
     parser.add_argument(
         "--backend", 
         type=str, 

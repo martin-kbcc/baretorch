@@ -1,48 +1,43 @@
 # baretorch/export/quantization.py
 import torch
 import torch.nn as nn
-from typing import Tuple
+
+try:
+    from torchao.quantization import quantize_, int4_weight_only, int8_weight_only
+    HAS_TORCHAO = True
+except ImportError:
+    HAS_TORCHAO = False
 
 
 def apply_quantization(
-    wrapper_model: nn.Module,
-    example_inputs: Tuple[torch.Tensor, ...],
-    quant_type: str = "fp32"
+    model: nn.Module,
+    quant_type: str = "int4"
 ) -> nn.Module:
     """
-    Applies ahead-of-time (AOT) weight and activation quantization prior to EXIR lowering.
-    Supports 'fp32' (eager baseline) and 'int8' (W8A8 dynamic/static).
+    Applies ahead-of-time (AOT) weight quantization via torchao prior to EXIR lowering.
+    Supports 'int4', 'int8', and 'fp32'.
     """
-    if quant_type.lower() == "fp32":
-        return wrapper_model.eval().cpu()
+    quant_str = quant_type.lower().strip()
 
-    elif quant_type.lower() == "int8":
-        print("  ⚙️ Applying INT8 (W8A8) dynamic quantization pass...")
+    if quant_str == "fp32":
+        return model.eval().cpu()
 
+    elif quant_str in ["int4", "int8"]:
+        if not HAS_TORCHAO:
+            print("  ⚠️ 'torchao' is not installed (`pip install torchao`). Falling back to unquantized FP32...")
+            return model.eval().cpu()
+
+        print(f"  ⚡ Applying torchao native {quant_str.upper()} weight-only quantization...")
         try:
-            from torchao.quantization import quantize_
-
-            # Multi-version fallback for torchao API evolution
-            quant_plan = None
-            try:
-                from torchao.quantization import Int8DynamicActivationInt8WeightConfig
-                quant_plan = Int8DynamicActivationInt8WeightConfig()
-            except ImportError:
-                try:
-                    from torchao.quantization import int8_dynamic_activation_int8_weight
-                    quant_plan = int8_dynamic_activation_int8_weight()
-                except ImportError:
-                    from torchao.quantization.quant_api import int8_dynamic_activation_int8_weight
-                    quant_plan = int8_dynamic_activation_int8_weight()
-
-            quantized_model = wrapper_model.eval().cpu()
-            quantize_(quantized_model, quant_plan)
-            print("  ✅ INT8 quantization applied successfully via torchao.")
-            return quantized_model
-
-        except Exception as e_ao:
-            print(f"  ⚠️ torchao quantization failed ({e_ao}). Proceeding with unquantized FP32 graph...")
-            return wrapper_model.eval().cpu()
-
+            model = model.eval().cpu()
+            if quant_str == "int4":
+                quantize_(model, int4_weight_only(group_size=32))
+            elif quant_str == "int8":
+                quantize_(model, int8_weight_only())
+            print(f"  ✅ {quant_str.upper()} quantization applied successfully via torchao.")
+            return model
+        except Exception as e:
+            print(f"  ⚠️ torchao quantization failed ({e}). Proceeding with unquantized FP32 graph...")
+            return model.eval().cpu()
     else:
-        raise ValueError(f"Unsupported quantization type '{quant_type}'. Choose 'fp32' or 'int8'.")
+        raise ValueError(f"Unsupported quantization type '{quant_type}'. Choose 'fp32', 'int8', or 'int4'.")

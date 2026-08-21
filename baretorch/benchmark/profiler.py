@@ -1,3 +1,4 @@
+# baretorch/benchmark/profiler.py
 import gc
 import time
 import torch
@@ -22,7 +23,9 @@ def extract_kv_cache_config(model: nn.Module) -> Dict[str, Any]:
     Safely extracts model layer structure and attention parameters 
     across BareTorch hybrids and arbitrary Hugging Face architectures (MHA/GQA/MQA).
     """
-    cfg = getattr(model, "config", None)
+    # Handle torch.compile WrappedModules
+    raw_model = getattr(model, "_orig_mod", model)
+    cfg = getattr(raw_model, "config", None)
     if cfg is None:
         return {"is_baretorch": False, "num_layers": 0, "num_heads": 0, "num_kv_heads": 0, "head_dim": 0}
 
@@ -113,7 +116,8 @@ class LatencyProfiler:
     ) -> Dict[str, Any]:
         model.eval()
         
-        cfg = getattr(model, "config", None)
+        raw_model = getattr(model, "_orig_mod", model)
+        cfg = getattr(raw_model, "config", None)
         if cfg is not None:
             cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
             vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", vocab_size))
@@ -123,18 +127,18 @@ class LatencyProfiler:
             curr_token = torch.randint(0, vocab_size, (1, 1), device=device)
 
             # ------------------------------------------------------------------
-            # 0. Multi-Step JIT Warmup Pass (Forces Triton/Inductor to finish compiling)
+            # 0. Multi-Step JIT Warmup Pass (Forces Triton/Inductor kernel compilation)
             # ------------------------------------------------------------------
             with torch.no_grad():
                 w_out = model(prompt, use_cache=True)
                 w_kv = getattr(w_out, "past_key_values", None)
-                for _ in range(5):
+                for _ in range(3):
                     w_out = model(curr_token, past_key_values=w_kv, use_cache=True)
                     w_kv = getattr(w_out, "past_key_values", None)
 
             if device == "cuda":
-                torch.cuda.empty_cache()
                 torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
 
             # ------------------------------------------------------------------
             # 1. Prefill Phase (Time To First Token / TTFT)
@@ -192,7 +196,7 @@ class MemoryProfiler:
     Profiles Peak CUDA VRAM allocation and ExecuTorch AOT static Tensor Arena memory.
     """
     @staticmethod
-    def get_peak_vram_mb(device: str = "cuda") -> Any:
+    def get_peak_vram_mb(device: str = "cuda") -> float:
         if device == "cuda" and torch.cuda.is_available():
             peak_bytes = torch.cuda.max_memory_allocated()
             return round(peak_bytes / (1024.0 ** 2), 2)
@@ -205,11 +209,12 @@ class MemoryProfiler:
         vocab_size: int = 50257,
         backend: str = "xnnpack"
     ) -> Dict[str, Any]:
-        orig_device = next(model.parameters()).device
+        raw_model = getattr(model, "_orig_mod", model)
+        orig_device = next(raw_model.parameters()).device
         try:
             from executorch.exir import capture, CaptureConfig, EdgeCompileConfig
             
-            model_eval = model.eval().cpu()
+            model_eval = raw_model.eval().cpu()
             example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long),)
             
             with torch.no_grad():
@@ -229,7 +234,7 @@ class MemoryProfiler:
         except Exception as e:
             return {"arena_ram_mb": "N/A", "status": f"skipped ({type(e).__name__})"}
         finally:
-            model.to(orig_device)
+            raw_model.to(orig_device)
 
 
 class RooflineEstimator:
