@@ -11,8 +11,8 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones((d_model,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        return x * mx.rsqrt(variance + self.eps) * self.weight
+        variance = mx.mean(mx.square(x.astype(mx.float32)), axis=-1, keepdims=True)
+        return (x * mx.rsqrt(variance + self.eps)).astype(x.dtype) * self.weight.astype(x.dtype)
 
 
 class GatedMLP(nn.Module):
@@ -37,8 +37,8 @@ class RotaryEmbedding(nn.Module):
     def apply_rope(self, q: mx.array, k: mx.array, position_ids: mx.array) -> tuple[mx.array, mx.array]:
         freqs = mx.expand_dims(position_ids.astype(mx.float32), axis=-1) * self.inv_freq
         emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.expand_dims(mx.cos(emb), axis=1)
-        sin = mx.expand_dims(mx.sin(emb), axis=1)
+        cos = mx.expand_dims(mx.cos(emb), axis=1).astype(q.dtype)
+        sin = mx.expand_dims(mx.sin(emb), axis=1).astype(q.dtype)
 
         def _rotate_half(x):
             half = self.dim // 2

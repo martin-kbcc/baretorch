@@ -50,10 +50,10 @@ def benchmark_mlx_model(
     is_mlx_lm: bool = False
 ) -> dict:
     """
-    Standardized MLX benchmark matching CUDA profiler:
+    Standardized FP16 MLX benchmark matching CUDA profiler:
     1. Un-timed warmup pass
     2. Prefill phase (TTFT ms for prompt_len)
-    3. Decode phase (steady-state tok/s)
+    3. Decode phase (steady-state tok/s with pre-compiled kernel warmup)
     """
     clear_memory()
 
@@ -81,7 +81,7 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Decode Phase (mlx_lm uses internal C++ cache state)
+        # 3. Decode Phase
         gen_start = time.perf_counter()
         for _ in range(gen_len):
             outputs = model(curr_token, cache=cache)
@@ -108,13 +108,17 @@ def benchmark_mlx_model(
 
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Compiled Decode Phase for BareTorch (Lists/Tuples of mx.array are valid PyTrees)
+        # 3. Compiled Decode Phase with JIT Kernel Warmup
         def decode_step_bt(tok, p_kv):
             logits, n_kv = model(tok, past_key_values=p_kv)
             next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
             return next_tok, n_kv
 
         compiled_step = mx.compile(decode_step_bt)
+
+        # JIT Warmup pass to eliminate Metal compilation overhead from timer
+        dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
+        mx.eval(dummy_tok)
 
         gen_start = time.perf_counter()
         for _ in range(gen_len):
@@ -142,7 +146,7 @@ def main():
     args = parser.parse_args()
 
     print("==================================================================================================")
-    print("🍎 BARETORCH NATIVE APPLE SILICON MLX CONTEXT SCALING BENCHMARK")
+    print("🍎 BARETORCH NATIVE APPLE SILICON MLX CONTEXT SCALING BENCHMARK (FP16)")
     print("==================================================================================================")
 
     try:
@@ -163,7 +167,7 @@ def main():
             hf_vocab_size = vocab_size
 
             for ctx in args.prompt_lens:
-                print(f"  ├─ Benchmarking Baseline (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
+                print(f"  ├─ Benchmarking Baseline (MLX FP16) @ Context: {ctx:<5} tokens...", end="", flush=True)
                 try:
                     hf_results[ctx] = benchmark_mlx_model(hf_model, ctx, args.gen_len, hf_vocab_size, is_mlx_lm=True)
                     print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | VRAM: {hf_results[ctx]['peak_vram_mb']} MB)")
@@ -179,9 +183,9 @@ def main():
     else:
         print("⚠️ 'mlx-lm' package not found (`pip install mlx-lm`). Skipping HF baseline run.")
 
-    # 2. Benchmark Native MLX BareTorch Hybrid Model
+    # 2. Benchmark Native MLX BareTorch Hybrid Model (FP16)
     clear_memory()
-    print(f"\n⚙️ Instantiating Native BareTorch MLX Blueprint (~1237M params)...")
+    print(f"\n⚙️ Instantiating Native BareTorch MLX Blueprint (~1237M params in FP16)...")
     bt_config = BareTorchConfig(
         vocab_size=vocab_size,
         d_model=1888,
@@ -193,9 +197,10 @@ def main():
         layer_types=["cs_lrad", "cs_lrad", "cs_lrad", "transformer"] * 3 + ["cs_lrad", "cs_lrad"]
     )
     bt_model = BareTorchForCausalLMMLX(bt_config)
+    bt_model.set_dtype(mx.float16)
 
     for ctx in args.prompt_lens:
-        print(f"  ├─ Benchmarking BareTorch (MLX) @ Context: {ctx:<5} tokens...", end="", flush=True)
+        print(f"  ├─ Benchmarking BareTorch (MLX FP16) @ Context: {ctx:<5} tokens...", end="", flush=True)
         try:
             bt_results[ctx] = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
             print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | VRAM: {bt_results[ctx]['peak_vram_mb']} MB)")
@@ -209,7 +214,7 @@ def main():
 
     # 3. Comparative Summary Report
     print("\n" + "=" * 130)
-    print("📊 STANDARDIZED BARETORCH vs. LLAMA 3.2 1B CONTEXT REPORT (NATIVE APPLE SILICON MLX)")
+    print("📊 STANDARDIZED BARETORCH vs. LLAMA 3.2 1B CONTEXT REPORT (NATIVE APPLE SILICON MLX FP16)")
     print("=" * 130)
     print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18} | {'VRAM (BT / HF)':<20}")
     print("-" * 130)
