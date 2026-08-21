@@ -1,58 +1,22 @@
 # baretorch/benchmark/benchmark_mac.py
+import os
 import time
 import gc
 import argparse
 import traceback
 import psutil
 import torch
-import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
+from baretorch.export.export_executorch import export_single_model_to_pte, find_matching_baretorch_config
 
 try:
-    import torchao
-    HAS_TORCHAO = True
+    from executorch.runtime import Runtime
+    HAS_EXECUTORCH_RUNTIME = True
 except ImportError:
-    HAS_TORCHAO = False
-
-
-def apply_quantization(model: nn.Module, quant_type: str, device: torch.device) -> nn.Module:
-    """Applies torchao native weight-only quantization or precision casting across API versions."""
-    if quant_type in ["int4", "int8"]:
-        if not HAS_TORCHAO:
-            print("  ⚠️ 'torchao' is not installed (`pip install torchao`). Falling back to FP16...")
-            model = model.to(dtype=torch.float16)
-        else:
-            print(f"  ⚡ Applying torchao native {quant_type.upper()} weight-only quantization...")
-            try:
-                from torchao.quantization import quantize_
-                model = model.eval().cpu()
-                if quant_type == "int4":
-                    try:
-                        from torchao.quantization import Int4WeightOnlyConfig
-                        quantize_(model, Int4WeightOnlyConfig(group_size=32))
-                    except ImportError:
-                        from torchao.quantization import int4_weight_only
-                        quantize_(model, int4_weight_only(group_size=32))
-                elif quant_type == "int8":
-                    try:
-                        from torchao.quantization import Int8WeightOnlyConfig
-                        quantize_(model, Int8WeightOnlyConfig())
-                    except ImportError:
-                        from torchao.quantization import int8_weight_only
-                        quantize_(model, int8_weight_only())
-                print(f"  ✅ {quant_type.upper()} quantization applied successfully via torchao.")
-            except Exception as e:
-                print(f"  ⚠️ torchao quantization failed ({e}). Falling back to FP16...")
-                model = model.to(dtype=torch.float16)
-    elif quant_type == "fp16":
-        model = model.to(dtype=torch.float16)
-    elif quant_type == "fp32":
-        model = model.to(dtype=torch.float32)
-
-    return model.to(device).eval()
+    HAS_EXECUTORCH_RUNTIME = False
 
 
 def clear_memory():
@@ -76,82 +40,78 @@ def get_vram_mb() -> float:
     return process.memory_info().rss / (1024.0 ** 2)
 
 
-def benchmark_inference_standardized(
-    model: nn.Module,
+def benchmark_pte_execution(
+    pte_path: str,
     prompt_len: int,
     gen_len: int,
-    device: torch.device,
     vocab_size: int
 ) -> dict:
     """
-    Standardized benchmark function matching CUDA profiler.py:
-    1. Un-timed warmup pass
-    2. Prefill phase (TTFT ms for prompt_len)
-    3. Decode phase (steady-state tok/s over gen_len=32)
+    Executes an exported ExecuTorch .pte file through native C++ pybindings.
+    Measures TTFT (ms) and steady-state decode throughput (tok/s).
     """
-    prompt = torch.randint(0, vocab_size, (1, prompt_len), device=device)
-    curr_token = torch.randint(0, vocab_size, (1, 1), device=device)
+    if not os.path.exists(pte_path):
+        return {"ttft_ms": "File Missing", "tokens_per_sec": "N/A", "peak_vram_mb": "N/A"}
 
-    # 1. Warmup Pass
-    with torch.no_grad():
-        w_out = model(prompt, use_cache=True)
-        w_kv = getattr(w_out, "past_key_values", None)
-        for _ in range(3):
-            w_out = model(curr_token, past_key_values=w_kv, use_cache=True)
-            w_kv = getattr(w_out, "past_key_values", None)
+    if not HAS_EXECUTORCH_RUNTIME:
+        return {"ttft_ms": "Runtime Missing", "tokens_per_sec": "N/A", "peak_vram_mb": "N/A"}
 
-    if device.type == "mps":
-        torch.mps.synchronize()
+    try:
+        runtime = Runtime.get()
+        program = runtime.load_program(pte_path)
+        method = program.load_method("forward")
 
-    # 2. Prefill Phase (TTFT)
-    ttft_start = time.perf_counter()
-    with torch.no_grad():
-        outputs = model(prompt, use_cache=True)
-    if device.type == "mps":
-        torch.mps.synchronize()
-    ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+        prompt_input = torch.randint(0, vocab_size, (1, prompt_len), dtype=torch.long)
+        single_token_input = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
 
-    past_key_values = getattr(outputs, "past_key_values", None)
-    curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+        # 1. Warmup Pass
+        _ = method.execute([prompt_input])
+        for _ in range(2):
+            _ = method.execute([single_token_input])
 
-    # 3. Decode Phase (gen_len tokens)
-    gen_start = time.perf_counter()
-    with torch.no_grad():
+        # 2. Prefill Phase (TTFT)
+        ttft_start = time.perf_counter()
+        _ = method.execute([prompt_input])
+        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+
+        # 3. Decode Phase
+        gen_start = time.perf_counter()
         for _ in range(gen_len):
-            outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
-            past_key_values = getattr(outputs, "past_key_values", None)
-            if hasattr(outputs, "logits"):
-                curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+            _ = method.execute([single_token_input])
+        decode_sec = max(time.perf_counter() - gen_start, 1e-5)
 
-    if device.type == "mps":
-        torch.mps.synchronize()
-    decode_sec = max(time.perf_counter() - gen_start, 1e-5)
+        peak_vram_mb = get_vram_mb()
+        tokens_per_sec = gen_len / decode_sec
 
-    peak_vram_mb = get_vram_mb()
-    tokens_per_sec = gen_len / decode_sec
-
-    return {
-        "prompt_len": prompt_len,
-        "ttft_ms": round(ttft_ms, 2),
-        "tokens_per_sec": round(tokens_per_sec, 2),
-        "peak_vram_mb": round(peak_vram_mb, 2)
-    }
+        return {
+            "prompt_len": prompt_len,
+            "ttft_ms": round(ttft_ms, 2),
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "peak_vram_mb": round(peak_vram_mb, 2)
+        }
+    except Exception as e:
+        print(f"\n    ⚠️ ExecuTorch runtime execution error ({e})")
+        return {"ttft_ms": "Exec Error", "tokens_per_sec": "N/A", "peak_vram_mb": "N/A"}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Standardized Apple Silicon MPS Context Benchmarker")
+    parser = argparse.ArgumentParser(description="BareTorch Standardized Apple Silicon ExecuTorch (.pte) Benchmarker")
     parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--device", type=str, choices=["mps", "cpu"], default="mps")
-    parser.add_argument("--quant_type", type=str, choices=["int4", "int8", "fp16", "fp32"], default="int4")
-    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192])
+    parser.add_argument("--quant_type", type=str, choices=["int4", "int8", "fp32"], default="int4")
+    parser.add_argument("--backend", type=str, choices=["none", "coreml", "xnnpack"], default="none")
+    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[128, 256, 512, 1024])
     parser.add_argument("--gen_len", type=int, default=32)
+    parser.add_argument("--output_dir", type=str, default="./pte_models")
     args = parser.parse_args()
 
-    device = torch.device(args.device if (args.device == "mps" and torch.backends.mps.is_available()) else "cpu")
+    print("==================================================================================================")
+    print(f"🍎 BARETORCH EXECUTORCH (.PTE) BENCHMARK (Quant: {args.quant_type.upper()} | Backend: {args.backend.upper()})")
+    print("==================================================================================================")
 
-    print("==================================================================================================")
-    print(f"🍎 BARETORCH STANDARDIZED CONTEXT SCALING BENCHMARK (MPS | Device: {device} | Quant: {args.quant_type.upper()})")
-    print("==================================================================================================")
+    # 1. Load Hugging Face Baseline & Export to .pte
+    clear_memory()
+    sanitized_name = args.hf_model_id.replace("/", "_").replace("-", "_").lower()
+    print(f"\n📦 Processing Baseline Model: '{args.hf_model_id}'...")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.hf_model_id, trust_remote_code=True)
@@ -159,88 +119,85 @@ def main():
     except Exception:
         vocab_size = 50257
 
-    hf_results = {}
-    bt_results = {}
+    hf_model = AutoModelForCausalLM.from_pretrained(args.hf_model_id, torch_dtype=torch.float32, trust_remote_code=True)
+    hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
+    hf_vocab_size = getattr(hf_model.config, "vocab_size", vocab_size)
 
-    # 1. Benchmark Hugging Face Baseline
+    hf_pte_path = os.path.join(args.output_dir, f"baseline_{sanitized_name}_{args.quant_type}_{args.backend}.pte")
+    hf_export_info = export_single_model_to_pte(
+        model=hf_model,
+        model_name=args.hf_model_id,
+        vocab_size=hf_vocab_size,
+        seq_len=128,
+        output_pte_path=hf_pte_path,
+        quant_type=args.quant_type,
+        backend_delegate=args.backend
+    )
+
+    del hf_model
     clear_memory()
-    print(f"\n📦 Loading Hugging Face Baseline: '{args.hf_model_id}'...")
-    try:
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            args.hf_model_id,
-            torch_dtype=torch.float32,
-            trust_remote_code=True
-        )
-        hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
-        hf_vocab_size = getattr(hf_model.config, "vocab_size", vocab_size)
 
-        hf_model = apply_quantization(hf_model, quant_type=args.quant_type, device=device)
-
-        for ctx in args.prompt_lens:
-            print(f"  ├─ Benchmarking Baseline ({args.quant_type.upper()}) @ Context: {ctx:<5} tokens...", end="", flush=True)
-            try:
-                hf_results[ctx] = benchmark_inference_standardized(hf_model, ctx, args.gen_len, device, hf_vocab_size)
-                print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | VRAM: {hf_results[ctx]['peak_vram_mb']} MB)")
-            except Exception as e_step:
-                print(f" ❌ Failed ({type(e_step).__name__})")
-                traceback.print_exc()
-                hf_results[ctx] = {"ttft_ms": "OOM/Fail", "tokens_per_sec": "OOM/Fail", "peak_vram_mb": "N/A"}
-
-        del hf_model
-        clear_memory()
-    except Exception as e:
-        print(f"⚠️ Failed to initialize Hugging Face baseline ({e})")
-        hf_params_m = 1235.81
-
-    # 2. Benchmark BareTorch Matched Hybrid
-    clear_memory()
-    print(f"\n⚙️ Instantiating BareTorch Matched Blueprint (~{hf_params_m:.2f}M params)...")
-    bt_config = BareTorchConfig(
-        vocab_size=vocab_size,
-        d_model=1888,
-        num_heads=16,
-        num_layers=14,
-        chunk_size=32,
-        rank=8,
-        max_seq_len=16384,
-        layer_types=["cs_lrad", "cs_lrad", "cs_lrad", "transformer"] * 3 + ["cs_lrad", "cs_lrad"]
+    # 2. Instantiate Matching BareTorch Blueprint & Export to .pte
+    print(f"\n⚙️ Finding BareTorch blueprint matching ~{hf_params_m:.2f}M parameters...")
+    bt_config, _ = find_matching_baretorch_config(
+        target_params_m=hf_params_m,
+        target_vocab_size=hf_vocab_size,
+        layer_sequence="cs_lrad,cs_lrad,cs_lrad,transformer",
+        max_seq_len=16384
     )
     bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32)
-    bt_model = apply_quantization(bt_model, quant_type=args.quant_type, device=device)
+    actual_bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
-    for ctx in args.prompt_lens:
-        print(f"  ├─ Benchmarking BareTorch ({args.quant_type.upper()}) @ Context: {ctx:<5} tokens...", end="", flush=True)
-        try:
-            bt_results[ctx] = benchmark_inference_standardized(bt_model, ctx, args.gen_len, device, vocab_size)
-            print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | VRAM: {bt_results[ctx]['peak_vram_mb']} MB)")
-        except Exception as e_step:
-            print(f" ❌ Failed ({type(e_step).__name__})")
-            traceback.print_exc()
-            bt_results[ctx] = {"ttft_ms": "Fail", "tokens_per_sec": "Fail", "peak_vram_mb": "N/A"}
+    bt_pte_path = os.path.join(args.output_dir, f"baretorch_{sanitized_name}_{args.quant_type}_{args.backend}.pte")
+    bt_export_info = export_single_model_to_pte(
+        model=bt_model,
+        model_name=f"BareTorch Matched ({actual_bt_params_m:.1f}M)",
+        vocab_size=hf_vocab_size,
+        seq_len=128,
+        output_pte_path=bt_pte_path,
+        quant_type=args.quant_type,
+        backend_delegate=args.backend
+    )
 
     del bt_model
     clear_memory()
 
-    # 3. Comparative Report
-    print("\n" + "=" * 130)
-    print(f"📊 STANDARDIZED BARETORCH ({args.quant_type.upper()}) vs. LLAMA 3.2 1B CONTEXT REPORT (APPLE SILICON MPS)")
-    print("=" * 130)
-    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18} | {'VRAM (BT / HF)':<20}")
-    print("-" * 130)
+    # 3. Execution Benchmarks
+    hf_results = {}
+    bt_results = {}
+
+    print("\n🚀 Executing ExecuTorch (.pte) Graph Benchmarks...")
+    for ctx in args.prompt_lens:
+        print(f"  ├─ Benchmarking Baseline .pte @ Context: {ctx:<5} tokens...", end="", flush=True)
+        hf_results[ctx] = benchmark_pte_execution(hf_pte_path, ctx, args.gen_len, hf_vocab_size)
+        print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} | Decode: {hf_results[ctx]['tokens_per_sec']})")
+
+        print(f"  ├─ Benchmarking BareTorch .pte @ Context: {ctx:<5} tokens...", end="", flush=True)
+        bt_results[ctx] = benchmark_pte_execution(bt_pte_path, ctx, args.gen_len, hf_vocab_size)
+        print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} | Decode: {bt_results[ctx]['tokens_per_sec']})")
+
+    # 4. Summary Report
+    print("\n" + "=" * 140)
+    print(f"📊 EXECUTORCH (.PTE) GRAPH REPORT: BARETORCH vs. LLAMA 3.2 1B (Quant: {args.quant_type.upper()})")
+    print("=" * 140)
+    print(f"  • .pte Binary Size (MB) : BareTorch = {bt_export_info.get('pte_file_size_mb', 'N/A')} MB | Baseline = {hf_export_info.get('pte_file_size_mb', 'N/A')} MB")
+    print(f"  • Tensor Arena RAM (MB) : BareTorch = {bt_export_info.get('tensor_arena_ram_mb', 'N/A')} MB | Baseline = {hf_export_info.get('tensor_arena_ram_mb', 'N/A')} MB")
+    print("-" * 140)
+    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18}")
+    print("-" * 140)
 
     for ctx in args.prompt_lens:
         bt = bt_results.get(ctx, {})
         hf = hf_results.get(ctx, {})
 
-        bt_ttft = f"{bt.get('ttft_ms', 'N/A')} ms"
-        hf_ttft = f"{hf.get('ttft_ms', 'N/A')} ms"
-        bt_dec = f"{bt.get('tokens_per_sec', 'N/A')} tok/s"
-        hf_dec = f"{hf.get('tokens_per_sec', 'N/A')} tok/s"
-        vram_str = f"{bt.get('peak_vram_mb', 'N/A')} / {hf.get('peak_vram_mb', 'N/A')} MB"
+        bt_ttft = f"{bt.get('ttft_ms', 'N/A')} ms" if isinstance(bt.get('ttft_ms'), (int, float)) else str(bt.get('ttft_ms'))
+        hf_ttft = f"{hf.get('ttft_ms', 'N/A')} ms" if isinstance(hf.get('ttft_ms'), (int, float)) else str(hf.get('ttft_ms'))
+        bt_dec = f"{bt.get('tokens_per_sec', 'N/A')} tok/s" if isinstance(bt.get('tokens_per_sec'), (int, float)) else str(bt.get('tokens_per_sec'))
+        hf_dec = f"{hf.get('tokens_per_sec', 'N/A')} tok/s" if isinstance(hf.get('tokens_per_sec'), (int, float)) else str(hf.get('tokens_per_sec'))
 
-        print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<20}")
+        print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18}")
 
-    print("=" * 130)
+    print("=" * 140)
 
 
 if __name__ == "__main__":

@@ -36,15 +36,23 @@ def apply_quantization(
                     from torchao.quantization import Int4WeightOnlyConfig
                     quantize_(model, Int4WeightOnlyConfig(group_size=32))
                 except ImportError:
-                    from torchao.quantization import int4_weight_only
-                    quantize_(model, int4_weight_only(group_size=32))
+                    try:
+                        from torchao.quantization.quant_api import Int4WeightOnlyConfig
+                        quantize_(model, Int4WeightOnlyConfig(group_size=32))
+                    except ImportError:
+                        from torchao.quantization import int4_weight_only
+                        quantize_(model, int4_weight_only(group_size=32))
             elif quant_str == "int8":
                 try:
                     from torchao.quantization import Int8WeightOnlyConfig
                     quantize_(model, Int8WeightOnlyConfig())
                 except ImportError:
-                    from torchao.quantization import int8_weight_only
-                    quantize_(model, int8_weight_only())
+                    try:
+                        from torchao.quantization.quant_api import Int8WeightOnlyConfig
+                        quantize_(model, Int8WeightOnlyConfig())
+                    except ImportError:
+                        from torchao.quantization import int8_weight_only
+                        quantize_(model, int8_weight_only())
 
             print(f"  ✅ {quant_str.upper()} quantization applied successfully via torchao.")
             return model
