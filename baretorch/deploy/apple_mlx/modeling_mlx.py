@@ -20,7 +20,7 @@ class GatedMLP(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
         self.w2 = nn.Linear(d_model, d_ff, bias=False)
-        self.w3 = nn.Linear(d_model, d_ff, bias=False)
+        self.w3 = nn.Linear(d_ff, d_model, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.w3(nn.silu(self.w1(x)) * self.w2(x))
@@ -128,7 +128,6 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         self.d_head = d_model // num_heads
         self.inner_dim = self.num_heads * self.d_head
 
-        # Total output dimensions for 1 fused GEMM layer
         self.q_dim = self.inner_dim
         self.k_dim = self.inner_dim
         self.v_dim = self.inner_dim
@@ -144,7 +143,6 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
             self.beta_dim + self.swish_dim
         )
 
-        # Single fused input projection layer (8 GEMM dispatches -> 1 GEMM dispatch)
         self.W_in = nn.Linear(d_model, self.total_fused_dim, bias=True)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
 
