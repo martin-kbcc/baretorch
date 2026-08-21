@@ -19,7 +19,7 @@ except ImportError:
 
 
 def clear_memory():
-    """Flushes Python garbage collection and resets MLX Metal peak memory tracking."""
+    """Flushes Python garbage collection and clears MLX cache/memory stats."""
     gc.collect()
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
@@ -28,10 +28,127 @@ def clear_memory():
 
 
 def get_peak_vram_mb() -> float:
-    """Returns actual Metal GPU peak allocated memory in MB."""
+    """Returns peak Metal GPU memory allocation in MB."""
     if hasattr(mx, "get_peak_memory"):
         return mx.get_peak_memory() / (1024.0 ** 2)
     return 0.0
+
+
+def count_mlx_params_m(model: nn.Module) -> float:
+    """Counts actual instantiated parameters in an MLX module tree."""
+    def _count(tree):
+        total = 0
+        if isinstance(tree, dict):
+            for v in tree.values():
+                total += _count(v)
+        elif isinstance(tree, list):
+            for v in tree:
+                total += _count(v)
+        elif hasattr(tree, "size"):
+            total += tree.size
+        return total
+    return _count(model.parameters()) / 1e6
+
+
+def count_baretorch_params_fast(
+    d_model: int,
+    num_layers: int,
+    num_heads: int,
+    vocab_size: int,
+    rank: int = 8,
+    layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer"
+) -> float:
+    """Exact BareTorch parameter math matching instantiated MLX modules."""
+    raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
+    full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(num_layers)]
+
+    num_kv_heads = max(1, num_heads // 4)
+    while num_heads % num_kv_heads != 0:
+        num_kv_heads -= 1
+    head_dim = d_model // num_heads
+    d_ff = int(d_model * 3.5)
+
+    embed_params = 2 * vocab_size * d_model
+    final_norm = d_model
+    layer_params = 0
+
+    for l_type in full_layer_types:
+        norms = 2 * d_model
+        mlp = 3 * d_model * d_ff
+
+        if l_type == "cs_lrad":
+            attn = (5 * (d_model ** 2)) + (2 * d_model * num_heads * rank) + (2 * (d_model * num_heads + num_heads))
+        else:
+            attn = (2 * (d_model ** 2)) + (2 * d_model * (num_kv_heads * head_dim))
+
+        layer_params += (norms + mlp + attn)
+
+    total_params = embed_params + final_norm + layer_params
+    return total_params / 1e6
+
+
+def find_matching_baretorch_config(
+    target_params_m: float,
+    target_vocab_size: int = 50257,
+    layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
+    max_seq_len: int = 32768
+) -> tuple[BareTorchConfig, float]:
+    """
+    Evaluates candidate hyper-parameters and matches target model size.
+    Restricts head_dim strictly to [64, 128] to ensure MLX's Metal FlashAttention
+    (mx.fast.sdpa) executes without falling back to eager O(L^2) matrices.
+    """
+    raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
+
+    best_cfg = None
+    best_diff = float("inf")
+    best_params_m = 0.0
+
+    for nl in range(12, 36, 2):
+        for d in range(512, 4096, 32):
+            for nh in [8, 12, 16, 20, 24, 32]:
+                if d % nh != 0:
+                    continue
+                head_dim = d // nh
+                
+                # MLX SDPA Kernel requirement: head_dim MUST be 64 or 128
+                if head_dim not in [64, 128]:
+                    continue
+
+                num_kv_heads = max(1, nh // 4)
+                while nh % num_kv_heads != 0:
+                    num_kv_heads -= 1
+
+                p_m = count_baretorch_params_fast(
+                    d_model=d,
+                    num_layers=nl,
+                    num_heads=nh,
+                    vocab_size=target_vocab_size,
+                    rank=8,
+                    layer_sequence=layer_sequence
+                )
+
+                diff = abs(p_m - target_params_m)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_params_m = p_m
+                    full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(nl)]
+                    best_cfg = BareTorchConfig(
+                        vocab_size=target_vocab_size,
+                        d_model=d,
+                        num_heads=nh,
+                        num_kv_heads=num_kv_heads,
+                        num_layers=nl,
+                        chunk_size=32,
+                        rank=8,
+                        dropout=0.0,
+                        max_seq_len=max_seq_len,
+                        layer_types=full_layer_types
+                    )
+
+    div_pct = (best_diff / target_params_m) * 100
+    print(f"  ⚡ MLX Vocab-Aware Match completed (|Δ| = {best_diff:.2f}M, {div_pct:.2f}%)")
+    return best_cfg, best_params_m
 
 
 def benchmark_mlx_model(
@@ -41,33 +158,25 @@ def benchmark_mlx_model(
     vocab_size: int,
     is_mlx_lm: bool = False
 ) -> dict:
-    """
-    Standardized MLX benchmark measuring isolated Prefill and Decode metrics:
-    Materializes past_key_values lazily to prevent DAG memory accumulation in Metal RAM.
-    """
     clear_memory()
     prompt = mx.random.randint(0, vocab_size, (1, prompt_len))
 
     if is_mlx_lm:
-        # 1. Warmup Pass
         w_cache = make_prompt_cache(model)
         w_out = model(prompt, cache=w_cache)
         mx.eval(w_out)
 
         clear_memory()
 
-        # 2. Prefill Phase
         cache = make_prompt_cache(model)
         ttft_start = time.perf_counter()
         outputs = model(prompt, cache=cache)
         mx.eval(outputs)
         ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
-        prefill_vram_mb = get_peak_vram_mb()
 
         clear_memory()
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Decode Phase
         gen_start = time.perf_counter()
         for _ in range(gen_len):
             outputs = model(curr_token, cache=cache)
@@ -77,25 +186,19 @@ def benchmark_mlx_model(
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
         decode_vram_mb = get_peak_vram_mb()
     else:
-        # 1. Warmup Pass
         w_out, w_cache = model(prompt)
         mx.eval(w_out, w_cache)
 
         clear_memory()
 
-        # 2. Prefill Phase
         ttft_start = time.perf_counter()
         outputs, past_key_values = model(prompt)
-        # Materialize BOTH outputs and past_key_values to collapse S_final into O(1) tensors
-        # and release the multi-gigabyte prefill DAG from Metal memory.
         mx.eval(outputs, past_key_values)
         ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
-        prefill_vram_mb = get_peak_vram_mb()
 
         clear_memory()
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
-        # 3. Compiled Decode Step
         def decode_step_bt(tok, p_kv):
             logits, n_kv = model(tok, past_key_values=p_kv)
             next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -103,14 +206,12 @@ def benchmark_mlx_model(
 
         compiled_step = mx.compile(decode_step_bt)
 
-        # JIT Warmup pass
         dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
         mx.eval(dummy_tok, past_key_values)
 
         gen_start = time.perf_counter()
         for _ in range(gen_len):
             curr_token, past_key_values = compiled_step(curr_token, past_key_values)
-            # Materialize BOTH current token and past_key_values on every decode iteration
             mx.eval(curr_token, past_key_values)
 
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
@@ -122,20 +223,20 @@ def benchmark_mlx_model(
         "prompt_len": prompt_len,
         "ttft_ms": round(ttft_ms, 2),
         "tokens_per_sec": round(tokens_per_sec, 2),
-        "prefill_vram_mb": round(prefill_vram_mb, 2),
         "decode_vram_mb": round(decode_vram_mb, 2)
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Native Apple MLX Standardized Benchmarker")
+    parser = argparse.ArgumentParser(description="BareTorch Apples-to-Apples MLX Suite")
     parser.add_argument("--hf_model_id", type=str, default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192])
+    parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
+    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192, 16384, 32768])
     parser.add_argument("--gen_len", type=int, default=32)
     args = parser.parse_args()
 
     print("==================================================================================================")
-    print("🍎 BARETORCH NATIVE APPLE SILICON MLX BENCHMARK (LAZY EVALUATION FIXED)")
+    print("🍎 BARETORCH APPLES-TO-APPLES NATIVE MLX SUITE (DYNAMIC PARAMETER MATCHING)")
     print("==================================================================================================")
 
     try:
@@ -147,51 +248,56 @@ def main():
     hf_results = {}
     bt_results = {}
 
-    # 1. Benchmark Baseline
     clear_memory()
     print(f"\n📦 Loading Native MLX Baseline: '{args.hf_model_id}'...")
+    hf_params_m = 0.0
     if HAS_MLX_LM:
         try:
             hf_model, _ = mlx_lm_load(args.hf_model_id)
+            hf_params_m = count_mlx_params_m(hf_model)
+            print(f"  • Baseline Parameters (MLX Measured): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
+
             for ctx in args.prompt_lens:
                 print(f"  ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
                 hf_results[ctx] = benchmark_mlx_model(hf_model, ctx, args.gen_len, vocab_size, is_mlx_lm=True)
-                print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | Decode VRAM: {hf_results[ctx]['decode_vram_mb']} MB)")
+                print(f" ✅ (TTFT: {hf_results[ctx]['ttft_ms']} ms | Decode: {hf_results[ctx]['tokens_per_sec']} tok/s | VRAM: {hf_results[ctx]['decode_vram_mb']} MB)")
             del hf_model
             clear_memory()
         except Exception as e:
             print(f"⚠️ Failed to load baseline ({e}).")
 
-    # 2. Benchmark BareTorch
-    clear_memory()
-    print(f"\n⚙️ Instantiating Native BareTorch MLX Blueprint (~1237M params)...")
-    bt_config = BareTorchConfig(
-        vocab_size=vocab_size,
-        d_model=1888,
-        num_heads=16,
-        num_layers=14,
-        chunk_size=32,
-        rank=8,
-        max_seq_len=16384,
-        layer_types=["cs_lrad", "cs_lrad", "cs_lrad", "transformer"] * 3 + ["cs_lrad", "cs_lrad"]
+    if hf_params_m == 0.0:
+        hf_params_m = 1237.0
+
+    print(f"\n⚙️ Looking up BareTorch MLX blueprint matching ~{hf_params_m:.2f}M parameters...")
+    max_seq_len = max(args.prompt_lens) + args.gen_len + 1024
+    bt_config, bt_params_m_predicted = find_matching_baretorch_config(
+        target_params_m=hf_params_m,
+        target_vocab_size=vocab_size,
+        layer_sequence=args.layer_sequence,
+        max_seq_len=max_seq_len
     )
+
     bt_model = BareTorchForCausalLMMLX(bt_config)
     bt_model.set_dtype(mx.float16)
+    actual_bt_params_m = count_mlx_params_m(bt_model)
+
+    print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
+    print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}, head_dim={bt_config.d_model // bt_config.num_heads}")
 
     for ctx in args.prompt_lens:
         print(f"  ├─ Benchmarking BareTorch @ Context: {ctx:<5} tokens...", end="", flush=True)
         bt_results[ctx] = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
-        print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | Decode VRAM: {bt_results[ctx]['decode_vram_mb']} MB)")
+        print(f" ✅ (TTFT: {bt_results[ctx]['ttft_ms']} ms | Decode: {bt_results[ctx]['tokens_per_sec']} tok/s | VRAM: {bt_results[ctx]['decode_vram_mb']} MB)")
 
     del bt_model
     clear_memory()
 
-    # 3. Report
-    print("\n" + "=" * 135)
-    print("📊 STANDARDIZED BARETORCH vs. LLAMA 3.2 1B CONTEXT REPORT (NATIVE APPLE SILICON MLX FP16)")
-    print("=" * 135)
-    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Llama TTFT':<16} | {'BareTorch Decode':<18} | {'Llama Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
-    print("-" * 135)
+    print("\n" + "=" * 145)
+    print(f"📊 STANDARDIZED BARETORCH ({actual_bt_params_m:.1f}M) vs. BASELINE ({hf_params_m:.1f}M) REPORT")
+    print("=" * 145)
+    print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Baseline TTFT':<16} | {'BareTorch Decode':<18} | {'Baseline Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
+    print("-" * 145)
 
     for ctx in args.prompt_lens:
         bt = bt_results.get(ctx, {})
@@ -205,7 +311,7 @@ def main():
 
         print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<22}")
 
-    print("=" * 135)
+    print("=" * 145)
 
 
 if __name__ == "__main__":
