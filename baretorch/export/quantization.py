@@ -4,6 +4,7 @@ import torch.nn as nn
 
 try:
     import torchao
+    from torchao.quantization import quantize_, Int4WeightOnlyConfig, Int8WeightOnlyConfig
     HAS_TORCHAO = True
 except ImportError:
     HAS_TORCHAO = False
@@ -29,35 +30,16 @@ def apply_quantization(
 
         print(f"  ⚡ Applying torchao native {quant_str.upper()} weight-only quantization...")
         try:
-            from torchao.quantization import quantize_
             model = model.eval().cpu()
             if quant_str == "int4":
-                try:
-                    from torchao.quantization import Int4WeightOnlyConfig
-                    quantize_(model, Int4WeightOnlyConfig(group_size=32))
-                except ImportError:
-                    try:
-                        from torchao.quantization.quant_api import Int4WeightOnlyConfig
-                        quantize_(model, Int4WeightOnlyConfig(group_size=32))
-                    except ImportError:
-                        from torchao.quantization import int4_weight_only
-                        quantize_(model, int4_weight_only(group_size=32))
+                quantize_(model, Int4WeightOnlyConfig(group_size=32))
             elif quant_str == "int8":
-                try:
-                    from torchao.quantization import Int8WeightOnlyConfig
-                    quantize_(model, Int8WeightOnlyConfig())
-                except ImportError:
-                    try:
-                        from torchao.quantization.quant_api import Int8WeightOnlyConfig
-                        quantize_(model, Int8WeightOnlyConfig())
-                    except ImportError:
-                        from torchao.quantization import int8_weight_only
-                        quantize_(model, int8_weight_only())
+                quantize_(model, Int8WeightOnlyConfig())
 
             print(f"  ✅ {quant_str.upper()} quantization applied successfully via torchao.")
             return model
         except Exception as e:
-            print(f"  ⚠️ torchao quantization failed ({e}). Proceeding with unquantized FP32 graph...")
+            print(f"  ⚠️ torchao quantization failed ({type(e).__name__}: {e}). Proceeding with unquantized FP32 graph...")
             return model.eval().cpu()
     else:
         raise ValueError(f"Unsupported quantization type '{quant_type}'. Choose 'fp32', 'int8', or 'int4'.")

@@ -90,8 +90,9 @@ def benchmark_pte_execution(
             "peak_vram_mb": round(peak_vram_mb, 2)
         }
     except Exception as e:
+        err_type = type(e).__name__
         print(f"\n    ⚠️ ExecuTorch runtime execution error ({e})")
-        return {"ttft_ms": "Exec Error", "tokens_per_sec": "N/A", "peak_vram_mb": "N/A"}
+        return {"ttft_ms": f"Exec Error ({err_type})", "tokens_per_sec": "N/A", "peak_vram_mb": "N/A"}
 
 
 def main():

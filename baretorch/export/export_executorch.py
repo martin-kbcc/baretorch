@@ -130,9 +130,8 @@ def export_single_model_to_pte(
     backend_delegate: str = "none"
 ) -> Dict[str, Any]:
     """
-    Exports a model to ExecuTorch (.pte) format using graph capture, optional torchao
-    quantization (INT4/INT8/FP32), backend partitioning (CoreML, QNN, Vulkan, XNNPACK),
-    and AOT MemoryPlanningPass.
+    Exports a model to ExecuTorch (.pte) format using graph capture, torchao quantization,
+    dynamic sequence shapes, backend partitioning, and AOT MemoryPlanningPass.
     """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
 
@@ -144,16 +143,22 @@ def export_single_model_to_pte(
     print(f"\n📦 Exporting '{model_name}' ({param_count_m:.2f}M params) | Quant: {quant_type.upper()} | Backend: {backend_delegate.upper()}...")
 
     try:
-        from torch.export import export
+        from torch.export import export, Dim
         from executorch.exir import to_edge, EdgeCompileConfig, ExecutorchBackendConfig
         from executorch.exir.passes import MemoryPlanningPass
 
         # 2. Apply torchao Native Quantization via centralized module
         prepared_model = apply_quantization(wrapper, quant_type=quant_type)
 
-        # 3. Capture PyTorch ExportedProgram
-        with torch.no_grad():
-            exported_prog = export(prepared_model, example_inputs)
+        # 3. Capture PyTorch ExportedProgram with Dynamic Sequence Length
+        dim_seq = Dim("seq_len", min=1, max=16384)
+        try:
+            with torch.no_grad():
+                exported_prog = export(prepared_model, example_inputs, dynamic_shapes=({1: dim_seq},))
+        except Exception as e_dyn:
+            print(f"  ⚠️ Dynamic shape export notice ({e_dyn}). Falling back to static graph...")
+            with torch.no_grad():
+                exported_prog = export(prepared_model, example_inputs)
 
         # 4. Lower to ExecuTorch Edge Dialect
         edge_prog = to_edge(
