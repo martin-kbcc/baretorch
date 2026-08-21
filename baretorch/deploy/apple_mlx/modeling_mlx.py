@@ -20,7 +20,7 @@ class GatedMLP(nn.Module):
         super().__init__()
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
         self.w2 = nn.Linear(d_model, d_ff, bias=False)
-        self.w3 = nn.Linear(d_ff, d_model, bias=False)
+        self.w3 = nn.Linear(d_model, d_ff, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.w3(nn.silu(self.w1(x)) * self.w2(x))
@@ -118,7 +118,7 @@ class TransformerDecoderBlock(nn.Module):
         return x_out, current_kv
 
 
-class LowRankAssociativeDeltaEngine(nn.Module):
+class FusedLowRankAssociativeDeltaEngine(nn.Module):
     def __init__(self, d_model: int = 256, num_heads: int = 16, chunk_size: int = 32, rank: int = 8):
         super().__init__()
         self.d_model = d_model
@@ -128,30 +128,71 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         self.d_head = d_model // num_heads
         self.inner_dim = self.num_heads * self.d_head
 
-        self.W_q = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.W_k = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.W_v = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.W_u = nn.Linear(d_model, self.num_heads * self.r, bias=False)
-        self.W_r = nn.Linear(d_model, self.num_heads * self.r, bias=False)
-        self.W_gate = nn.Linear(d_model, num_heads, bias=True)
-        self.W_beta_gate = nn.Linear(d_model, num_heads, bias=True)
-        self.W_swish_gate = nn.Linear(d_model, self.inner_dim, bias=False)
+        # Total output dimensions for 1 fused GEMM layer
+        self.q_dim = self.inner_dim
+        self.k_dim = self.inner_dim
+        self.v_dim = self.inner_dim
+        self.u_dim = self.num_heads * self.r
+        self.r_dim = self.num_heads * self.r
+        self.gate_dim = self.num_heads
+        self.beta_dim = self.num_heads
+        self.swish_dim = self.inner_dim
+
+        self.total_fused_dim = (
+            self.q_dim + self.k_dim + self.v_dim +
+            self.u_dim + self.r_dim + self.gate_dim +
+            self.beta_dim + self.swish_dim
+        )
+
+        # Single fused input projection layer (8 GEMM dispatches -> 1 GEMM dispatch)
+        self.W_in = nn.Linear(d_model, self.total_fused_dim, bias=True)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
+
+    def _split_projections(self, x: mx.array):
+        fused = self.W_in(x)
+        idx = 0
+
+        q = fused[..., idx:idx + self.q_dim]
+        idx += self.q_dim
+
+        k = fused[..., idx:idx + self.k_dim]
+        idx += self.k_dim
+
+        v = fused[..., idx:idx + self.v_dim]
+        idx += self.v_dim
+
+        u = fused[..., idx:idx + self.u_dim]
+        idx += self.u_dim
+
+        r = fused[..., idx:idx + self.r_dim]
+        idx += self.r_dim
+
+        gate = fused[..., idx:idx + self.gate_dim]
+        idx += self.gate_dim
+
+        beta_gate = fused[..., idx:idx + self.beta_dim]
+        idx += self.beta_dim
+
+        swish_gate = fused[..., idx:idx + self.swish_dim]
+
+        return q, k, v, u, r, gate, beta_gate, swish_gate
 
     def forward_sequence(self, x: mx.array):
         B, L, D = x.shape
         H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
         N = L // C
 
-        Q = mx.transpose(mx.reshape(nn.silu(self.W_q(x)), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        K = mx.transpose(mx.reshape(nn.silu(self.W_k(x)), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        V = mx.transpose(mx.reshape(self.W_v(x), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        q_raw, k_raw, v_raw, u_raw, r_raw, gate_raw, beta_raw, swish_raw = self._split_projections(x)
 
-        U = mx.transpose(mx.reshape(self.W_u(x), (B, N, C, H, r)), (0, 3, 1, 2, 4))
-        R = mx.transpose(mx.reshape(self.W_r(x), (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        V = mx.transpose(mx.reshape(v_raw, (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
 
-        gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(self.W_gate(x)), 1e-3, 0.999), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
-        beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(self.W_beta_gate(x)), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
+        U = mx.transpose(mx.reshape(u_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        R = mx.transpose(mx.reshape(r_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
+
+        gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(gate_raw), 1e-3, 0.999), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
+        beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(beta_raw), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
 
         log_gate = mx.log(gate)
         Lambda = mx.cumsum(log_gate, axis=-2)
@@ -188,21 +229,23 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         S_local_last = mx.transpose(U_decayed[:, :, -1], (0, 1, 3, 2)) @ V[:, :, -1]
         S_final = (chunk_decay_last * S_historical_last) + S_local_last
 
-        return self.W_out(Out * nn.silu(self.W_swish_gate(x))), S_final
+        return self.W_out(Out * nn.silu(swish_raw)), S_final
 
     def step_inference(self, x: mx.array, past_S: mx.array | None = None):
         B, L, D = x.shape
         H, d_h, r = self.num_heads, self.d_head, self.r
         scaling = 1.0 / math.sqrt(d_h)
 
-        Q = mx.transpose(mx.reshape(nn.silu(self.W_q(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        K = mx.transpose(mx.reshape(nn.silu(self.W_k(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        V = mx.transpose(mx.reshape(self.W_v(x), (B, L, H, d_h)), (0, 2, 1, 3))
-        U = mx.transpose(mx.reshape(self.W_u(x), (B, L, H, r)), (0, 2, 1, 3))
-        R = mx.transpose(mx.reshape(self.W_r(x), (B, L, H, r)), (0, 2, 1, 3))
+        q_raw, k_raw, v_raw, u_raw, r_raw, gate_raw, beta_raw, swish_raw = self._split_projections(x)
 
-        gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(self.W_gate(x)), 1e-3, 0.999), (B, L, H)), (0, 2, 1)), axis=-1)
-        beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(self.W_beta_gate(x)), (B, L, H)), (0, 2, 1)), axis=-1)
+        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        V = mx.transpose(mx.reshape(v_raw, (B, L, H, d_h)), (0, 2, 1, 3))
+        U = mx.transpose(mx.reshape(u_raw, (B, L, H, r)), (0, 2, 1, 3))
+        R = mx.transpose(mx.reshape(r_raw, (B, L, H, r)), (0, 2, 1, 3))
+
+        gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(gate_raw), 1e-3, 0.999), (B, L, H)), (0, 2, 1)), axis=-1)
+        beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(beta_raw), (B, L, H)), (0, 2, 1)), axis=-1)
 
         if past_S is None:
             past_S = mx.zeros((B, H, r, d_h), dtype=x.dtype)
@@ -216,14 +259,14 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         next_S = S_decayed + S_local
 
         out_flat = mx.reshape(mx.transpose(Out, (0, 2, 1, 3)), (B, L, self.inner_dim))
-        return self.W_out(out_flat * nn.silu(self.W_swish_gate(x))), next_S
+        return self.W_out(out_flat * nn.silu(swish_raw)), next_S
 
 
 class LRADDecoderBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, chunk_size: int = 32, rank: int = 8):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
-        self.attn = LowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank)
+        self.attn = FusedLowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank)
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5))
 
