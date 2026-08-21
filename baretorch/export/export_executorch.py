@@ -131,7 +131,7 @@ def export_single_model_to_pte(
 ) -> Dict[str, Any]:
     """
     Exports a model to ExecuTorch (.pte) format using graph capture, torchao quantization,
-    dynamic sequence shapes, backend partitioning, and AOT MemoryPlanningPass.
+    backend partitioning, and AOT MemoryPlanningPass.
     """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
 
@@ -140,25 +140,19 @@ def export_single_model_to_pte(
     param_count_m = sum(p.numel() for p in wrapper.parameters()) / 1e6
     example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long),)
 
-    print(f"\n📦 Exporting '{model_name}' ({param_count_m:.2f}M params) | Quant: {quant_type.upper()} | Backend: {backend_delegate.upper()}...")
+    print(f"\n📦 Exporting '{model_name}' ({param_count_m:.2f}M params) | SeqLen: {seq_len} | Quant: {quant_type.upper()} | Backend: {backend_delegate.upper()}...")
 
     try:
-        from torch.export import export, Dim
+        from torch.export import export
         from executorch.exir import to_edge, EdgeCompileConfig, ExecutorchBackendConfig
         from executorch.exir.passes import MemoryPlanningPass
 
-        # 2. Apply torchao Native Quantization via centralized module
+        # 2. Apply torchao Native Quantization
         prepared_model = apply_quantization(wrapper, quant_type=quant_type)
 
-        # 3. Capture PyTorch ExportedProgram with Dynamic Sequence Length
-        dim_seq = Dim("seq_len", min=1, max=16384)
-        try:
-            with torch.no_grad():
-                exported_prog = export(prepared_model, example_inputs, dynamic_shapes=({1: dim_seq},))
-        except Exception as e_dyn:
-            print(f"  ⚠️ Dynamic shape export notice ({e_dyn}). Falling back to static graph...")
-            with torch.no_grad():
-                exported_prog = export(prepared_model, example_inputs)
+        # 3. Capture PyTorch ExportedProgram
+        with torch.no_grad():
+            exported_prog = export(prepared_model, example_inputs)
 
         # 4. Lower to ExecuTorch Edge Dialect
         edge_prog = to_edge(
@@ -166,7 +160,7 @@ def export_single_model_to_pte(
             compile_config=EdgeCompileConfig(_check_ir_validity=False)
         )
 
-        # 5. Resolve & Apply Hardware Partitioner (CoreML, QNN, Vulkan, XNNPACK)
+        # 5. Resolve & Apply Hardware Partitioner
         partitioners = get_backend_partitioner(backend_delegate)
         if partitioners:
             print("  🧩 Lowering graph through backend delegate partitioner...")
@@ -207,6 +201,7 @@ def export_single_model_to_pte(
         return {
             "model_name": model_name,
             "param_count_m": round(param_count_m, 2),
+            "seq_len": seq_len,
             "quant_type": quant_type,
             "backend_delegate": backend_delegate,
             "pte_file_size_mb": file_size_mb,
@@ -221,6 +216,7 @@ def export_single_model_to_pte(
         return {
             "model_name": model_name,
             "param_count_m": round(param_count_m, 2),
+            "seq_len": seq_len,
             "quant_type": quant_type,
             "backend_delegate": backend_delegate,
             "pte_file_size_mb": "N/A",
