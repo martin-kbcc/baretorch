@@ -16,7 +16,7 @@ def apply_quantization(
 ) -> nn.Module:
     """
     Applies ahead-of-time (AOT) weight quantization via torchao prior to EXIR lowering.
-    Sets set_inductor_config=False to prevent MSLK GPU kernel checks on macOS/MPS.
+    Uses int4_packing_format="plain" to bypass CUDA-only mslk kernel checks on macOS.
     """
     quant_str = quant_type.lower().strip()
 
@@ -32,8 +32,12 @@ def apply_quantization(
         try:
             model = model.eval().cpu()
             if quant_str == "int4":
-                config = Int4WeightOnlyConfig(group_size=32, set_inductor_config=False)
-                quantize_(model, config)
+                try:
+                    config = Int4WeightOnlyConfig(group_size=32, set_inductor_config=False, int4_packing_format="plain")
+                    quantize_(model, config)
+                except (TypeError, ValueError, AttributeError, ImportError):
+                    config = Int4WeightOnlyConfig(group_size=32, set_inductor_config=False)
+                    quantize_(model, config)
             elif quant_str == "int8":
                 config = Int8WeightOnlyConfig(set_inductor_config=False)
                 quantize_(model, config)

@@ -62,7 +62,6 @@ def benchmark_pte_inference_standardized(
     try:
         runtime = Runtime.get()
 
-        # Load prefill and decode programs
         prog_prefill = runtime.load_program(pte_prefill_path)
         method_prefill = prog_prefill.load_method("forward")
 
@@ -125,7 +124,6 @@ def main():
     except Exception:
         vocab_size = 50257
 
-    # Load models once for metadata extraction
     clear_memory()
     print(f"\n📦 Loading Hugging Face Baseline: '{args.hf_model_id}'...")
     hf_model = AutoModelForCausalLM.from_pretrained(args.hf_model_id, torch_dtype=torch.float32, trust_remote_code=True)
@@ -142,7 +140,6 @@ def main():
     bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32)
     actual_bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
-    # 1. Export 1-token decode models (shared across all context decode steps)
     print("\n📦 Exporting single-token decode .pte models (seq_len=1)...")
     hf_decode_path = os.path.join(args.output_dir, f"baseline_{sanitized_name}_dec1_{args.quant_type}_{args.backend}.pte")
     export_single_model_to_pte(
@@ -169,11 +166,9 @@ def main():
     hf_results = {}
     bt_results = {}
 
-    # 2. Export & Benchmark prefill models for each context length
     for ctx in args.prompt_lens:
         print(f"\n📦 Exporting & Benchmarking .pte Graphs @ Context Length: {ctx} tokens...")
 
-        # Export Baseline Prefill for ctx
         hf_prefill_path = os.path.join(args.output_dir, f"baseline_{sanitized_name}_pref{ctx}_{args.quant_type}_{args.backend}.pte")
         export_single_model_to_pte(
             model=hf_model,
@@ -185,7 +180,6 @@ def main():
             backend_delegate=args.backend
         )
 
-        # Export BareTorch Prefill for ctx
         bt_prefill_path = os.path.join(args.output_dir, f"baretorch_{sanitized_name}_pref{ctx}_{args.quant_type}_{args.backend}.pte")
         export_single_model_to_pte(
             model=bt_model,
@@ -197,7 +191,6 @@ def main():
             backend_delegate=args.backend
         )
 
-        # Benchmark via ExecuTorch C++ runtime
         print(f"  ├─ Benchmarking Baseline .pte @ {ctx} tokens...", end="", flush=True)
         hf_results[ctx] = benchmark_pte_inference_standardized(
             pte_prefill_path=hf_prefill_path,
@@ -221,7 +214,6 @@ def main():
     del hf_model, bt_model
     clear_memory()
 
-    # 3. Comparative Report
     print("\n" + "=" * 135)
     print(f"📊 EXECUTORCH (.PTE) GRAPH REPORT: BARETORCH vs. LLAMA 3.2 1B (Quant: {args.quant_type.upper()})")
     print("=" * 135)

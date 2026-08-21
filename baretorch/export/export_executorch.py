@@ -57,7 +57,7 @@ def count_baretorch_params_fast(
         layer_params += (norms + mlp + attn)
 
     total_params = embed_params + final_norm + layer_params
-    return total_params / 1e6  # Millions
+    return total_params / 1e6
 
 
 def find_matching_baretorch_config(
@@ -135,7 +135,6 @@ def export_single_model_to_pte(
     """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
 
-    # 1. Wrap model for pure Tensor logits output
     wrapper = ModelExportWrapper(model).eval().cpu()
     param_count_m = sum(p.numel() for p in wrapper.parameters()) / 1e6
     example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long),)
@@ -147,33 +146,27 @@ def export_single_model_to_pte(
         from executorch.exir import to_edge, EdgeCompileConfig, ExecutorchBackendConfig
         from executorch.exir.passes import MemoryPlanningPass
 
-        # 2. Apply torchao Native Quantization
         prepared_model = apply_quantization(wrapper, quant_type=quant_type)
 
-        # 3. Capture PyTorch ExportedProgram
         with torch.no_grad():
             exported_prog = export(prepared_model, example_inputs)
 
-        # 4. Lower to ExecuTorch Edge Dialect
         edge_prog = to_edge(
             exported_prog,
             compile_config=EdgeCompileConfig(_check_ir_validity=False)
         )
 
-        # 5. Resolve & Apply Hardware Partitioner
         partitioners = get_backend_partitioner(backend_delegate)
         if partitioners:
             print("  🧩 Lowering graph through backend delegate partitioner...")
             edge_prog = edge_prog.to_backend(partitioners[0])
 
-        # 6. Lower to ExecuTorch Program with AOT Memory Planning
         et_prog = edge_prog.to_executorch(
             ExecutorchBackendConfig(
                 memory_planning_pass=MemoryPlanningPass()
             )
         )
 
-        # 7. Serialize to .pte binary file
         buf = getattr(et_prog, "buffer", None)
         raw_bytes = buf if isinstance(buf, (bytes, bytearray)) else (buf() if callable(buf) else et_prog.buffer)
         with open(output_pte_path, "wb") as f:
@@ -181,7 +174,6 @@ def export_single_model_to_pte(
 
         file_size_mb = round(os.path.getsize(output_pte_path) / (1024.0 ** 2), 2)
 
-        # 8. Extract Tensor Arena Memory Allocation from ExecuTorch Plan
         arena_bytes = 0
         try:
             program_flatbuffer = getattr(et_prog, "executorch_program", None)
@@ -330,7 +322,6 @@ def run_stage1_export_suite(
         target_vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", 50257))
         hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
 
-        # 1. Export HF Baseline to .pte
         hf_pte_path = os.path.join(output_dir, f"baseline_{sanitized_name}_{quant_type}_{backend_delegate}.pte")
         hf_res = export_single_model_to_pte(
             model=hf_model,
@@ -345,7 +336,6 @@ def run_stage1_export_suite(
         del hf_model
         clear_host_memory()
 
-        # 2. Find matching BareTorch blueprint
         print(f"\n⚙️ Finding BareTorch blueprint matching ~{hf_params_m:.2f}M parameters...")
         bt_config, bt_params_m_predicted = find_matching_baretorch_config(
             target_params_m=hf_params_m,
@@ -354,7 +344,6 @@ def run_stage1_export_suite(
             max_seq_len=32768
         )
 
-        # 3. Instantiate BareTorch
         bt_model = BareTorchForCausalLM(bt_config).to(dtype=torch.float32)
         actual_bt_params_m = sum(p.numel() for p in bt_model.parameters()) / 1e6
 
