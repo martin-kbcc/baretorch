@@ -15,35 +15,38 @@ def apply_quantization(
     quant_type: str = "int4"
 ) -> nn.Module:
     """
-    Applies ahead-of-time (AOT) weight quantization via torchao on Apple Silicon (MPS) or CPU.
-    Specifies version=1 to bypass CUDA MSLK/Triton kernel checks.
+    Applies ahead-of-time (AOT) weight quantization via torchao on CPU prior to EXIR lowering.
+    Specifies version=1 and set_inductor_config=False to prevent CUDA MSLK checks.
     """
     quant_str = quant_type.lower().strip()
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
     if quant_str == "fp32":
-        return model.eval().to(device)
+        return model.eval().cpu()
 
     elif quant_str in ["int4", "int8"]:
         if not HAS_TORCHAO:
             print("  ⚠️ 'torchao' is not installed (`pip install torchao`). Falling back to FP32...")
-            return model.eval().to(device)
+            return model.eval().cpu()
 
-        print(f"  ⚡ Applying torchao native {quant_str.upper()} weight-only quantization on {device}...")
+        print(f"  ⚡ Applying torchao native {quant_str.upper()} weight-only quantization on CPU...")
         try:
-            model = model.eval().to(device)
+            model = model.eval().cpu()
             if quant_str == "int4":
-                # version=1 uses pure PyTorch layouts that do not check for CUDA MSLK
-                config = Int4WeightOnlyConfig(group_size=32, version=1)
-                quantize_(model, config)
+                try:
+                    config = Int4WeightOnlyConfig(group_size=32, set_inductor_config=False, version=1)
+                    quantize_(model, config)
+                except Exception as e_v1:
+                    print(f"  ⚠️ INT4 v1 layout notice ({type(e_v1).__name__}: {e_v1}). Trying INT8 fallback...")
+                    config = Int8WeightOnlyConfig(set_inductor_config=False)
+                    quantize_(model, config)
             elif quant_str == "int8":
-                config = Int8WeightOnlyConfig()
+                config = Int8WeightOnlyConfig(set_inductor_config=False)
                 quantize_(model, config)
 
             print(f"  ✅ {quant_str.upper()} quantization applied successfully via torchao.")
-            return model
+            return model.eval().cpu()
         except Exception as e:
             print(f"  ⚠️ torchao quantization failed ({type(e).__name__}: {e}). Proceeding with unquantized FP32 graph...")
-            return model.eval().to(device)
+            return model.eval().cpu()
     else:
         raise ValueError(f"Unsupported quantization type '{quant_type}'. Choose 'fp32', 'int8', or 'int4'.")

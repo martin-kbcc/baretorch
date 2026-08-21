@@ -130,14 +130,14 @@ def export_single_model_to_pte(
     backend_delegate: str = "none"
 ) -> Dict[str, Any]:
     """
-    Exports a model to ExecuTorch (.pte) format using graph capture, torchao quantization,
+    Exports a model to ExecuTorch (.pte) format using CPU graph capture, torchao quantization,
     backend partitioning, and AOT MemoryPlanningPass.
     """
     os.makedirs(os.path.dirname(output_pte_path) or ".", exist_ok=True)
 
     wrapper = ModelExportWrapper(model).eval().cpu()
     param_count_m = sum(p.numel() for p in wrapper.parameters()) / 1e6
-    example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long),)
+    example_inputs = (torch.randint(0, vocab_size, (1, seq_len), dtype=torch.long, device="cpu"),)
 
     print(f"\n📦 Exporting '{model_name}' ({param_count_m:.2f}M params) | SeqLen: {seq_len} | Quant: {quant_type.upper()} | Backend: {backend_delegate.upper()}...")
 

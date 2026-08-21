@@ -20,7 +20,7 @@ except ImportError:
 
 
 def clear_memory():
-    """Flushes Python garbage collection and MPS VRAM allocation."""
+    """Flushes Python garbage collection and RAM allocation."""
     gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
@@ -68,8 +68,8 @@ def benchmark_pte_inference_standardized(
         prog_decode = runtime.load_program(pte_decode_path)
         method_decode = prog_decode.load_method("forward")
 
-        prompt_input = torch.randint(0, vocab_size, (1, prompt_len), dtype=torch.long)
-        single_token_input = torch.randint(0, vocab_size, (1, 1), dtype=torch.long)
+        prompt_input = torch.randint(0, vocab_size, (1, prompt_len), dtype=torch.long, device="cpu")
+        single_token_input = torch.randint(0, vocab_size, (1, 1), dtype=torch.long, device="cpu")
 
         # 1. Warmup Passes
         _ = method_prefill.execute([prompt_input])
