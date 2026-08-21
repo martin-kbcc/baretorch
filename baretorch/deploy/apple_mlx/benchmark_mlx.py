@@ -43,8 +43,7 @@ def benchmark_mlx_model(
 ) -> dict:
     """
     Standardized MLX benchmark measuring isolated Prefill and Decode metrics:
-      - Prefill TTFT (ms) & Prefill Peak VRAM (MB)
-      - Decode Speed (tok/s) & Decode State VRAM (MB)
+    Materializes past_key_values lazily to prevent DAG memory accumulation in Metal RAM.
     """
     clear_memory()
     prompt = mx.random.randint(0, vocab_size, (1, prompt_len))
@@ -65,7 +64,6 @@ def benchmark_mlx_model(
         ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
         prefill_vram_mb = get_peak_vram_mb()
 
-        # Reset VRAM tracking specifically for the decode phase
         clear_memory()
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
@@ -81,18 +79,19 @@ def benchmark_mlx_model(
     else:
         # 1. Warmup Pass
         w_out, w_cache = model(prompt)
-        mx.eval(w_out)
+        mx.eval(w_out, w_cache)
 
         clear_memory()
 
         # 2. Prefill Phase
         ttft_start = time.perf_counter()
         outputs, past_key_values = model(prompt)
-        mx.eval(outputs)
+        # Materialize BOTH outputs and past_key_values to collapse S_final into O(1) tensors
+        # and release the multi-gigabyte prefill DAG from Metal memory.
+        mx.eval(outputs, past_key_values)
         ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
         prefill_vram_mb = get_peak_vram_mb()
 
-        # Reset VRAM tracking specifically for the decode phase
         clear_memory()
         curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
 
@@ -106,12 +105,13 @@ def benchmark_mlx_model(
 
         # JIT Warmup pass
         dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
-        mx.eval(dummy_tok)
+        mx.eval(dummy_tok, past_key_values)
 
         gen_start = time.perf_counter()
         for _ in range(gen_len):
             curr_token, past_key_values = compiled_step(curr_token, past_key_values)
-            mx.eval(curr_token)
+            # Materialize BOTH current token and past_key_values on every decode iteration
+            mx.eval(curr_token, past_key_values)
 
         decode_sec = max(time.perf_counter() - gen_start, 1e-5)
         decode_vram_mb = get_peak_vram_mb()
@@ -135,7 +135,7 @@ def main():
     args = parser.parse_args()
 
     print("==================================================================================================")
-    print("🍎 BARETORCH NATIVE APPLE SILICON MLX BENCHMARK (ISOLATED DECODE VRAM)")
+    print("🍎 BARETORCH NATIVE APPLE SILICON MLX BENCHMARK (LAZY EVALUATION FIXED)")
     print("==================================================================================================")
 
     try:
