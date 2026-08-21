@@ -13,8 +13,9 @@ def convert_pytorch_to_fused_mlx_safetensors(
     dtype: str = "float16"
 ):
     """
-    Fuses separate PyTorch projection weights (W_q, W_k, W_v, W_u, W_r, W_gate, W_beta, W_swish)
-    into a single MLX 'W_in' weight matrix per layer.
+    Fuses separate PyTorch projection weights into two optimized MLX linear layers per cs_lrad block:
+    1. W_qkv_swish (W_q, W_k, W_v, W_swish_gate)
+    2. W_gates (W_u, W_r, W_gate, W_beta_gate)
     """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     target_dtype = getattr(mx, dtype, mx.float16)
@@ -23,13 +24,11 @@ def convert_pytorch_to_fused_mlx_safetensors(
     mlx_weights = {}
     fused_layers = set()
 
-    # Identify cs_lrad layer indices
     for key in pt_state.keys():
         if "attn.W_q.weight" in key:
             layer_prefix = key.rsplit(".attn.W_q.weight", 1)[0]
             fused_layers.add(layer_prefix)
 
-    # 1. Process and Fuse CS-LRAD Layers
     for prefix in fused_layers:
         w_q = pt_state.pop(f"{prefix}.attn.W_q.weight")
         w_k = pt_state.pop(f"{prefix}.attn.W_k.weight")
@@ -45,23 +44,19 @@ def convert_pytorch_to_fused_mlx_safetensors(
         
         w_swish = pt_state.pop(f"{prefix}.attn.W_swish_gate.weight")
 
-        # Fuse weights along output dim (dim 0 in PyTorch linear weights)
-        fused_weight = torch.cat([w_q, w_k, w_v, w_u, w_r, w_gate, w_beta, w_swish], dim=0)
+        # 1. W_qkv_swish fusion
+        w_qkv_swish = torch.cat([w_q, w_k, w_v, w_swish], dim=0)
+        mlx_weights[f"{prefix}.attn.W_qkv_swish.weight"] = mx.array(w_qkv_swish.cpu().to(torch.float32).numpy()).astype(target_dtype)
 
-        # Construct fused bias vector (zero-padded for layers without bias)
-        b_q = torch.zeros(w_q.size(0), device=w_q.device, dtype=w_q.dtype)
-        b_k = torch.zeros(w_k.size(0), device=w_k.device, dtype=w_k.dtype)
-        b_v = torch.zeros(w_v.size(0), device=w_v.device, dtype=w_v.dtype)
+        # 2. W_gates fusion
+        w_gates = torch.cat([w_u, w_r, w_gate, w_beta], dim=0)
         b_u = torch.zeros(w_u.size(0), device=w_u.device, dtype=w_u.dtype)
         b_r = torch.zeros(w_r.size(0), device=w_r.device, dtype=w_r.dtype)
-        b_swish = torch.zeros(w_swish.size(0), device=w_swish.device, dtype=w_swish.dtype)
+        b_gates = torch.cat([b_u, b_r, b_gate, b_beta], dim=0)
 
-        fused_bias = torch.cat([b_q, b_k, b_v, b_u, b_r, b_gate, b_beta, b_swish], dim=0)
+        mlx_weights[f"{prefix}.attn.W_gates.weight"] = mx.array(w_gates.cpu().to(torch.float32).numpy()).astype(target_dtype)
+        mlx_weights[f"{prefix}.attn.W_gates.bias"] = mx.array(b_gates.cpu().to(torch.float32).numpy()).astype(target_dtype)
 
-        mlx_weights[f"{prefix}.attn.W_in.weight"] = mx.array(fused_weight.cpu().to(torch.float32).numpy()).astype(target_dtype)
-        mlx_weights[f"{prefix}.attn.W_in.bias"] = mx.array(fused_bias.cpu().to(torch.float32).numpy()).astype(target_dtype)
-
-    # 2. Copy remaining weights (Transformer blocks, Embeddings, Norms, LM Head)
     for name, tensor in pt_state.items():
         np_arr = tensor.detach().cpu().to(torch.float32).numpy()
         mlx_weights[name] = mx.array(np_arr).astype(target_dtype)

@@ -128,66 +128,35 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         self.d_head = d_model // num_heads
         self.inner_dim = self.num_heads * self.d_head
 
-        self.q_dim = self.inner_dim
-        self.k_dim = self.inner_dim
-        self.v_dim = self.inner_dim
-        self.u_dim = self.num_heads * self.r
-        self.r_dim = self.num_heads * self.r
-        self.gate_dim = self.num_heads
-        self.beta_dim = self.num_heads
-        self.swish_dim = self.inner_dim
-
-        self.total_fused_dim = (
-            self.q_dim + self.k_dim + self.v_dim +
-            self.u_dim + self.r_dim + self.gate_dim +
-            self.beta_dim + self.swish_dim
-        )
-
-        self.W_in = nn.Linear(d_model, self.total_fused_dim, bias=True)
+        # Split projections into 2 smaller, memory-contiguous Linear layers
+        self.W_qkv_swish = nn.Linear(d_model, self.inner_dim * 4, bias=False)
+        self.W_gates = nn.Linear(d_model, (self.num_heads * self.r * 2) + (self.num_heads * 2), bias=True)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
-
-    def _split_projections(self, x: mx.array):
-        fused = self.W_in(x)
-        idx = 0
-
-        q = fused[..., idx:idx + self.q_dim]
-        idx += self.q_dim
-
-        k = fused[..., idx:idx + self.k_dim]
-        idx += self.k_dim
-
-        v = fused[..., idx:idx + self.v_dim]
-        idx += self.v_dim
-
-        u = fused[..., idx:idx + self.u_dim]
-        idx += self.u_dim
-
-        r = fused[..., idx:idx + self.r_dim]
-        idx += self.r_dim
-
-        gate = fused[..., idx:idx + self.gate_dim]
-        idx += self.gate_dim
-
-        beta_gate = fused[..., idx:idx + self.beta_dim]
-        idx += self.beta_dim
-
-        swish_gate = fused[..., idx:idx + self.swish_dim]
-
-        return q, k, v, u, r, gate, beta_gate, swish_gate
 
     def forward_sequence(self, x: mx.array):
         B, L, D = x.shape
         H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
         N = L // C
 
-        q_raw, k_raw, v_raw, u_raw, r_raw, gate_raw, beta_raw, swish_raw = self._split_projections(x)
+        qkv_s = self.W_qkv_swish(x)
+        Q_raw = qkv_s[..., :self.inner_dim]
+        K_raw = qkv_s[..., self.inner_dim:2 * self.inner_dim]
+        V_raw = qkv_s[..., 2 * self.inner_dim:3 * self.inner_dim]
+        swish_raw = qkv_s[..., 3 * self.inner_dim:]
 
-        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        V = mx.transpose(mx.reshape(v_raw, (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        gates = self.W_gates(x)
+        u_dim = H * r
+        U_raw = gates[..., :u_dim]
+        R_raw = gates[..., u_dim:2 * u_dim]
+        gate_raw = gates[..., 2 * u_dim:2 * u_dim + H]
+        beta_raw = gates[..., 2 * u_dim + H:]
 
-        U = mx.transpose(mx.reshape(u_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
-        R = mx.transpose(mx.reshape(r_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        Q = mx.transpose(mx.reshape(nn.silu(Q_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        K = mx.transpose(mx.reshape(nn.silu(K_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        V = mx.transpose(mx.reshape(V_raw, (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+
+        U = mx.transpose(mx.reshape(U_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        R = mx.transpose(mx.reshape(R_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
 
         gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(gate_raw), 1e-3, 0.999), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
         beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(beta_raw), (B, N, C, H)), (0, 3, 1, 2)), axis=-1)
@@ -234,13 +203,24 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         H, d_h, r = self.num_heads, self.d_head, self.r
         scaling = 1.0 / math.sqrt(d_h)
 
-        q_raw, k_raw, v_raw, u_raw, r_raw, gate_raw, beta_raw, swish_raw = self._split_projections(x)
+        qkv_s = self.W_qkv_swish(x)
+        Q_raw = qkv_s[..., :self.inner_dim]
+        K_raw = qkv_s[..., self.inner_dim:2 * self.inner_dim]
+        V_raw = qkv_s[..., 2 * self.inner_dim:3 * self.inner_dim]
+        swish_raw = qkv_s[..., 3 * self.inner_dim:]
 
-        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, L, H, d_h)), (0, 2, 1, 3))
-        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, L, H, d_h)), (0, 2, 1, 3))
-        V = mx.transpose(mx.reshape(v_raw, (B, L, H, d_h)), (0, 2, 1, 3))
-        U = mx.transpose(mx.reshape(u_raw, (B, L, H, r)), (0, 2, 1, 3))
-        R = mx.transpose(mx.reshape(r_raw, (B, L, H, r)), (0, 2, 1, 3))
+        gates = self.W_gates(x)
+        u_dim = H * r
+        U_raw = gates[..., :u_dim]
+        R_raw = gates[..., u_dim:2 * u_dim]
+        gate_raw = gates[..., 2 * u_dim:2 * u_dim + H]
+        beta_raw = gates[..., 2 * u_dim + H:]
+
+        Q = mx.transpose(mx.reshape(nn.silu(Q_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        K = mx.transpose(mx.reshape(nn.silu(K_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        V = mx.transpose(mx.reshape(V_raw, (B, L, H, d_h)), (0, 2, 1, 3))
+        U = mx.transpose(mx.reshape(U_raw, (B, L, H, r)), (0, 2, 1, 3))
+        R = mx.transpose(mx.reshape(R_raw, (B, L, H, r)), (0, 2, 1, 3))
 
         gate = mx.expand_dims(mx.transpose(mx.reshape(mx.clip(mx.sigmoid(gate_raw), 1e-3, 0.999), (B, L, H)), (0, 2, 1)), axis=-1)
         beta_gate = mx.expand_dims(mx.transpose(mx.reshape(mx.sigmoid(beta_raw), (B, L, H)), (0, 2, 1)), axis=-1)
