@@ -1,4 +1,4 @@
-# baretorch/export/benchmark_mac.py
+# baretorch/benchmark/benchmark_mac.py
 import time
 import gc
 import argparse
@@ -12,24 +12,41 @@ from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
 
 try:
-    from torchao.quantization import quantize_, int4_weight_only, int8_weight_only
+    import torchao
     HAS_TORCHAO = True
 except ImportError:
     HAS_TORCHAO = False
 
 
 def apply_quantization(model: nn.Module, quant_type: str, device: torch.device) -> nn.Module:
-    """Applies torchao native weight-only quantization or precision casting."""
+    """Applies torchao native weight-only quantization or precision casting across API versions."""
     if quant_type in ["int4", "int8"]:
         if not HAS_TORCHAO:
             print("  ⚠️ 'torchao' is not installed (`pip install torchao`). Falling back to FP16...")
             model = model.to(dtype=torch.float16)
         else:
             print(f"  ⚡ Applying torchao native {quant_type.upper()} weight-only quantization...")
-            if quant_type == "int4":
-                quantize_(model, int4_weight_only(group_size=32))
-            elif quant_type == "int8":
-                quantize_(model, int8_weight_only())
+            try:
+                from torchao.quantization import quantize_
+                model = model.eval().cpu()
+                if quant_type == "int4":
+                    try:
+                        from torchao.quantization import Int4WeightOnlyConfig
+                        quantize_(model, Int4WeightOnlyConfig(group_size=32))
+                    except ImportError:
+                        from torchao.quantization import int4_weight_only
+                        quantize_(model, int4_weight_only(group_size=32))
+                elif quant_type == "int8":
+                    try:
+                        from torchao.quantization import Int8WeightOnlyConfig
+                        quantize_(model, Int8WeightOnlyConfig())
+                    except ImportError:
+                        from torchao.quantization import int8_weight_only
+                        quantize_(model, int8_weight_only())
+                print(f"  ✅ {quant_type.upper()} quantization applied successfully via torchao.")
+            except Exception as e:
+                print(f"  ⚠️ torchao quantization failed ({e}). Falling back to FP16...")
+                model = model.to(dtype=torch.float16)
     elif quant_type == "fp16":
         model = model.to(dtype=torch.float16)
     elif quant_type == "fp32":
