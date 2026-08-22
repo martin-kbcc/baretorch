@@ -38,7 +38,7 @@ def get_peak_vram_mb() -> float:
 
 
 def count_mlx_params_m(model: nn.Module) -> float:
-    """Counts actual instantiated parameters in an MLX module tree."""
+    """Counts actual instantiated parameters in an unquantized MLX module tree."""
     def _count(tree):
         total = 0
         if isinstance(tree, dict):
@@ -51,6 +51,13 @@ def count_mlx_params_m(model: nn.Module) -> float:
             total += tree.size
         return total
     return _count(model.parameters()) / 1e6
+
+
+def apply_quantization(model: nn.Module, bits: int = 4, group_size: int = 64) -> nn.Module:
+    """Quantizes an MLX Module tree in-place using MLX's native nn.quantize API."""
+    if bits in [4, 8]:
+        nn.quantize(model, group_size=group_size, bits=bits)
+    return model
 
 
 def count_baretorch_params_fast(
@@ -113,7 +120,7 @@ def find_matching_baretorch_config(
                 if d % nh != 0:
                     continue
                 head_dim = d // nh
-                
+
                 # MLX SDPA Kernel requirement: head_dim MUST be 64 or 128
                 if head_dim not in [64, 128]:
                     continue
@@ -265,23 +272,27 @@ def export_to_csv(paired_results: list, output_csv: str):
             bt_res = pair["baretorch_matched"]
             baseline_id = hf_res["model_name"]
 
-            prompt_lens = [r["prompt_len"] for r in bt_res["runs"]]
+            bt_runs = bt_res.get("runs", [])
+            hf_runs = hf_res.get("runs", [])
 
-            for run_idx, ctx in enumerate(prompt_lens):
-                b_run = bt_res["runs"][run_idx]
-                h_run = hf_res["runs"][run_idx]
+            for run_idx, b_run in enumerate(bt_runs):
+                ctx = b_run["prompt_len"]
+                h_run = hf_runs[run_idx] if run_idx < len(hf_runs) else {}
 
-                t_b, t_h = b_run["ttft_ms"], h_run["ttft_ms"]
+                t_b = b_run.get("ttft_ms")
+                t_h = h_run.get("ttft_ms", "N/A")
                 ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_b, (int, float)) and t_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", t_b, t_h, ttft_adv])
+                writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", format_cell(t_b), format_cell(t_h), ttft_adv])
 
-                s_b, s_h = b_run["tokens_per_sec"], h_run["tokens_per_sec"]
+                s_b = b_run.get("tokens_per_sec")
+                s_h = h_run.get("tokens_per_sec", "N/A")
                 speed_adv = f"{s_b / s_h:.2f}x" if (isinstance(s_h, (int, float)) and isinstance(s_b, (int, float)) and s_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Local_GPU_Decode_tok_s", s_b, s_h, speed_adv])
+                writer.writerow([baseline_id, ctx, "Local_GPU_Decode_tok_s", format_cell(s_b), format_cell(s_h), speed_adv])
 
-                v_b, v_h = b_run["decode_vram_mb"], h_run["decode_vram_mb"]
+                v_b = b_run.get("decode_vram_mb")
+                v_h = h_run.get("decode_vram_mb", "N/A")
                 vram_adv = f"-{((v_h - v_b) / v_h) * 100:.2f}%" if (isinstance(v_h, (int, float)) and isinstance(v_b, (int, float)) and v_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Decode_VRAM_MB", v_b, v_h, vram_adv])
+                writer.writerow([baseline_id, ctx, "Decode_VRAM_MB", format_cell(v_b), format_cell(v_h), vram_adv])
 
     print(f"\n📊 MLX Multi-model CSV report saved to: {output_csv}")
 
@@ -298,12 +309,15 @@ def main():
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
     parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192, 16384, 32768])
     parser.add_argument("--gen_len", type=int, default=32)
+    parser.add_argument("--quantize", type=int, choices=[4, 8], default=None, help="Quantize linear layers to 4-bit or 8-bit INT")
+    parser.add_argument("--group_size", type=int, default=64, help="Quantization group size (64 or 128)")
     parser.add_argument("--output_json", type=str, default="./results_mlx_suite.json")
     parser.add_argument("--output_csv", type=str, default="./results_mlx_suite.csv")
     args = parser.parse_args()
 
+    quant_suffix = f" (INT{args.quantize})" if args.quantize else " (FP16)"
     print("==================================================================================================")
-    print(f"🍎 BARETORCH APPLES-TO-APPLES NATIVE MLX SUITE ({len(args.hf_model_ids)} Baseline Models)")
+    print(f"🍎 BARETORCH APPLES-TO-APPLES NATIVE MLX SUITE{quant_suffix} ({len(args.hf_model_ids)} Baseline Models)")
     print("==================================================================================================")
 
     paired_results = []
@@ -330,8 +344,15 @@ def main():
             try:
                 print(f"  • Loading Baseline from MLX/HF Hub...")
                 hf_model, _ = mlx_lm_load(model_id)
+
+                # Step 1: Count baseline parameters BEFORE applying quantization
                 hf_params_m = count_mlx_params_m(hf_model)
-                print(f"  • Baseline Parameters (MLX Measured): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
+                print(f"  • Baseline Parameters (Full Precision): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
+
+                # Step 2: Apply quantization AFTER parameter counting
+                if args.quantize:
+                    print(f"  ⚡ Quantizing Baseline MLX model to INT{args.quantize} (group_size={args.group_size})...")
+                    hf_model = apply_quantization(hf_model, bits=args.quantize, group_size=args.group_size)
 
                 for ctx in args.prompt_lens:
                     print(f"  ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
@@ -357,7 +378,14 @@ def main():
 
         bt_model = BareTorchForCausalLMMLX(bt_config)
         bt_model.set_dtype(mx.float16)
+
+        # Step 3: Count BareTorch parameters BEFORE applying quantization
         actual_bt_params_m = count_mlx_params_m(bt_model)
+
+        # Step 4: Apply quantization AFTER parameter counting
+        if args.quantize:
+            print(f"  ⚡ Quantizing BareTorch MLX model to INT{args.quantize} (group_size={args.group_size})...")
+            bt_model = apply_quantization(bt_model, bits=args.quantize, group_size=args.group_size)
 
         print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
         print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}, head_dim={bt_config.d_model // bt_config.num_heads}")
@@ -386,7 +414,7 @@ def main():
 
     # Summary Report
     print("\n" + "=" * 145)
-    print("📊 APPLES-TO-APPLES MLX SUITE SUMMARY REPORT")
+    print(f"📊 APPLES-TO-APPLES MLX SUITE SUMMARY REPORT{quant_suffix}")
     print("=" * 145)
 
     for pair in paired_results:
@@ -397,9 +425,12 @@ def main():
         print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Baseline TTFT':<16} | {'BareTorch Decode':<18} | {'Baseline Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
         print("-" * 145)
 
-        for run_idx in range(len(bt_res["runs"])):
-            b_run = bt_res["runs"][run_idx]
-            h_run = hf_res["runs"][run_idx] if run_idx < len(hf_res["runs"]) else {}
+        bt_runs = bt_res.get("runs", [])
+        hf_runs = hf_res.get("runs", [])
+
+        for run_idx in range(len(bt_runs)):
+            b_run = bt_runs[run_idx]
+            h_run = hf_runs[run_idx] if run_idx < len(hf_runs) else {}
 
             ctx = b_run["prompt_len"]
             bt_ttft = f"{format_cell(b_run.get('ttft_ms'))} ms"
