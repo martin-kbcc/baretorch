@@ -87,7 +87,7 @@ class RotaryEmbedding(nn.Module):
         # Bypass .item() evaluation during torch.export / ExecuTorch tracing
         if not torch.compiler.is_compiling():
             try:
-                max_pos = int(position_ids.max().item()) if position_ids.numel() > 0 else 0
+                max_pos = position_ids.shape[-1] if position_ids is not None else q.shape[1]
                 if (
                     self.cos_cached is None 
                     or max_pos >= self.cos_cached.size(0) 

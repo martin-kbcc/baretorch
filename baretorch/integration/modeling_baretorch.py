@@ -1,10 +1,10 @@
+# baretorch/integration/modeling_baretorch.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
-# Absolute imports of modular layer-specific configs and architectures
 from baretorch.integration.configuration_baretorch import (
     BareTorchConfig,
     CSLRADConfig,
@@ -22,10 +22,6 @@ from baretorch.modeling.cs_lrad_transformer import CSLRADTransformerForCausalLM
 from baretorch.modeling.cs_ttt_transformer import CSTTTTransformerForCausalLM
 from baretorch.modeling.cs_lrad_cs_ttt_transformer import CSLRADCSTTTTransformerForCausalLM
 
-
-# ==========================================
-# 1. Master Dynamic Unified Model
-# ==========================================
 
 class BareTorchPreTrainedModel(PreTrainedModel):
     config_class = BareTorchConfig
@@ -58,11 +54,6 @@ class BareTorchPreTrainedModel(PreTrainedModel):
 
 
 class BareTorchModel(BareTorchPreTrainedModel):
-    """
-    The Dynamic Unified Sequence Engine of BareTorch.
-    Assembles heterogeneous sequence mixers dynamically in runtime based on 
-    the config's layer_types list.
-    """
     def __init__(self, config):
         super().__init__(config)
         self.config = config
@@ -157,7 +148,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         
         effective_seq_len = seq_length + pad_len
         
-        if position_ids is None:
+        if position_ids is None or position_ids.shape[-1] != effective_seq_len:
             past_length = 0
             if past_key_values is not None:
                 for cache in past_key_values:
@@ -185,14 +176,19 @@ class BareTorchModel(BareTorchPreTrainedModel):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
             elif isinstance(layer, TTTDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
+            
+            # Zero out padded positions after each layer block
+            if not is_step_inference and pad_len > 0:
+                h = torch.cat([h[:, :seq_length, :], torch.zeros_like(h[:, seq_length:, :])], dim=1)
                 
             if use_cache:
                 next_decoder_cache.append(next_state)
 
-        h = self.final_norm(h)
-        
+        # Slice back to unpadded length BEFORE final_norm
         if not is_step_inference and pad_len > 0:
             h = h[:, :seq_length, :]
+
+        h = self.final_norm(h)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (h,)
@@ -223,7 +219,7 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         return self.model.token_embedding
 
     def set_input_embeddings(self, value):
-        self.model.token_embedding = value
+        self.model.token_embedding = value  # Fixed: correctly updates inner model embedding
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -271,8 +267,8 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -289,10 +285,6 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, position_ids=None, **kwargs
     ):
-        """
-        Formats input_ids for Hugging Face generate().
-        During step decoding (past_key_values present), passes only the single newest token.
-        """
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
@@ -319,19 +311,15 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         for layer_past in past_key_values:
             if layer_past is None:
                 reordered_past += (None,)
-            elif isinstance(layer_past, tuple):  # Transformer KV cache
+            elif isinstance(layer_past, tuple):
                 k, v = layer_past
                 reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
-            elif isinstance(layer_past, torch.Tensor):  # Recurrent state matrix
+            elif isinstance(layer_past, torch.Tensor):
                 reordered_past += (layer_past.index_select(0, beam_idx),)
             else:
                 reordered_past += (layer_past,)
         return reordered_past
 
-
-# ==========================================
-# 2. Global Hugging Face Model Registration
-# ==========================================
 
 AutoModel.register(BareTorchConfig, BareTorchModel)
 AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM)

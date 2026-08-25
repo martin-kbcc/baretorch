@@ -1,9 +1,10 @@
 #!/bin/bash
+# /home/martinkb/Desktop/BareTorch_F/cloud_runs_0.5B/launch_lrad_hybrid_sft.sh
 set -e
 
 # ==============================================================================
-#                  BareTorch Stage 1: SFT Launcher (Cloud 0.5B)
-#              Scale Configuration: ~500M Hybrid on 4x NVIDIA H100
+#                  BareTorch Stage 1: SFT Launcher (Local Dual RTX 4090)
+#          Scale Configuration: ~500M Hybrid on 2x NVIDIA RTX 4090 (24GB)
 # ==============================================================================
 
 # CUDA Memory Management & Distributed NCCL Tuning
@@ -13,31 +14,31 @@ export TORCH_CPP_MIN_LOG_LEVEL=2
 export NCCL_DEBUG=WARN
 
 # ==============================================================================
-#                               Hardware & Cluster Config
+#                                Hardware Config
 # ==============================================================================
-NUM_GPUS=4
+NUM_GPUS=2
 
 # ==============================================================================
 #                        Checkpoint & Cloud Sync Config
 # ==============================================================================
-PRETRAINED_CHECKPOINT="./checkpoints_500m_hybrid_baretorch/checkpoint-240326"
+PRETRAINED_CHECKPOINT="./checkpoints_500m_hybrid_baretorch/checkpoint-190735"
 OUTPUT_DIR="./checkpoints_500m_sft"
 TOKENIZER_NAME="HuggingFaceTB/SmolLM2-360M"
 
 R2_BUCKET="baretorch-data"
 R2_PREFIX="checkpoints"
-R2_REMOTE_PATH="r2:${R2_BUCKET}/${R2_PREFIX}/checkpoints_500m_hybrid_baretorch/checkpoint-240326"
+R2_REMOTE_PATH="r2:${R2_BUCKET}/${R2_PREFIX}/checkpoints_500m_hybrid_baretorch/checkpoint-190735"
 
 # ==============================================================================
 #                   Dataset & Hyperparameters (Stage 1 SFT)
 # ==============================================================================
-DATASET_NAME="HuggingFaceTB/smoltalk"
-DATASET_CONFIG="all"
-MAX_SAMPLES=0             # 0 = Use full dataset (~1M samples)
+DATASET_NAME="HuggingFaceTB/smol-smoltalk"
+DATASET_CONFIG="default"
+MAX_SAMPLES=0             # 0 = Use full dataset (~485k samples)
 
-PER_GPU_BATCH_SIZE=32     # Per-GPU batch size
-GRAD_ACCUM=2              # Global batch size = 4 GPUs * 32 batch * 2 accum = 256 sequences
-LEARNING_RATE=1.5e-4      # Optimal LR for sub-1B SFT to maximize instruction adherence
+PER_GPU_BATCH_SIZE=2      # Per-GPU batch size (Optimal for 24GB VRAM at 2K seq_len)
+GRAD_ACCUM=16             # Global batch size = 2 GPUs * 2 batch * 16 accum = 64 sequences
+LEARNING_RATE=3e-5        # Optimal LR for 500M SFT to maximize instruction adherence
 WARMUP_STEPS=100
 WEIGHT_DECAY=0.01
 NUM_EPOCHS=1
@@ -52,9 +53,9 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 echo "======================================================================"
 echo "🚀 Launching BareTorch Stage 1: Supervised Fine-Tuning (SFT)..."
 echo "  ├─ Pre-trained Checkpoint : ${PRETRAINED_CHECKPOINT}"
-echo "  ├─ Tokenizer             : ${TOKENIZER_NAME}"
+echo "  ├─ Tokenizer              : ${TOKENIZER_NAME}"
 echo "  ├─ Target Output Dir      : ${OUTPUT_DIR}"
-echo "  ├─ Hardware Config        : ${NUM_GPUS}x NVIDIA H100 SXM (80GB)"
+echo "  ├─ Hardware Config        : ${NUM_GPUS}x NVIDIA RTX 4090 (24GB)"
 echo "  ├─ Dataset                : ${DATASET_NAME} (${DATASET_CONFIG})"
 echo "  ├─ Context Length         : ${SEQ_LEN} tokens"
 echo "  ├─ Learning Rate          : ${LEARNING_RATE}"
@@ -79,7 +80,7 @@ else
     echo "✅ Found local pre-trained checkpoint at ${PRETRAINED_CHECKPOINT}."
 fi
 
-# Execute DDP via torchrun across 4x H100 GPUs
+# Execute DDP via torchrun across 2x RTX 4090 GPUs
 torchrun --nproc_per_node=${NUM_GPUS} train_sft.py \
     --pretrained_model_path "${PRETRAINED_CHECKPOINT}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -94,8 +95,4 @@ torchrun --nproc_per_node=${NUM_GPUS} train_sft.py \
     --weight_decay ${WEIGHT_DECAY} \
     --num_epochs ${NUM_EPOCHS} \
     --seq_len ${SEQ_LEN} \
-    --compile \
-    --grad_checkpointing \
-    --r2_sync \
-    --r2_bucket "${R2_BUCKET}" \
-    --r2_prefix "${R2_PREFIX}"
+    --compile

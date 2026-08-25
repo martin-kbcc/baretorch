@@ -1,3 +1,4 @@
+# /home/martinkb/Desktop/BareTorch_F/baretorch/modeling/cs_lrad.py
 import math
 import torch
 import torch.nn as nn
@@ -6,38 +7,6 @@ import torch.utils.checkpoint as checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
-
-def safe_coreml_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
-    """
-    Computes cumulative sum safely for CoreML export by temporarily flattening 
-    tensors with rank > 4 down to 3D. Prevents coremltools MIL 5D operator failure 
-    without altering parameters or numerical outputs.
-    """
-    orig_shape = x.shape
-    if dim < 0:
-        dim = len(orig_shape) + dim
-
-    if x.dim() > 4:
-        pre_dim_size = 1
-        for s in orig_shape[:dim]:
-            pre_dim_size *= s
-
-        post_dim_size = 1
-        for s in orig_shape[dim + 1:]:
-            post_dim_size *= s
-
-        target_dim_size = orig_shape[dim]
-
-        x_3d = x.reshape(pre_dim_size, target_dim_size, post_dim_size)
-        out_3d = torch.cumsum(x_3d, dim=1)
-        return out_3d.reshape(orig_shape)
-    else:
-        return torch.cumsum(x, dim=dim)
-
-
-# ==========================================
-# 1. Pure GEMM-Compliant Core Utilities
-# ==========================================
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
@@ -61,10 +30,6 @@ class GatedMLP(nn.Module):
     def forward(self, x):
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
-
-# ==========================================
-# 2. Pure PyTorch BareTorch Sequence Mixer
-# ==========================================
 
 class LowRankAssociativeDeltaEngine(nn.Module):
     def __init__(self, d_model=256, num_heads=16, chunk_size=32, rank=8):
@@ -106,7 +71,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
         
         log_gate = torch.log(gate)
-        Lambda = safe_coreml_cumsum(log_gate, dim=-2)
+        Lambda = torch.cumsum(log_gate, dim=-2)
         exp_Lambda = torch.exp(Lambda)  
         
         causal_mask = torch.tril(torch.ones(C, C, device=x.device)).view(1, 1, 1, C, C)
@@ -116,7 +81,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         Y_local = torch.matmul(torch.matmul(Q, K.transpose(-1, -2)) * scaling * M_links, V)  
         
         chunk_decay_log = torch.sum(log_gate, dim=-2).squeeze(-1) 
-        Lambda_chunks = safe_coreml_cumsum(chunk_decay_log, dim=2)  
+        Lambda_chunks = torch.cumsum(chunk_decay_log, dim=2)  
         log_M_chunks = (Lambda_chunks.unsqueeze(-1) - Lambda_chunks.unsqueeze(-2)) - chunk_decay_log.unsqueeze(-1)
         
         causal_mask_chunks = torch.tril(torch.ones(N, N, device=x.device), diagonal=-1)
@@ -129,7 +94,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         
         Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, L, self.inner_dim)
         
-        # --- Hugging Face Cache Optimization: S_final (State at step L) ---
+        # Calculate last step state for KV cache compatibility
         chunk_decay_last = exp_Lambda[:, :, -1, -1:, :] 
         S_historical_last = S_historical[:, :, -1]      
         S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V[:, :, -1]) 
@@ -140,7 +105,6 @@ class LowRankAssociativeDeltaEngine(nn.Module):
     def step_inference(self, x, past_S=None):
         B, L, D = x.shape
         H, d_h, r = self.num_heads, self.d_head, self.r
-        scaling = 1.0 / math.sqrt(d_h)
         
         Q = F.silu(self.W_q(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
         K = F.silu(self.W_k(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
@@ -150,21 +114,11 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         gate = torch.clamp(torch.sigmoid(self.W_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), min=1e-3, max=0.999)
         beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
         
-        past_S = past_S if past_S is not None else torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)
+        S_state = gate * (past_S if past_S is not None else torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)) + \
+                  torch.matmul((U * beta_gate).transpose(-1, -2), V)
         
-        # 1. Decay past historical state for the current step
-        S_decayed = gate * past_S
-        
-        # 2. Local step attention + global historical attention (read BEFORE local state write)
-        Y_local = torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) * scaling
-        Y_global = torch.matmul(R, S_decayed) * scaling
-        Out = Y_local + Y_global
-        
-        # 3. Update state with current token's associative delta for future steps
-        S_local = torch.matmul((U * beta_gate).transpose(-1, -2), V)
-        next_S = S_decayed + S_local
-        
-        return self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, self.inner_dim) * F.silu(self.W_swish_gate(x))), next_S
+        Out = (torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) + torch.matmul(R, S_state)) * (1.0 / math.sqrt(d_h))
+        return self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, D) * F.silu(self.W_swish_gate(x))), S_state
 
 
 class LRADDecoderBlock(nn.Module):

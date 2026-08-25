@@ -1,16 +1,19 @@
+# /home/martinkb/Desktop/BareTorch_F/train_sft.py
+
 import argparse
 import logging
 import os
 import subprocess
 import numpy as np
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 import torch
+from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
-    DataCollatorForSeq2Seq,
     Trainer,
     TrainerCallback,
     TrainingArguments,
+    default_data_collator,
 )
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
@@ -29,414 +32,415 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 
 
 # ==============================================================================
-#                        Cloudflare R2 Background Sync Callback
+#                         Cloudflare R2 Background Sync Callback
 # ==============================================================================
 class R2CheckpointCallback(TrainerCallback):
-  """Hugging Face Trainer Callback that automatically syncs newly saved
+    """Hugging Face Trainer Callback that automatically syncs newly saved
+    checkpoints to Cloudflare R2 asynchronously using rclone.
+    Does not block active GPU training execution.
+    """
 
-  checkpoints to Cloudflare R2 asynchronously using rclone.
-  Does not block active GPU training execution.
-  """
+    def __init__(
+        self,
+        bucket_name: str = "baretorch-data",
+        remote_name: str = "r2",
+        prefix: str = "checkpoints",
+    ):
+        self.bucket_name = bucket_name
+        self.remote_name = remote_name
+        self.prefix = prefix.strip("/")
 
-  def __init__(
-      self,
-      bucket_name: str = "baretorch-data",
-      remote_name: str = "r2",
-      prefix: str = "checkpoints",
-  ):
-    self.bucket_name = bucket_name
-    self.remote_name = remote_name
-    self.prefix = prefix.strip("/")
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            checkpoint_dir = f"checkpoint-{state.global_step}"
+            local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
 
-  def on_save(self, args, state, control, **kwargs):
-    if state.is_world_process_zero:
-      checkpoint_dir = f"checkpoint-{state.global_step}"
-      local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
+            if os.path.exists(local_ckpt_path):
+                rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+                target_r2_path = (
+                    f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
+                )
 
-      if os.path.exists(local_ckpt_path):
-        rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
-        target_r2_path = (
-            f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
-        )
+                logger.info(
+                    f"\n[R2 Sync] Uploading {checkpoint_dir} to Cloudflare R2"
+                    f" ({target_r2_path}) in background..."
+                )
+                cmd = [
+                    "rclone",
+                    "copy",
+                    local_ckpt_path,
+                    target_r2_path,
+                    "--transfers",
+                    "4",
+                    "--s3-chunk-size",
+                    "64M",
+                ]
+                subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
 
+
+def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
+    """Packs multi-turn ChatML conversations into dense 2048-token blocks.
+
+    Eliminates padding tokens completely, preventing CS-LRAD recurrent state
+    contamination, guaranteeing static tensor shapes for torch.compile, and
+    maximizing training throughput.
+    """
+    if local_rank == 0:
         logger.info(
-            f"\n[R2 Sync] Uploading {checkpoint_dir} to Cloudflare R2"
-            f" ({target_r2_path}) in background..."
-        )
-        cmd = [
-            "rclone",
-            "copy",
-            local_ckpt_path,
-            target_r2_path,
-            "--transfers",
-            "4",
-            "--s3-chunk-size",
-            "64M",
-        ]
-        subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            "📦 Packing ChatML conversations into dense 2048-token blocks..."
         )
 
+    all_input_ids = []
+    all_labels = []
+    packed_samples = []
 
-def preprocess_chatml_example(example, tokenizer, max_seq_len=2048):
-  """Formats multi-turn dialogues into ChatML format with turn-aware truncation.
+    iterator = tqdm(
+        raw_dataset,
+        desc="Packing ChatML Data",
+        disable=(local_rank != 0),
+        dynamic_ncols=True,
+    )
 
-  Guarantees that no assistant turns are sliced in half and every included turn
-  ends with <|im_end|>. Assigns -100 to user/system tokens for loss masking.
-  """
-  messages = example.get("messages", [])
-  input_ids = []
-  labels = []
-  has_assistant_tokens = False
+    for example in iterator:
+        messages = example.get("messages", [])
+        if not messages:
+            continue
 
-  for msg in messages:
-    role = msg.get("role", "user")
-    content = msg.get("content", "")
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
 
-    # Format ChatML block for this turn
-    formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
+            # Format ChatML block for this turn
+            formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
+            tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
 
-    # Stop adding turns if this message would exceed max_seq_len
-    if len(input_ids) + len(tokens) > max_seq_len:
-      break
+            all_input_ids.extend(tokens)
 
-    input_ids.extend(tokens)
+            # Apply loss masking (compute loss ONLY on assistant completions)
+            if role == "assistant":
+                all_labels.extend(tokens)
+            else:
+                all_labels.extend([-100] * len(tokens))
 
-    # Apply loss masking (compute loss ONLY on assistant completions)
-    if role == "assistant":
-      labels.extend(tokens)
-      has_assistant_tokens = True
-    else:
-      labels.extend([-100] * len(tokens))
+        # Continuously extract max_seq_len-token blocks
+        while len(all_input_ids) >= max_seq_len:
+            chunk_input_ids = all_input_ids[:max_seq_len]
+            chunk_labels = all_labels[:max_seq_len]
 
-  # Fallback safety: guarantee at least one valid assistant target token exists
-  if not has_assistant_tokens and len(input_ids) > 0:
-    labels[-1] = input_ids[-1]
+            # Guarantee at least one valid assistant target token exists in shifted labels
+            if any(lbl != -100 for lbl in chunk_labels[1:]):
+                packed_samples.append({
+                    "input_ids": chunk_input_ids,
+                    "labels": chunk_labels,
+                    "attention_mask": [1] * max_seq_len,
+                })
 
-  return {
-      "input_ids": input_ids,
-      "labels": labels,
-      "attention_mask": [1] * len(input_ids),
-  }
+            all_input_ids = all_input_ids[max_seq_len:]
+            all_labels = all_labels[max_seq_len:]
+
+    if local_rank == 0:
+        logger.info(
+            f"✅ Packing complete: Created {len(packed_samples):,} dense {max_seq_len}-token sequences."
+        )
+
+    return Dataset.from_list(packed_samples)
 
 
 def main():
-  # Distributed Initialization for torchrun
-  if "LOCAL_RANK" in os.environ:
-    if not torch.distributed.is_initialized():
-      torch.distributed.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    # Distributed Initialization for torchrun
+    if "LOCAL_RANK" in os.environ:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
 
-  parser = argparse.ArgumentParser(
-      description="BareTorch Stage 1: Supervised Fine-Tuning (SFT) Engine"
-  )
-
-  # Checkpoint Paths
-  parser.add_argument(
-      "--pretrained_model_path",
-      type=str,
-      required=True,
-      help="Path to pre-trained BareTorch checkpoint folder.",
-  )
-  parser.add_argument(
-      "--output_dir",
-      type=str,
-      default="./checkpoints_500m_sft",
-      help="Directory to save fine-tuned SFT weights.",
-  )
-
-  # Tokenizer & Dataset Parameters
-  parser.add_argument(
-      "--tokenizer_name",
-      type=str,
-      default="HuggingFaceTB/SmolLM2-360M",
-      help="Hugging Face tokenizer identifier.",
-  )
-  parser.add_argument(
-      "--dataset_name",
-      type=str,
-      default="HuggingFaceTB/smoltalk",
-      help="Hugging Face SFT dataset path.",
-  )
-  parser.add_argument(
-      "--dataset_config",
-      type=str,
-      default="all",
-      help=(
-          "Dataset subset/config name (e.g., 'all' or"
-          " 'everyday-conversations')."
-      ),
-  )
-  parser.add_argument(
-      "--max_samples",
-      type=int,
-      default=100000,
-      help=(
-          "Sub-sample N rows for ultra-dense fast SFT. Set to 0 for full"
-          " dataset."
-      ),
-  )
-
-  # Hyperparameters
-  parser.add_argument("--num_epochs", type=int, default=1)
-  parser.add_argument(
-      "--batch_size", type=int, default=12, help="Per-GPU batch size."
-  )
-  parser.add_argument(
-      "--grad_accum", type=int, default=3, help="Gradient accumulation steps."
-  )
-  parser.add_argument(
-      "--learning_rate", type=float, default=5e-5, help="SFT learning rate."
-  )
-  parser.add_argument("--warmup_steps", type=int, default=100)
-  parser.add_argument("--weight_decay", type=float, default=0.01)
-  parser.add_argument("--seq_len", type=int, default=2048)
-  parser.add_argument(
-      "--compile",
-      action="store_true",
-      help="Enable targeted torch.compile for CS-LRAD sub-modules.",
-  )
-  parser.add_argument(
-      "--grad_checkpointing",
-      action="store_true",
-      help="Enable gradient checkpointing.",
-  )
-
-  # Cloud Storage / Sync
-  parser.add_argument(
-      "--r2_sync",
-      action="store_true",
-      help=(
-          "Enable background checkpoint syncing to Cloudflare R2 via rclone."
-      ),
-  )
-  parser.add_argument(
-      "--r2_bucket",
-      type=str,
-      default="baretorch-data",
-      help="Cloudflare R2 bucket name.",
-  )
-  parser.add_argument(
-      "--r2_prefix",
-      type=str,
-      default="checkpoints",
-      help="Prefix path inside R2 bucket.",
-  )
-
-  args = parser.parse_args()
-
-  local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-  # 1. Tokenizer Setup with ChatML Special Tokens
-  if local_rank == 0:
-    logger.info(
-        f"Initializing Tokenizer '{args.tokenizer_name}' with ChatML Special"
-        " Tokens..."
+    parser = argparse.ArgumentParser(
+        description="BareTorch Stage 1: Supervised Fine-Tuning (SFT) Engine"
     )
 
-  tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-  tokenizer.model_max_length = args.seq_len
-
-  special_tokens_dict = {
-      "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
-      "pad_token": "<|im_end|>",
-  }
-  tokenizer.add_special_tokens(special_tokens_dict)
-
-  # 2. Model Loading & Safe Token Embedding Resizing
-  if local_rank == 0:
-    logger.info(
-        f"Loading pre-trained model weights from: {args.pretrained_model_path}"
+    # Checkpoint Paths
+    parser.add_argument(
+        "--pretrained_model_path",
+        type=str,
+        default="./checkpoints_500m_hybrid_baretorch/checkpoint-190735",
+        help="Path to pre-trained BareTorch checkpoint folder.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./checkpoints_500m_sft",
+        help="Directory to save fine-tuned SFT weights.",
     )
 
-  model = BareTorchForCausalLM.from_pretrained(args.pretrained_model_path)
+    # Tokenizer & Dataset Parameters
+    parser.add_argument(
+        "--tokenizer_name",
+        type=str,
+        default="HuggingFaceTB/SmolLM2-360M",
+        help="Hugging Face tokenizer identifier.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="HuggingFaceTB/smol-smoltalk",
+        help="Hugging Face SFT dataset path.",
+    )
+    parser.add_argument(
+        "--dataset_config",
+        type=str,
+        default="default",
+        help="Dataset subset/config name (e.g., 'default' or 'all').",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=0,
+        help="Sub-sample N rows for fast iteration. Set to 0 for full dataset.",
+    )
 
-  # Safely resize token embeddings without multivariate covariance estimation
-  model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    # Hyperparameters
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument(
+        "--batch_size", type=int, default=4, help="Per-GPU batch size."
+    )
+    parser.add_argument(
+        "--grad_accum", type=int, default=4, help="Gradient accumulation steps."
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=3e-5, help="SFT learning rate."
+    )
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable targeted torch.compile for CS-LRAD sub-modules.",
+    )
+    parser.add_argument(
+        "--grad_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing.",
+    )
 
-  # Model runtime configurations
-  model.config.pad_token_id = tokenizer.pad_token_id
-  model.config.use_cache = False  # Disable KV caching during training
-  model.config.use_grad_checkpointing = args.grad_checkpointing
+    # Cloud Storage / Sync
+    parser.add_argument(
+        "--r2_sync",
+        action="store_true",
+        help="Enable background checkpoint syncing to Cloudflare R2 via rclone.",
+    )
+    parser.add_argument(
+        "--r2_bucket",
+        type=str,
+        default="baretorch-data",
+        help="Cloudflare R2 bucket name.",
+    )
+    parser.add_argument(
+        "--r2_prefix",
+        type=str,
+        default="checkpoints",
+        help="Prefix path inside R2 bucket.",
+    )
 
-  # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
-  if args.compile:
+    args = parser.parse_args()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # 1. Tokenizer Setup
     if local_rank == 0:
-      logger.info(
-          "⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules..."
-      )
-    compiled_blocks = 0
-    for name, module in model.named_modules():
-      cls_name = module.__class__.__name__.lower()
-      if "lrad" in cls_name or "lrad" in name.lower():
-        module.forward = torch.compile(module.forward)
-        compiled_blocks += 1
-    if local_rank == 0:
-      logger.info(
-          f"Successfully compiled {compiled_blocks} CS-LRAD recurrent"
-          " sub-module(s)."
-      )
+        logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
 
-  # 3. Load & Process Dataset
-  if local_rank == 0:
-    logger.info(
-        f"Loading SFT Dataset '{args.dataset_name}' (Config:"
-        f" {args.dataset_config})..."
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    tokenizer.model_max_length = args.seq_len
+
+    special_tokens_dict = {
+        "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+        "pad_token": "<|im_end|>",
+    }
+    tokenizer.add_special_tokens(special_tokens_dict)
+
+    # 2. Model Loading & Safe Token Embedding Resizing
+    if local_rank == 0:
+        logger.info(
+            f"Loading pre-trained model weights from: {args.pretrained_model_path}"
+        )
+
+    model = BareTorchForCausalLM.from_pretrained(
+        args.pretrained_model_path, 
+        torch_dtype=torch.bfloat16,
     )
 
-  raw_dataset = load_dataset(
-      args.dataset_name, args.dataset_config, split="train"
-  )
+    # Safely resize token embeddings AND re-tie weights to preserve lm_head binding
+    if len(tokenizer) != model.config.vocab_size:
+        model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+        model.tie_weights()
 
-  if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
+    # Model runtime configurations
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False  # Disable KV caching during training
+    model.config.use_grad_checkpointing = args.grad_checkpointing
+
+    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
+    if args.compile:
+        if local_rank == 0:
+            logger.info(
+                "⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules..."
+            )
+        compiled_blocks = 0
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+        if local_rank == 0:
+            logger.info(
+                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent"
+                " sub-module(s)."
+            )
+
+    # 3. Load & Process Dataset with Sequence Packing
     if local_rank == 0:
-      logger.info(
-          f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to"
-          f" {args.max_samples:,} rows."
-      )
-    raw_dataset = raw_dataset.select(range(args.max_samples))
+        logger.info(
+            f"Loading SFT Dataset '{args.dataset_name}' (Config:"
+            f" {args.dataset_config})..."
+        )
 
-  if local_rank == 0:
-    logger.info(
-        "Formatting multi-turn conversations and building assistant loss"
-        " masks..."
+    dataset_kwargs = {}
+    if args.dataset_config and args.dataset_config.lower() not in ("default", "none", "null"):
+        dataset_kwargs["name"] = args.dataset_config
+
+    raw_dataset = load_dataset(
+        args.dataset_name, split="train", **dataset_kwargs
     )
 
-  processed_dataset = raw_dataset.map(
-      lambda example: preprocess_chatml_example(
-          example, tokenizer, max_seq_len=args.seq_len
-      ),
-      batched=False,
-      remove_columns=raw_dataset.column_names,
-      num_proc=4,
-      desc="Formatting ChatML SFT Data",
-  )
+    if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
+        if local_rank == 0:
+            logger.info(
+                f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to"
+                f" {args.max_samples:,} rows."
+            )
+        raw_dataset = raw_dataset.select(range(args.max_samples))
 
-  # Split 5% off for validation
-  dataset_split = processed_dataset.train_test_split(test_size=0.05, seed=42)
-  train_data = dataset_split["train"]
-  val_data = dataset_split["test"]
-
-  if local_rank == 0:
-    logger.info(
-        f"Dataset split complete: {len(train_data):,} training samples |"
-        f" {len(val_data):,} validation samples."
+    # Pack conversations into dense, zero-padded 2048-token sequences
+    processed_dataset = pack_chatml_dataset(
+        raw_dataset, tokenizer, max_seq_len=args.seq_len, local_rank=local_rank
     )
 
-  # 4. Training Configurations
-  training_args = TrainingArguments(
-      output_dir=args.output_dir,
-      num_train_epochs=args.num_epochs,
-      per_device_train_batch_size=args.batch_size,
-      per_device_eval_batch_size=args.batch_size,
-      gradient_accumulation_steps=args.grad_accum,
-      learning_rate=args.learning_rate,
-      lr_scheduler_type="cosine",
-      warmup_steps=args.warmup_steps,
-      weight_decay=args.weight_decay,
-      bf16=True,
-      logging_steps=50,
-      eval_strategy="steps",
-      eval_steps=200,
-      save_strategy="steps",
-      save_steps=200,
-      save_total_limit=2,
-      report_to="tensorboard",
-      torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
-      gradient_checkpointing=args.grad_checkpointing,
-      gradient_checkpointing_kwargs={"use_reentrant": False},
-      ddp_find_unused_parameters=False,
-      dataloader_num_workers=4,
-      dataloader_pin_memory=True,
-  )
+    # Split 5% off for validation
+    dataset_split = processed_dataset.train_test_split(test_size=0.05, seed=42)
+    train_data = dataset_split["train"]
+    val_data = dataset_split["test"]
 
-  # Detect R2 sync activation via argument or environment variables
-  enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in (
-      "1",
-      "true",
-      "yes",
-  )
-  r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
-  r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
-
-  callbacks = []
-  if enable_r2_sync:
     if local_rank == 0:
-      logger.info(
-          f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' |"
-          f" Prefix: '{r2_prefix}'"
-      )
-    callbacks.append(
-        R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix)
+        logger.info(
+            f"Dataset split complete: {len(train_data):,} training samples |"
+            f" {len(val_data):,} validation samples."
+        )
+
+    # 4. Training Configurations
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.num_epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type="cosine",
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
+        bf16=True,
+        logging_steps=250,
+        eval_strategy="steps",
+        eval_steps=250,
+        save_strategy="steps",
+        save_steps=250,
+        save_total_limit=2,
+        torch_compile=False,
+        gradient_checkpointing=args.grad_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=False,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
     )
-  else:
-    if local_rank == 0:
-      logger.info(
-          "R2 sync disabled. Running in local mode (disk checkpoints only)."
-      )
 
-  # Sequence padding collator guaranteed to pad to multiples of 32 for CS-LRAD/CS-TTT
-  data_collator = DataCollatorForSeq2Seq(
-      tokenizer=tokenizer,
-      model=model,
-      padding=True,
-      pad_to_multiple_of=32,
-      label_pad_token_id=-100,
-  )
+    # Detect R2 sync activation via argument or environment variables
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
+    r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
 
-  trainer = Trainer(
-      model=model,
-      args=training_args,
-      train_dataset=train_data,
-      eval_dataset=val_data,
-      data_collator=data_collator,
-      callbacks=callbacks,
-  )
-
-  # 5. Launch Supervised Fine-Tuning
-  if local_rank == 0:
-    logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT)...")
-
-  trainer.train()
-
-  # Save final model and tokenizer config
-  if local_rank == 0:
-    logger.info(f"Saving final SFT checkpoint to '{args.output_dir}'...")
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    logger.info("✅ Stage 1: Supervised Fine-Tuning completed successfully!")
-
+    callbacks = []
     if enable_r2_sync:
-      rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
-      target_r2_path = (
-          f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}"
-      )
-      logger.info(
-          "📤 Syncing final SFT model weights to Cloudflare R2"
-          f" ({target_r2_path})..."
-      )
-      cmd = [
-          "rclone",
-          "copy",
-          args.output_dir,
-          target_r2_path,
-          "--transfers",
-          "8",
-          "--s3-chunk-size",
-          "64M",
-      ]
-      subprocess.run(cmd, check=False)
-      logger.info(
-          "✅ Final SFT weights successfully uploaded to Cloudflare R2!"
-      )
+        if local_rank == 0:
+            logger.info(
+                f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' |"
+                f" Prefix: '{r2_prefix}'"
+            )
+        callbacks.append(
+            R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix)
+        )
+    else:
+        if local_rank == 0:
+            logger.info(
+                "R2 sync disabled. Running in local mode (disk checkpoints only)."
+            )
 
-  if torch.distributed.is_initialized():
-    torch.distributed.destroy_process_group()
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        data_collator=default_data_collator,
+        callbacks=callbacks,
+    )
 
-  os._exit(0)
+    # 5. Launch Supervised Fine-Tuning
+    if local_rank == 0:
+        logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT)...")
+
+    trainer.train()
+
+    # Save final model and tokenizer config
+    if local_rank == 0:
+        logger.info(f"Saving final SFT checkpoint to '{args.output_dir}'...")
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        logger.info("✅ Stage 1: Supervised Fine-Tuning completed successfully!")
+
+        if enable_r2_sync:
+            rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+            target_r2_path = (
+                f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}"
+            )
+            logger.info(
+                "📤 Syncing final SFT model weights to Cloudflare R2"
+                f" ({target_r2_path})..."
+            )
+            cmd = [
+                "rclone",
+                "copy",
+                args.output_dir,
+                target_r2_path,
+                "--transfers",
+                "8",
+                "--s3-chunk-size",
+                "64M",
+            ]
+            subprocess.run(cmd, check=False)
+            logger.info(
+                "✅ Final SFT weights successfully uploaded to Cloudflare R2!"
+            )
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+    os._exit(0)
 
 
 if __name__ == "__main__":
-  main()
+    main()

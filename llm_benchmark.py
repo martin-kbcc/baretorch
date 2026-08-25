@@ -1,3 +1,4 @@
+# /home/martinkb/Desktop/BareTorch_F/llm_benchmark.py
 import os
 import json
 import argparse
@@ -14,8 +15,6 @@ import baretorch
 from baretorch import (
     BareTorchConfig,
     BareTorchForCausalLM,
-    CSLRADConfig,
-    CSLRADForCausalLM,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="BareTorch LLM Evaluation Suite")
+    parser = argparse.ArgumentParser(description="BareTorch Universal LLM Evaluation Suite")
     
     # Model & Checkpoint Paths
     parser.add_argument(
@@ -35,12 +34,18 @@ def parse_args():
     parser.add_argument(
         "--tokenizer_name", 
         type=str, 
-        default="gpt2", 
-        help="Tokenizer checkpoint/name to use (if not found in checkpoint dir)."
+        default="HuggingFaceTB/SmolLM2-360M", 
+        help="Tokenizer checkpoint name/path to load if not embedded in checkpoint_path."
+    )
+    parser.add_argument(
+        "--vocab_size", 
+        type=int, 
+        default=None, 
+        help="Explicit vocabulary size override (if None, auto-detected from tokenizer)."
     )
     
-    # Architecture Overrides (Matching launch_lrad_hybrid.sh defaults for 1B model)
-    parser.add_argument("--d_model", type=int, default=1536, help="Model hidden dimension.")
+    # Architecture Flags
+    parser.add_argument("--d_model", type=int, default=1152, help="Model hidden dimension.")
     parser.add_argument("--num_heads", type=int, default=16, help="Number of attention/mixer heads.")
     parser.add_argument("--num_layers", type=int, default=24, help="Total transformer/mixer layers.")
     parser.add_argument(
@@ -51,65 +56,63 @@ def parse_args():
     )
     parser.add_argument("--chunk_size", type=int, default=32, help="CS-LRAD chunk size.")
     parser.add_argument("--rank", type=int, default=8, help="CS-LRAD projection rank.")
+    parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence context length.")
     
-    # Task Selection
+    # Task & Evaluation Flags
     parser.add_argument(
         "--tasks", 
         type=str, 
-        default="gsm8k,mmlu,arc_challenge,hellaswag,winogrande",
+        default="mmlu,arc_challenge,arc_easy,hellaswag,winogrande",
         help="Comma-separated list of lm-eval tasks."
     )
     parser.add_argument("--num_fewshot", type=int, default=0, help="Few-shot count (0 for zero-shot).")
     parser.add_argument("--limit", type=float, default=None, help="Sample limit per task for smoke testing.")
     
-    # Execution & Precision
-    parser.add_argument("--batch_size", type=int, default=8, help="Evaluation batch size.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on.")
+    # Execution & Precision Flags
+    parser.add_argument("--batch_size", type=int, default=16, help="Evaluation batch size.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on (e.g., cuda, cpu).")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
-    parser.add_argument("--output_file", type=str, default="benchmark_results_1b.json", help="Path to save output JSON.")
+    parser.add_argument("--output_file", type=str, default="benchmark_results.json", help="Path to save output JSON.")
     
     return parser.parse_args()
 
 
-def build_baretorch_config(args, config_file: str = None) -> BareTorchConfig:
+def build_baretorch_config(args, resolved_vocab_size: int, config_file: str = None) -> BareTorchConfig:
     """Builds BareTorchConfig from file if available, otherwise constructs from CLI args."""
     if config_file and os.path.exists(config_file):
-        logger.info(f"Loading BareTorch configuration from '{config_file}'...")
+        logger.info(f"Loading BareTorch configuration directly from '{config_file}'...")
         try:
             return AutoConfig.from_pretrained(config_file)
         except Exception as e:
-            logger.warning(f"Failed to load via AutoConfig ({e}). Constructing BareTorchConfig manually...")
+            logger.warning(f"Failed to load via AutoConfig ({e}). Constructing BareTorchConfig manually from flags...")
 
-    # Expand layer sequence pattern across total layers
     pattern = [s.strip() for t in args.layer_sequence.split(",") if (s := t.strip())]
     repeats = (args.num_layers + len(pattern) - 1) // len(pattern)
     full_layer_types = (pattern * repeats)[:args.num_layers]
 
     logger.info(
-        f"Constructing BareTorchConfig: d_model={args.d_model}, num_layers={args.num_layers}, "
-        f"num_heads={args.num_heads}, layer_pattern='{args.layer_sequence}'"
+        f"Constructing BareTorchConfig from CLI flags: d_model={args.d_model}, num_layers={args.num_layers}, "
+        f"num_heads={args.num_heads}, vocab_size={resolved_vocab_size}, layer_pattern='{args.layer_sequence}'"
     )
     
     return BareTorchConfig(
+        vocab_size=resolved_vocab_size,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         layer_types=full_layer_types,
         chunk_size=args.chunk_size,
         rank=args.rank,
+        max_seq_len=args.max_seq_len,
     )
 
 
-def load_baretorch_model(args, device: str, dtype: torch.dtype):
-    """
-    Robust checkpoint loader supporting HuggingFace directories and raw state_dicts,
-    fully compliant with 1B parameter configurations.
-    """
+def load_baretorch_model(args, resolved_vocab_size: int, device: str, dtype: torch.dtype):
+    """Loads model from directory or state_dict file using CLI-specified parameter flags."""
     checkpoint_path = args.checkpoint_path
     logger.info(f"Loading BareTorch model from checkpoint: '{checkpoint_path}'")
     
     if os.path.isdir(checkpoint_path):
-        # Hugging Face Directory Load
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 checkpoint_path,
@@ -118,9 +121,9 @@ def load_baretorch_model(args, device: str, dtype: torch.dtype):
             )
             logger.info("Successfully loaded model via AutoModelForCausalLM.")
         except Exception as e:
-            logger.warning(f"AutoModel load failed ({e}). Attempting BareTorchForCausalLM load...")
+            logger.warning(f"AutoModel load failed ({e}). Falling back to manual BareTorchForCausalLM load...")
             config_file = os.path.join(checkpoint_path, "config.json")
-            config = build_baretorch_config(args, config_file)
+            config = build_baretorch_config(args, resolved_vocab_size, config_file)
             
             model = BareTorchForCausalLM.from_pretrained(
                 checkpoint_path, 
@@ -129,18 +132,15 @@ def load_baretorch_model(args, device: str, dtype: torch.dtype):
             )
             
     elif os.path.isfile(checkpoint_path):
-        # Raw PyTorch .pt or .bin state_dict file
-        logger.info("Detected raw state_dict file. Initializing model structure...")
         ckpt_dir = os.path.dirname(checkpoint_path)
         config_file = os.path.join(ckpt_dir, "config.json")
         
-        config = build_baretorch_config(args, config_file)
+        config = build_baretorch_config(args, resolved_vocab_size, config_file)
         model = BareTorchForCausalLM(config)
         
-        logger.info(f"Loading state dict from '{checkpoint_path}'...")
+        logger.info(f"Loading state dict from file '{checkpoint_path}'...")
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         
-        # Unwrap state_dict if saved inside a wrapper dictionary
         if "model" in state_dict:
             state_dict = state_dict["model"]
         elif "state_dict" in state_dict:
@@ -160,10 +160,25 @@ def load_baretorch_model(args, device: str, dtype: torch.dtype):
     return model
 
 
+def extract_primary_metric(metrics: dict):
+    """Safely extracts primary task metric avoiding 0.0 falsy key skips."""
+    candidate_keys = [
+        "acc_norm,none", "acc,none", "exact_match,none", 
+        "acc_norm,flexible", "acc,flexible", "exact_match,flexible"
+    ]
+    for key in candidate_keys:
+        if key in metrics and metrics[key] is not None:
+            return metrics[key]
+    
+    for val in metrics.values():
+        if isinstance(val, (int, float)):
+            return val
+    return "N/A"
+
+
 def main():
     args = parse_args()
     
-    # 1. Setup Torch Precision
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
@@ -171,35 +186,37 @@ def main():
     }
     eval_dtype = dtype_map[args.dtype]
     
-    # 2. Resolve Tokenizer
     tokenizer_path = args.checkpoint_path if os.path.isdir(args.checkpoint_path) else args.tokenizer_name
     logger.info(f"Loading tokenizer from: '{tokenizer_path}'")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     except Exception as e:
         logger.warning(f"Could not load tokenizer from '{tokenizer_path}' ({e}). Falling back to '{args.tokenizer_name}'.")
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
         
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        
+    # Determine vocab size: explicit CLI flag takes priority, then tokenizer property
+    if args.vocab_size is not None:
+        resolved_vocab_size = args.vocab_size
+        logger.info(f"Using explicit CLI vocab_size override: {resolved_vocab_size}")
+    else:
+        resolved_vocab_size = getattr(tokenizer, "vocab_size", 49152)
+        logger.info(f"Auto-detected vocab_size from tokenizer: {resolved_vocab_size}")
     
-    # 3. Load BareTorch Model
-    model = load_baretorch_model(args, args.device, eval_dtype)
+    model = load_baretorch_model(args, resolved_vocab_size, args.device, eval_dtype)
     
-    # 4. Wrap Model into lm-evaluation-harness HFLM Class
     logger.info("Wrapping BareTorch model into lm-evaluation-harness interface...")
     lm_eval_model = HFLM(
         pretrained=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
-        device=args.device,
     )
     
-    # 5. Parse Tasks
     task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
     logger.info(f"Starting evaluation across tasks: {task_list}")
     
-    # 6. Run Evaluation Suite
     results = simple_evaluate(
         model=lm_eval_model,
         tasks=task_list,
@@ -207,36 +224,30 @@ def main():
         limit=args.limit,
     )
     
-    # 7. Print Results Table
     print("\n" + "=" * 70)
-    print("📊 BARETORCH 1B FOUNDATIONAL BENCHMARK EVALUATION RESULTS")
+    print("📊 BARETORCH BENCHMARK EVALUATION RESULTS")
     print("=" * 70)
     
     formatted_summary = {}
     if "results" in results:
         for task_name, metrics in results["results"].items():
-            primary_metric = (
-                metrics.get("acc,none") 
-                or metrics.get("exact_match,none") 
-                or metrics.get("acc_norm,none")
-                or list(metrics.values())[0]
-            )
-            if isinstance(primary_metric, float):
-                formatted_summary[task_name] = f"{primary_metric * 100:.2f}%"
-                print(f"  ├─ {task_name:<20} : {primary_metric * 100:.2f}%")
+            primary_metric = extract_primary_metric(metrics)
+            if isinstance(primary_metric, (float, int)):
+                val_str = f"{primary_metric * 100:.2f}%"
             else:
-                formatted_summary[task_name] = str(primary_metric)
-                print(f"  ├─ {task_name:<20} : {primary_metric}")
+                val_str = str(primary_metric)
+                
+            formatted_summary[task_name] = val_str
+            print(f"  ├─ {task_name:<20} : {val_str}")
     
     print("=" * 70 + "\n")
     
-    # 8. Save JSON Results
     output_dir = os.path.dirname(args.output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         
     with open(args.output_file, "w") as f:
-        json.dump(results["results"], f, indent=4, default=str)
+        json.dump(results.get("results", {}), f, indent=4, default=str)
         
     logger.info(f"Full benchmark metrics saved to '{args.output_file}'")
 
