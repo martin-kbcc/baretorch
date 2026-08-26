@@ -1,0 +1,562 @@
+[
+  {
+    "hf_baseline": {
+      "model_name": "HuggingFaceTB/SmolLM2-1.7B",
+      "param_count_m": 1711.38,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 17.95,
+          "tokens_per_sec": 177.42,
+          "decode_vram_mb": 3485.44,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 32.51,
+          "tokens_per_sec": 155.08,
+          "decode_vram_mb": 3668.32,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 69.51,
+          "tokens_per_sec": 122.63,
+          "decode_vram_mb": 4052.32,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 158.19,
+          "tokens_per_sec": 85.18,
+          "decode_vram_mb": 4820.32,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 398.21,
+          "tokens_per_sec": 52.51,
+          "decode_vram_mb": 6356.32,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 1266.98,
+          "tokens_per_sec": 29.78,
+          "decode_vram_mb": 9428.32,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 4292.54,
+          "tokens_per_sec": 15.79,
+          "decode_vram_mb": 15572.34,
+          "status": "success"
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1709.4M)",
+      "param_count_m": 1709.41,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 18.73,
+          "tokens_per_sec": 158.58,
+          "decode_vram_mb": 3385.95,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 30.89,
+          "tokens_per_sec": 159.06,
+          "decode_vram_mb": 3411.97,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 57.0,
+          "tokens_per_sec": 160.11,
+          "decode_vram_mb": 3433.98,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 112.21,
+          "tokens_per_sec": 158.83,
+          "decode_vram_mb": 3498.0,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 233.09,
+          "tokens_per_sec": 159.84,
+          "decode_vram_mb": 3626.02,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 493.19,
+          "tokens_per_sec": 127.51,
+          "decode_vram_mb": 3882.02,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1134.2,
+          "tokens_per_sec": 98.92,
+          "decode_vram_mb": 4394.02,
+          "status": "success"
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "meta-llama/Llama-3.2-1B",
+      "param_count_m": 1235.81,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 14.35,
+          "tokens_per_sec": 249.67,
+          "decode_vram_mb": 2404.74,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 24.81,
+          "tokens_per_sec": 221.25,
+          "decode_vram_mb": 2446.43,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 52.7,
+          "tokens_per_sec": 183.06,
+          "decode_vram_mb": 2512.75,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 118.68,
+          "tokens_per_sec": 132.65,
+          "decode_vram_mb": 2656.75,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 291.33,
+          "tokens_per_sec": 81.63,
+          "decode_vram_mb": 2944.76,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 872.75,
+          "tokens_per_sec": 45.67,
+          "decode_vram_mb": 3520.77,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 2960.03,
+          "tokens_per_sec": 24.44,
+          "decode_vram_mb": 4672.81,
+          "status": "success"
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1236.1M)",
+      "param_count_m": 1236.14,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 11.98,
+          "tokens_per_sec": 257.0,
+          "decode_vram_mb": 2431.67,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 18.25,
+          "tokens_per_sec": 259.12,
+          "decode_vram_mb": 2440.98,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 33.69,
+          "tokens_per_sec": 263.28,
+          "decode_vram_mb": 2461.09,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 65.71,
+          "tokens_per_sec": 261.58,
+          "decode_vram_mb": 2498.45,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 130.04,
+          "tokens_per_sec": 262.24,
+          "decode_vram_mb": 2571.52,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 274.32,
+          "tokens_per_sec": 222.79,
+          "decode_vram_mb": 2720.34,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 598.36,
+          "tokens_per_sec": 169.24,
+          "decode_vram_mb": 3018.35,
+          "status": "success"
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "Qwen/Qwen3-0.6B",
+      "param_count_m": 596.05,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 16.06,
+          "tokens_per_sec": 136.76,
+          "decode_vram_mb": 1272.82,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 18.18,
+          "tokens_per_sec": 138.37,
+          "decode_vram_mb": 1384.96,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 43.15,
+          "tokens_per_sec": 134.08,
+          "decode_vram_mb": 1617.67,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 116.87,
+          "tokens_per_sec": 90.7,
+          "decode_vram_mb": 2080.97,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 346.07,
+          "tokens_per_sec": 50.07,
+          "decode_vram_mb": 3008.98,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 1180.54,
+          "tokens_per_sec": 25.79,
+          "decode_vram_mb": 4864.99,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 4343.26,
+          "tokens_per_sec": 13.15,
+          "decode_vram_mb": 8577.02,
+          "status": "success"
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (596.3M)",
+      "param_count_m": 596.29,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 12.47,
+          "tokens_per_sec": 172.22,
+          "decode_vram_mb": 1243.54,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 11.1,
+          "tokens_per_sec": 174.39,
+          "decode_vram_mb": 1250.12,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 18.68,
+          "tokens_per_sec": 169.43,
+          "decode_vram_mb": 1263.28,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 32.24,
+          "tokens_per_sec": 175.11,
+          "decode_vram_mb": 1289.53,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 62.52,
+          "tokens_per_sec": 171.12,
+          "decode_vram_mb": 1347.7,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 133.83,
+          "tokens_per_sec": 172.19,
+          "decode_vram_mb": 1448.87,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 314.89,
+          "tokens_per_sec": 164.49,
+          "decode_vram_mb": 1660.37,
+          "status": "success"
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "google/gemma-2-2b",
+      "param_count_m": 2614.34,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 27.95,
+          "tokens_per_sec": 121.79,
+          "decode_vram_mb": 5118.53,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 50.66,
+          "tokens_per_sec": 107.88,
+          "decode_vram_mb": 5212.5,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 107.2,
+          "tokens_per_sec": 88.88,
+          "decode_vram_mb": 5419.73,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 47871.92,
+          "tokens_per_sec": 0.27,
+          "decode_vram_mb": 6247.71,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 610.76,
+          "tokens_per_sec": 49.37,
+          "decode_vram_mb": 6348.0,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 61438.08,
+          "tokens_per_sec": 33.57,
+          "decode_vram_mb": 7411.65,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": "OOM",
+          "tokens_per_sec": "OOM",
+          "decode_vram_mb": "OOM",
+          "status": "OOM"
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (2612.2M)",
+      "param_count_m": 2612.2,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 19.96,
+          "tokens_per_sec": 151.11,
+          "decode_vram_mb": 5058.98,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 30.63,
+          "tokens_per_sec": 153.24,
+          "decode_vram_mb": 5078.71,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 55.98,
+          "tokens_per_sec": 152.42,
+          "decode_vram_mb": 5103.7,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 107.73,
+          "tokens_per_sec": 143.53,
+          "decode_vram_mb": 5158.78,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 223.75,
+          "tokens_per_sec": 142.16,
+          "decode_vram_mb": 5273.43,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 465.56,
+          "tokens_per_sec": 126.86,
+          "decode_vram_mb": 5501.63,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 1049.72,
+          "tokens_per_sec": 101.51,
+          "decode_vram_mb": 5957.7,
+          "status": "success"
+        }
+      ]
+    }
+  },
+  {
+    "hf_baseline": {
+      "model_name": "Qwen/Qwen2.5-1.5B",
+      "param_count_m": 1543.71,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 18.53,
+          "tokens_per_sec": 155.59,
+          "decode_vram_mb": 2987.03,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 32.84,
+          "tokens_per_sec": 142.94,
+          "decode_vram_mb": 3017.62,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 69.28,
+          "tokens_per_sec": 117.42,
+          "decode_vram_mb": 3091.64,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 160.48,
+          "tokens_per_sec": 83.45,
+          "decode_vram_mb": 3203.63,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 401.16,
+          "tokens_per_sec": 51.84,
+          "decode_vram_mb": 3452.36,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 1178.61,
+          "tokens_per_sec": 28.43,
+          "decode_vram_mb": 3948.45,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 3862.87,
+          "tokens_per_sec": 14.97,
+          "decode_vram_mb": 4939.68,
+          "status": "success"
+        }
+      ]
+    },
+    "baretorch_matched": {
+      "model_name": "BareTorch Matched (1543.4M)",
+      "param_count_m": 1543.36,
+      "runs": [
+        {
+          "prompt_len": 512,
+          "ttft_ms": 21.12,
+          "tokens_per_sec": 122.11,
+          "decode_vram_mb": 3150.08,
+          "status": "success"
+        },
+        {
+          "prompt_len": 1024,
+          "ttft_ms": 28.21,
+          "tokens_per_sec": 121.97,
+          "decode_vram_mb": 3165.78,
+          "status": "success"
+        },
+        {
+          "prompt_len": 2048,
+          "ttft_ms": 48.5,
+          "tokens_per_sec": 123.55,
+          "decode_vram_mb": 3199.59,
+          "status": "success"
+        },
+        {
+          "prompt_len": 4096,
+          "ttft_ms": 93.52,
+          "tokens_per_sec": 123.65,
+          "decode_vram_mb": 3258.29,
+          "status": "success"
+        },
+        {
+          "prompt_len": 8192,
+          "ttft_ms": 187.5,
+          "tokens_per_sec": 122.52,
+          "decode_vram_mb": 3373.03,
+          "status": "success"
+        },
+        {
+          "prompt_len": 16384,
+          "ttft_ms": 401.02,
+          "tokens_per_sec": 123.51,
+          "decode_vram_mb": 3610.56,
+          "status": "success"
+        },
+        {
+          "prompt_len": 32768,
+          "ttft_ms": 909.17,
+          "tokens_per_sec": 94.0,
+          "decode_vram_mb": 4080.34,
+          "status": "success"
+        }
+      ]
+    }
+  }
+]

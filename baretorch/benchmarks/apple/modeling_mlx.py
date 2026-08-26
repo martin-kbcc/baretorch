@@ -1,4 +1,4 @@
-# baretorch/deploy/apple_mlx/modeling_mlx.py
+# baretorch/benchmarks/apple/modeling_mlx.py
 import math
 import mlx.core as mx
 import mlx.nn as nn
@@ -86,9 +86,7 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(d_h)
         mask_arg = "causal" if (past_kv is None and L > 1) else None
 
-        # Apple Metal Fast SDPA Kernel (Eliminates O(L^2) 34GB single-buffer allocation)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask_arg)
-
         out_flat = mx.reshape(mx.transpose(out, (0, 2, 1, 3)), (B, L, D))
         return self.W_out(out_flat), current_kv
 
@@ -318,5 +316,11 @@ class BareTorchForCausalLMMLX(nn.Module):
 
     def __call__(self, input_ids: mx.array, past_key_values: list | None = None):
         hidden_states, next_cache = self.model(input_ids, past_key_values=past_key_values)
+        
+        # PREFILL SLICING OPTIMIZATION:
+        # Slice to the last token hidden state BEFORE lm_head to prevent 8.38 GB logit allocations
+        if hidden_states.shape[1] > 1:
+            hidden_states = hidden_states[:, -1:, :]
+            
         logits = self.lm_head(hidden_states)
         return logits, next_cache

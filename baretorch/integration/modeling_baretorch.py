@@ -177,14 +177,12 @@ class BareTorchModel(BareTorchPreTrainedModel):
             elif isinstance(layer, TTTDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
             
-            # Zero out padded positions after each layer block
             if not is_step_inference and pad_len > 0:
                 h = torch.cat([h[:, :seq_length, :], torch.zeros_like(h[:, seq_length:, :])], dim=1)
                 
             if use_cache:
                 next_decoder_cache.append(next_state)
 
-        # Slice back to unpadded length BEFORE final_norm
         if not is_step_inference and pad_len > 0:
             h = h[:, :seq_length, :]
 
@@ -219,7 +217,7 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         return self.model.token_embedding
 
     def set_input_embeddings(self, value):
-        self.model.token_embedding = value  # Fixed: correctly updates inner model embedding
+        self.model.token_embedding = value
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -261,6 +259,13 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
+
+        # PREFILL LOGIT SLICING OPTIMIZATION:
+        # Slices to the last token hidden state BEFORE lm_head during inference prefill.
+        # Eliminates temporary 8.38 GB (1, L, vocab_size) tensor allocations at L=32,768.
+        if labels is None and hidden_states.size(1) > 1:
+            hidden_states = hidden_states[:, -1:, :]
+
         logits = self.lm_head(hidden_states)
 
         loss = None

@@ -38,7 +38,7 @@ MAX_SAMPLES=0             # 0 = Use full dataset (~485k samples)
 
 PER_GPU_BATCH_SIZE=2      # Per-GPU batch size (Optimal for 24GB VRAM at 2K seq_len)
 GRAD_ACCUM=16             # Global batch size = 2 GPUs * 2 batch * 16 accum = 64 sequences
-LEARNING_RATE=3e-5        # Optimal LR for 500M SFT to maximize instruction adherence
+LEARNING_RATE=1e-5        # Optimal LR for 500M SFT to maximize instruction adherence
 WARMUP_STEPS=100
 WEIGHT_DECAY=0.01
 NUM_EPOCHS=1

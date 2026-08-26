@@ -1,17 +1,17 @@
-# baretorch/deploy/apple_mlx/benchmark_mlx.py
+# baretorch/benchmarks/apple/benchmark_mlx.py
 import os
 import csv
 import json
 import time
 import gc
 import argparse
-import traceback
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_map
 from transformers import AutoTokenizer
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
-from baretorch.deploy.apple_mlx.modeling_mlx import BareTorchForCausalLMMLX
+from baretorch.benchmarks.apple.modeling_mlx import BareTorchForCausalLMMLX
 
 try:
     from mlx_lm import load as mlx_lm_load
@@ -103,11 +103,7 @@ def find_matching_baretorch_config(
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     max_seq_len: int = 32768
 ) -> tuple[BareTorchConfig, float]:
-    """
-    Evaluates candidate hyper-parameters and matches target model size.
-    Restricts head_dim strictly to [64, 128] to ensure MLX's Metal FlashAttention
-    (mx.fast.sdpa) executes without falling back to eager O(L^2) matrices.
-    """
+    """Matches target model size restricting head_dim to [64, 128] for Metal FlashAttention."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
 
     best_cfg = None
@@ -121,7 +117,6 @@ def find_matching_baretorch_config(
                     continue
                 head_dim = d // nh
 
-                # MLX SDPA Kernel requirement: head_dim MUST be 64 or 128
                 if head_dim not in [64, 128]:
                     continue
 
@@ -173,20 +168,26 @@ def benchmark_mlx_model(
 
     try:
         if is_mlx_lm:
+            # Warmup
             w_cache = make_prompt_cache(model)
             w_out = model(prompt, cache=w_cache)
             mx.eval(w_out)
-
+            del w_out, w_cache
             clear_memory()
 
+            # Timed Prefill
             cache = make_prompt_cache(model)
             ttft_start = time.perf_counter()
             outputs = model(prompt, cache=cache)
             mx.eval(outputs)
             ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
 
-            clear_memory()
             curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+            mx.eval(curr_token)
+
+            # Free prefill output buffer before decode timing
+            del outputs
+            clear_memory()
 
             gen_start = time.perf_counter()
             for _ in range(gen_len):
@@ -197,19 +198,26 @@ def benchmark_mlx_model(
             decode_sec = max(time.perf_counter() - gen_start, 1e-5)
             decode_vram_mb = get_peak_vram_mb()
         else:
+            # Warmup
             w_out, w_cache = model(prompt)
             mx.eval(w_out, w_cache)
-
+            del w_out, w_cache
             clear_memory()
 
+            # Timed Prefill
             ttft_start = time.perf_counter()
             outputs, past_key_values = model(prompt)
             mx.eval(outputs, past_key_values)
             ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
 
-            clear_memory()
             curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
+            mx.eval(curr_token)
 
+            # Free prefill output buffer before decode timing
+            del outputs
+            clear_memory()
+
+            # Compile step generation loop with MLX JIT
             def decode_step_bt(tok, p_kv):
                 logits, n_kv = model(tok, past_key_values=p_kv)
                 next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -217,8 +225,13 @@ def benchmark_mlx_model(
 
             compiled_step = mx.compile(decode_step_bt)
 
+            # JIT Graph Warmup step
             dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
             mx.eval(dummy_tok, past_key_values)
+
+            # Reset peak memory tracker right before generation loop timer
+            if hasattr(mx, "reset_peak_memory"):
+                mx.reset_peak_memory()
 
             gen_start = time.perf_counter()
             for _ in range(gen_len):
@@ -345,11 +358,9 @@ def main():
                 print(f"  • Loading Baseline from MLX/HF Hub...")
                 hf_model, _ = mlx_lm_load(model_id)
 
-                # Step 1: Count baseline parameters BEFORE applying quantization
                 hf_params_m = count_mlx_params_m(hf_model)
                 print(f"  • Baseline Parameters (Full Precision): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
 
-                # Step 2: Apply quantization AFTER parameter counting
                 if args.quantize:
                     print(f"  ⚡ Quantizing Baseline MLX model to INT{args.quantize} (group_size={args.group_size})...")
                     hf_model = apply_quantization(hf_model, bits=args.quantize, group_size=args.group_size)
@@ -377,12 +388,10 @@ def main():
         )
 
         bt_model = BareTorchForCausalLMMLX(bt_config)
-        bt_model.set_dtype(mx.float16)
-
-        # Step 3: Count BareTorch parameters BEFORE applying quantization
+        # Cast parameters to FP16 natively using MLX tree_map
+        bt_model.update(tree_map(lambda p: p.astype(mx.float16), bt_model.parameters()))
         actual_bt_params_m = count_mlx_params_m(bt_model)
 
-        # Step 4: Apply quantization AFTER parameter counting
         if args.quantize:
             print(f"  ⚡ Quantizing BareTorch MLX model to INT{args.quantize} (group_size={args.group_size})...")
             bt_model = apply_quantization(bt_model, bits=args.quantize, group_size=args.group_size)
@@ -412,7 +421,6 @@ def main():
             }
         })
 
-    # Summary Report
     print("\n" + "=" * 145)
     print(f"📊 APPLES-TO-APPLES MLX SUITE SUMMARY REPORT{quant_suffix}")
     print("=" * 145)

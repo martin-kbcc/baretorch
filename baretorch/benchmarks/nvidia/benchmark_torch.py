@@ -1,24 +1,29 @@
-# baretorch/benchmark/runner.py
+# baretorch/benchmarks/nvidia/benchmark_torch.py
 import os
-import json
+import gc
 import csv
-import argparse
+import json
 import time
+import argparse
 import torch
 import torch.nn as nn
 from typing import List, Dict, Any
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
-from baretorch.benchmark.profiler import (
-    LatencyProfiler,
-    MemoryProfiler,
-    RooflineEstimator,
-    clear_gpu_memory
-)
 
 # Raise Dynamo recompile limit for variable context length sweeps
 torch._dynamo.config.recompile_limit = 64
+
+
+def clear_gpu_memory(device: str = "cuda"):
+    """Flushes Python garbage collection and CUDA cache, resetting memory stats."""
+    gc.collect()
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
 
 
 def count_baretorch_params_fast(
@@ -29,10 +34,7 @@ def count_baretorch_params_fast(
     rank: int = 8,
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer"
 ) -> float:
-    """
-    Computes exact BareTorch model parameter count in pure Python integer arithmetic.
-    Matched 1-to-1 with actual PyTorch module instantiations.
-    """
+    """Computes exact BareTorch parameter count matching PyTorch module instantiations."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
     full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(num_layers)]
 
@@ -42,13 +44,8 @@ def count_baretorch_params_fast(
     head_dim = d_model // num_heads
     d_ff = int(d_model * 3.5)
 
-    # 1. Embeddings (Token Embedding + Un-tied LM Head)
     embed_params = 2 * vocab_size * d_model
-
-    # 2. Final Norm (RMSNorm)
     final_norm = d_model
-
-    # 3. Layer Parameters
     layer_params = 0
 
     for l_type in full_layer_types:
@@ -63,7 +60,7 @@ def count_baretorch_params_fast(
         layer_params += (norms + mlp + attn)
 
     total_params = embed_params + final_norm + layer_params
-    return total_params / 1e6  # Millions
+    return total_params / 1e6
 
 
 def find_matching_baretorch_config(
@@ -72,7 +69,7 @@ def find_matching_baretorch_config(
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     max_seq_len: int = 32768
 ) -> tuple[BareTorchConfig, float]:
-    """Evaluates candidate hyper-parameters via pure Python math using exact target vocab_size."""
+    """Evaluates candidate hyper-parameters via pure Python math matching target vocab_size."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
 
     best_cfg = None
@@ -87,7 +84,7 @@ def find_matching_baretorch_config(
                 head_dim = d // nh
                 if head_dim < 64 or head_dim > 128:
                     continue
-                if head_dim % 2 != 0:  # RoPE requires even head_dim for 2D complex rotations
+                if head_dim % 2 != 0:
                     continue
 
                 num_kv_heads = max(1, nh // 4)
@@ -126,6 +123,89 @@ def find_matching_baretorch_config(
     return best_cfg, best_params_m
 
 
+def profile_inference(
+    model: nn.Module,
+    prompt_len: int = 2048,
+    gen_len: int = 32,
+    device: str = "cuda",
+    vocab_size: int = 50257
+) -> Dict[str, Any]:
+    """Profiles TTFT, tok/s, and Steady-State Decode VRAM symmetrically with Apple MLX."""
+    model.eval()
+    
+    raw_model = getattr(model, "_orig_mod", model)
+    cfg = getattr(raw_model, "config", None)
+    if cfg is not None:
+        cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else {}
+        vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", vocab_size))
+
+    try:
+        prompt = torch.randint(0, vocab_size, (1, prompt_len), device=device)
+
+        # 1. Timed Prefill Phase (TTFT)
+        start_prefill = time.perf_counter()
+        with torch.no_grad():
+            outputs = model(prompt, use_cache=True)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        ttft_ms = (time.perf_counter() - start_prefill) * 1000.0
+
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if hasattr(outputs, "logits"):
+            curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+        else:
+            curr_token = outputs[0][:, -1:, :].argmax(dim=-1)
+
+        # Free prefill output buffers before decode VRAM tracking
+        del outputs, prompt
+        gc.collect()
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+        # 2. Timed Decode Phase (Autoregressive Token Generation)
+        start_decode = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(gen_len):
+                outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
+                past_key_values = getattr(outputs, "past_key_values", None)
+                if hasattr(outputs, "logits"):
+                    curr_token = outputs.logits[:, -1:, :].argmax(dim=-1)
+                else:
+                    curr_token = outputs[0][:, -1:, :].argmax(dim=-1)
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+        decode_time = time.perf_counter() - start_decode
+        tokens_per_sec = gen_len / decode_time if decode_time > 0 else 0.0
+
+        # Capture Steady-State Decode Peak VRAM in MB
+        decode_vram_mb = 0.0
+        if device == "cuda" and torch.cuda.is_available():
+            decode_vram_mb = round(torch.cuda.max_memory_allocated() / (1024.0 ** 2), 2)
+
+        return {
+            "prompt_len": prompt_len,
+            "ttft_ms": round(ttft_ms, 2),
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "decode_vram_mb": decode_vram_mb,
+            "status": "success"
+        }
+
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        err_str = str(e).lower()
+        if isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in err_str:
+            clear_gpu_memory(device)
+            return {
+                "prompt_len": prompt_len,
+                "ttft_ms": "OOM",
+                "tokens_per_sec": "OOM",
+                "decode_vram_mb": "OOM",
+                "status": "OOM"
+            }
+        raise e
+
+
 def profile_single_model(
     model: nn.Module,
     model_name: str,
@@ -140,71 +220,47 @@ def profile_single_model(
     cfg_dict = cfg.to_dict() if (cfg is not None and hasattr(cfg, "to_dict")) else {}
     vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", 50257))
 
+    # FULL JIT WARMUP: Execute complete Prefill + 32 Decode steps so Triton codegen finishes BEFORE timer
     if is_compiled and device == "cuda":
-        print(f"  ⚡ Running PyTorch Inductor / Triton Warmup for {model_name}...")
+        warmup_ctx = prompt_lens[0]
+        print(f"  ⚡ Executing full Inductor JIT warmup for {model_name} (Prefill {warmup_ctx} + {gen_len} Decode steps)...")
         try:
-            warmup_prompt = torch.randint(0, vocab_size, (1, 128), device=device)
-            with torch.no_grad():
-                _ = model(warmup_prompt, use_cache=True)
-            torch.cuda.synchronize()
+            _ = profile_inference(
+                model=model,
+                prompt_len=warmup_ctx,
+                gen_len=gen_len,
+                device=device,
+                vocab_size=vocab_size
+            )
         except Exception as w_err:
             print(f"  ⚠️ Warmup pass warning ({w_err})")
-            clear_gpu_memory(device)
+        clear_gpu_memory(device)
 
-    results = {
-        "model_name": model_name,
-        "param_count_m": round(param_count_m, 2),
-        "executorch_arena_mb": "N/A",
-        "runs": []
-    }
-
+    runs = []
     for ctx_len in prompt_lens:
-        print(f"  🔍 Sweeping {model_name} @ Context Length: {ctx_len} tokens...")
+        print(f"  ├─ Benchmarking {model_name} @ Context: {ctx_len:<5} tokens...", end="", flush=True)
 
-        # Reset GPU memory stats before starting sweep step
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        clear_gpu_memory(device)
 
-        lat = LatencyProfiler.profile_inference(
+        lat = profile_inference(
             model=model,
             prompt_len=ctx_len,
             gen_len=gen_len,
             device=device,
             vocab_size=vocab_size
         )
+        runs.append(lat)
 
-        if lat["status"] == "OOM":
-            vram_mb = "OOM"
-            cache_mb = "OOM"
-            roofline_fps = {dev: "OOM" for dev in RooflineEstimator.DEVICE_BANDWIDTH_GBPS.keys()}
-        else:
-            vram_mb = MemoryProfiler.get_peak_vram_mb(device=device)
-            cache_bytes = RooflineEstimator.calculate_active_cache_bytes(model, seq_len=ctx_len)
-            cache_mb = round(cache_bytes / (1024.0 ** 2), 2)
+        ttft_str = f"{format_cell(lat['ttft_ms'])} ms" if lat['ttft_ms'] != "OOM" else "💥 OOM"
+        dec_str = f"{format_cell(lat['tokens_per_sec'])} tok/s" if lat['tokens_per_sec'] != "OOM" else "💥 OOM"
+        vram_str = f"{format_cell(lat['decode_vram_mb'])} MB" if lat['decode_vram_mb'] != "OOM" else "💥 OOM"
+        print(f" ✅ (TTFT: {ttft_str} | Decode: {dec_str} | VRAM: {vram_str})")
 
-            roofline_fps = RooflineEstimator.project_throughput(
-                param_count_m=param_count_m,
-                active_cache_bytes=cache_bytes,
-                precision_bytes=2.0
-            )
-
-        results["runs"].append({
-            "prompt_len": ctx_len,
-            "ttft_ms": lat["ttft_ms"],
-            "tokens_per_sec": lat["tokens_per_sec"],
-            "peak_vram_mb": vram_mb,
-            "cache_memory_mb": cache_mb,
-            "roofline_fps": roofline_fps
-        })
-
-    et_profile = MemoryProfiler.profile_executorch_arena(
-        model=model,
-        seq_len=128,
-        vocab_size=vocab_size
-    )
-    results["executorch_arena_mb"] = et_profile.get("arena_ram_mb", "N/A")
-
-    return results
+    return {
+        "model_name": model_name,
+        "param_count_m": round(param_count_m, 2),
+        "runs": runs
+    }
 
 
 def format_cell(val: Any) -> str:
@@ -215,55 +271,12 @@ def format_cell(val: Any) -> str:
     return str(val)
 
 
-def print_comparison_pairs(paired_results: List[Dict[str, Any]]):
-    print("\n" + "=" * 145)
-    print("📊 APPLES-TO-APPLES BENCHMARK SUITE: BareTorch Matched Hybrids vs Open Source Baselines")
-    print("=" * 145)
-
-    for pair_idx, pair in enumerate(paired_results, 1):
-        hf_res = pair["hf_baseline"]
-        bt_res = pair["baretorch_matched"]
-
-        print(f"\n🎯 PAIR {pair_idx}: {hf_res['model_name']}")
-        print(f"  • Baseline Params: {hf_res['param_count_m']:.2f}M")
-        print(f"  • BareTorch Matched Params: {bt_res['param_count_m']:.2f}M (Δ = {abs(bt_res['param_count_m'] - hf_res['param_count_m']):.2f}M)")
-        print("-" * 145)
-
-        prompt_lens = [r["prompt_len"] for r in bt_res["runs"]]
-
-        for run_idx, ctx in enumerate(prompt_lens):
-            b_run = bt_res["runs"][run_idx]
-            h_run = hf_res["runs"][run_idx]
-
-            print(f" Context: {ctx:<6} tokens | BareTorch Matched ({bt_res['param_count_m']:.1f}M) | Baseline ({hf_res['param_count_m']:.1f}M) | BareTorch Advantage")
-            print("-" * 145)
-
-            t_b, t_h = b_run["ttft_ms"], h_run["ttft_ms"]
-            ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.1f}% TTFT" if (isinstance(t_h, (int, float)) and isinstance(t_b, (int, float)) and t_h > 0) else "N/A"
-            print(f"    Prefill Latency (ms) : {format_cell(t_b):<25} | {format_cell(t_h):<20} | {ttft_adv}")
-
-            s_b, s_h = b_run["tokens_per_sec"], h_run["tokens_per_sec"]
-            speed_adv = f"{s_b / s_h:.2f}x Speed" if (isinstance(s_h, (int, float)) and isinstance(s_b, (int, float)) and s_h > 0) else "N/A"
-            print(f"    Local GPU (tok/s)    : {format_cell(s_b):<25} | {format_cell(s_h):<20} | {speed_adv}")
-
-            c_b, c_h = b_run["cache_memory_mb"], h_run["cache_memory_mb"]
-            cache_adv = f"-{((c_h - c_b) / c_h) * 100:.1f}% RAM" if (isinstance(c_h, (int, float)) and isinstance(c_b, (int, float)) and c_h > 0) else "N/A"
-            print(f"    Active Cache (MB)    : {format_cell(c_b):<25} | {format_cell(c_h):<20} | {cache_adv}")
-
-            p_b, p_h = b_run["roofline_fps"]["iphone_16_pro"], h_run["roofline_fps"]["iphone_16_pro"]
-            phone_adv = f"{p_b / p_h:.2f}x FPS" if (isinstance(p_h, (int, float)) and isinstance(p_b, (int, float)) and p_h > 0) else "N/A"
-            print(f"    iPhone 16 Pro (FPS)  : {format_cell(p_b):<25} | {format_cell(p_h):<20} | {phone_adv}")
-
-            print("-" * 145)
-
-
 def export_to_csv(paired_results: List[Dict[str, Any]], output_csv: str):
     os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     fieldnames = [
         "Baseline_Model_ID", "Context_Length", "Metric", 
         "BareTorch_Matched_Value", "Baseline_Value", "BareTorch_Advantage"
     ]
-    devices = list(RooflineEstimator.DEVICE_BANDWIDTH_GBPS.keys())
 
     with open(output_csv, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
@@ -274,46 +287,72 @@ def export_to_csv(paired_results: List[Dict[str, Any]], output_csv: str):
             bt_res = pair["baretorch_matched"]
             baseline_id = hf_res["model_name"]
 
-            prompt_lens = [r["prompt_len"] for r in bt_res["runs"]]
+            bt_runs = bt_res.get("runs", [])
+            hf_runs = hf_res.get("runs", [])
 
-            for run_idx, ctx in enumerate(prompt_lens):
-                b_run = bt_res["runs"][run_idx]
-                h_run = hf_res["runs"][run_idx]
+            for run_idx, b_run in enumerate(bt_runs):
+                ctx = b_run["prompt_len"]
+                h_run = hf_runs[run_idx] if run_idx < len(hf_runs) else {}
 
-                t_b, t_h = b_run["ttft_ms"], h_run["ttft_ms"]
-                ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_h, (int, float)) and t_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", t_b, t_h, ttft_adv])
+                t_b, t_h = b_run.get("ttft_ms"), h_run.get("ttft_ms", "N/A")
+                ttft_adv = f"{((t_h - t_b) / t_h) * 100:+.2f}%" if (isinstance(t_h, (int, float)) and isinstance(t_b, (int, float)) and t_h > 0) else "N/A"
+                writer.writerow([baseline_id, ctx, "Prefill_Latency_ms", format_cell(t_b), format_cell(t_h), ttft_adv])
 
-                s_b, s_h = b_run["tokens_per_sec"], h_run["tokens_per_sec"]
+                s_b, s_h = b_run.get("tokens_per_sec"), h_run.get("tokens_per_sec", "N/A")
                 speed_adv = f"{s_b / s_h:.2f}x" if (isinstance(s_h, (int, float)) and isinstance(s_b, (int, float)) and s_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Local_GPU_Decode_tok_s", s_b, s_h, speed_adv])
+                writer.writerow([baseline_id, ctx, "Local_GPU_Decode_tok_s", format_cell(s_b), format_cell(s_h), speed_adv])
 
-                c_b, c_h = b_run["cache_memory_mb"], h_run["cache_memory_mb"]
-                cache_adv = f"-{((c_h - c_b) / c_h) * 100:.2f}%" if (isinstance(c_h, (int, float)) and isinstance(c_b, (int, float)) and c_h > 0) else "N/A"
-                writer.writerow([baseline_id, ctx, "Active_Cache_MB", c_b, c_h, cache_adv])
+                v_b, v_h = b_run.get("decode_vram_mb"), h_run.get("decode_vram_mb", "N/A")
+                vram_adv = f"-{((v_h - v_b) / v_h) * 100:.2f}%" if (isinstance(v_h, (int, float)) and isinstance(v_b, (int, float)) and v_h > 0) else "N/A"
+                writer.writerow([baseline_id, ctx, "Decode_VRAM_MB", format_cell(v_b), format_cell(v_h), vram_adv])
 
-                for dev_key in devices:
-                    p_b, p_h = b_run["roofline_fps"][dev_key], h_run["roofline_fps"][dev_key]
-                    fps_adv = f"{p_b / p_h:.2f}x" if (isinstance(p_h, (int, float)) and isinstance(p_b, (int, float)) and p_h > 0) else "N/A"
-                    writer.writerow([baseline_id, ctx, f"Projected_FPS_{dev_key}", p_b, p_h, fps_adv])
+    print(f"\n📊 NVIDIA PyTorch Multi-model CSV report saved to: {output_csv}")
 
-    print(f"📊 Apples-to-Apples Multi-model CSV report saved to: {output_csv}")
+
+def print_summary_report(paired_results: List[Dict[str, Any]]):
+    print("\n" + "=" * 145)
+    print("📊 APPLES-TO-APPLES NVIDIA PYTORCH SUITE SUMMARY REPORT")
+    print("=" * 145)
+
+    for pair in paired_results:
+        hf_res = pair["hf_baseline"]
+        bt_res = pair["baretorch_matched"]
+
+        print(f"\n🎯 BASELINE: {hf_res['model_name']} ({hf_res['param_count_m']:.1f}M) vs BARETORCH MATCHED ({bt_res['param_count_m']:.1f}M)")
+        print(f"{'Context Length':<15} | {'BareTorch TTFT':<16} | {'Baseline TTFT':<16} | {'BareTorch Decode':<18} | {'Baseline Decode':<18} | {'Decode VRAM (BT / HF)':<22}")
+        print("-" * 145)
+
+        bt_runs = bt_res.get("runs", [])
+        hf_runs = hf_res.get("runs", [])
+
+        for run_idx in range(len(bt_runs)):
+            b_run = bt_runs[run_idx]
+            h_run = hf_runs[run_idx] if run_idx < len(hf_runs) else {}
+
+            ctx = b_run["prompt_len"]
+            bt_ttft = f"{format_cell(b_run.get('ttft_ms'))} ms"
+            hf_ttft = f"{format_cell(h_run.get('ttft_ms'))} ms"
+            bt_dec = f"{format_cell(b_run.get('tokens_per_sec'))} tok/s"
+            hf_dec = f"{format_cell(h_run.get('tokens_per_sec'))} tok/s"
+            vram_str = f"{format_cell(b_run.get('decode_vram_mb'))} / {format_cell(h_run.get('decode_vram_mb'))} MB"
+
+            print(f"{ctx:<15} | {bt_ttft:<16} | {hf_ttft:<16} | {bt_dec:<18} | {hf_dec:<18} | {vram_str:<22}")
 
 
 def run_comparative_benchmark(
     hf_model_ids: List[str] = ["meta-llama/Llama-3.2-1B"],
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
-    prompt_lens: List[int] = [2048, 4096, 8192, 16384, 32768],
+    prompt_lens: List[int] = [512, 1024, 2048, 4096, 8192, 16384, 32768],
     gen_len: int = 32,
     compile_model: bool = True,
-    output_json: str = "./results_sota_suite.json",
-    output_csv: str = "./results_sota_suite.csv"
+    output_json: str = "./results_nvidia_suite.json",
+    output_csv: str = "./results_nvidia_suite.csv"
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    print("\n======================================================================")
-    print(f"🚀 BareTorch Apples-to-Apples Vocab-Aware Benchmark Suite [{device.upper()}]")
+    print("======================================================================")
+    print(f"🚀 BARETORCH APPLES-TO-APPLES NVIDIA PYTORCH SUITE [{device.upper()}]")
     print(f"  • Baseline Target Models ({len(hf_model_ids)}) : {', '.join(hf_model_ids)}")
     print(f"  • torch.compile Mode: {'ENABLED (Symmetric)' if compile_model else 'DISABLED'}")
     print("======================================================================\n")
@@ -322,8 +361,17 @@ def run_comparative_benchmark(
     paired_results = []
 
     for model_id in hf_model_ids:
+        print("─" * 100)
+        print(f"📦 Evaluating Target Baseline Family: '{model_id}'")
+        print("─" * 100)
+
         clear_gpu_memory(device)
-        print(f"\n📦 Loading Hugging Face baseline model: '{model_id}'...")
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            vocab_size = getattr(tokenizer, "vocab_size", 50257)
+        except Exception:
+            vocab_size = 50257
 
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
@@ -353,14 +401,10 @@ def run_comparative_benchmark(
                 )
 
         hf_params_m = sum(p.numel() for p in hf_model.parameters()) / 1e6
-        cfg = getattr(hf_model, "config", None)
-        cfg_dict = cfg.to_dict() if (cfg is not None and hasattr(cfg, "to_dict")) else {}
-        target_vocab_size = cfg_dict.get("vocab_size", getattr(cfg, "vocab_size", 50257))
-
-        print(f"  • Baseline Parameters (PyTorch Measured): {hf_params_m:.2f}M params (vocab_size={target_vocab_size})")
+        print(f"  • Baseline Parameters (PyTorch Measured): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
 
         if compile_model and device == "cuda":
-            print(f"⚡ Fusing Hugging Face baseline ({actual_model_id}) kernels via torch.compile(dynamic=True)...")
+            print(f"  ⚡ Fusing Hugging Face baseline ({actual_model_id}) kernels via torch.compile(dynamic=True)...")
             try:
                 hf_model = torch.compile(hf_model, dynamic=True)
             except Exception as comp_err:
@@ -379,10 +423,10 @@ def run_comparative_benchmark(
         del hf_model
         clear_gpu_memory(device)
 
-        print(f"\n⚙️ Looking up BareTorch blueprint matching ~{hf_params_m:.2f}M parameters...")
+        print(f"\n  ⚙️ Looking up BareTorch blueprint matching ~{hf_params_m:.2f}M parameters...")
         bt_config, bt_params_m_predicted = find_matching_baretorch_config(
             target_params_m=hf_params_m,
-            target_vocab_size=target_vocab_size,
+            target_vocab_size=vocab_size,
             layer_sequence=layer_sequence,
             max_seq_len=max_seq_len
         )
@@ -396,7 +440,7 @@ def run_comparative_benchmark(
         bt_model_name = f"BareTorch Matched ({actual_bt_params_m:.1f}M)"
 
         if compile_model and device == "cuda":
-            print(f"⚡ Fusing {bt_model_name} CS-LRAD kernels via torch.compile(dynamic=True)...")
+            print(f"  ⚡ Fusing {bt_model_name} CS-LRAD kernels via torch.compile(dynamic=True)...")
             try:
                 bt_model = torch.compile(bt_model, dynamic=True)
             except Exception as comp_err:
@@ -420,7 +464,7 @@ def run_comparative_benchmark(
             "baretorch_matched": bt_res
         })
 
-    print_comparison_pairs(paired_results)
+    print_summary_report(paired_results)
 
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
     with open(output_json, "w") as f:
@@ -431,7 +475,7 @@ def run_comparative_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="BareTorch Vocab-Aware Benchmark Suite")
+    parser = argparse.ArgumentParser(description="BareTorch NVIDIA PyTorch Benchmark Suite")
     parser.add_argument(
         "--hf_model_ids",
         nargs="+",
@@ -440,11 +484,11 @@ def main():
         help="Space-separated list of Hugging Face model IDs to evaluate"
     )
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
-    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[2048, 4096, 8192, 16384, 32768])
+    parser.add_argument("--prompt_lens", nargs="+", type=int, default=[512, 1024, 2048, 4096, 8192, 16384, 32768])
     parser.add_argument("--gen_len", type=int, default=32)
     parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile kernel fusion")
-    parser.add_argument("--output_json", type=str, default="./results_sota_suite.json")
-    parser.add_argument("--output_csv", type=str, default="./results_sota_suite.csv")
+    parser.add_argument("--output_json", type=str, default="./results_nvidia_suite.json")
+    parser.add_argument("--output_csv", type=str, default="./results_nvidia_suite.csv")
 
     args = parser.parse_args()
 

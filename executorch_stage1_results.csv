@@ -1,2 +1,0 @@
-Baseline_Model_ID,BareTorch_Params_M,Baseline_Params_M,Quant_Type,Backend_Delegate,BareTorch_PTE_Size_MB,Baseline_PTE_Size_MB,Disk_Reduction_Pct,BareTorch_Tensor_Arena_MB,Baseline_Tensor_Arena_MB,Arena_RAM_Reduction_Pct
-meta-llama/Llama-3.2-1B,1237.1,1235.81,int8,coreml,4748.86,4714.29,-0.73%,987.27,1065.62,7.35%
