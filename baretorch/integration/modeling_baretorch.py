@@ -137,26 +137,15 @@ class BareTorchModel(BareTorchPreTrainedModel):
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
         
-        is_step_inference = (past_key_values is not None) or (seq_length == 1)
-        
-        pad_len = 0
-        if not is_step_inference:
-            chunk_size = self.config.chunk_size
-            pad_len = (chunk_size - (seq_length % chunk_size)) % chunk_size
-            if pad_len > 0:
-                h = F.pad(h, (0, 0, 0, pad_len), value=0)
-        
-        effective_seq_len = seq_length + pad_len
-        
-        if position_ids is None or position_ids.shape[-1] != effective_seq_len:
+        if position_ids is None or position_ids.shape[-1] != seq_length:
             past_length = 0
             if past_key_values is not None:
                 for cache in past_key_values:
-                    if cache is not None and isinstance(cache, tuple): # Transformer KV cache
+                    if cache is not None and isinstance(cache, tuple) and len(cache) > 0:  # Transformer KV cache
                         past_length = cache[0].size(-2)
                         break
             position_ids = torch.arange(
-                past_length, past_length + effective_seq_len, dtype=torch.long, device=inputs_embeds.device
+                past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
             ).unsqueeze(0)
 
         all_hidden_states = () if output_hidden_states else None
@@ -169,22 +158,13 @@ class BareTorchModel(BareTorchPreTrainedModel):
             
             if isinstance(layer, TransformerDecoderBlock):
                 h, next_state = layer(h, past_kv=past_state, position_ids=position_ids)
-                if not is_step_inference and pad_len > 0 and next_state is not None:
-                    k, v = next_state
-                    next_state = (k[:, :, :seq_length, :], v[:, :, :seq_length, :])
             elif isinstance(layer, LRADDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
             elif isinstance(layer, TTTDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
-            
-            if not is_step_inference and pad_len > 0:
-                h = torch.cat([h[:, :seq_length, :], torch.zeros_like(h[:, seq_length:, :])], dim=1)
                 
             if use_cache:
                 next_decoder_cache.append(next_state)
-
-        if not is_step_inference and pad_len > 0:
-            h = h[:, :seq_length, :]
 
         h = self.final_norm(h)
 
@@ -243,6 +223,7 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        num_logits_to_keep: int = 0,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -260,11 +241,8 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
 
-        # PREFILL LOGIT SLICING OPTIMIZATION:
-        # Slices to the last token hidden state BEFORE lm_head during inference prefill.
-        # Eliminates temporary 8.38 GB (1, L, vocab_size) tensor allocations at L=32,768.
-        if labels is None and hidden_states.size(1) > 1:
-            hidden_states = hidden_states[:, -1:, :]
+        if num_logits_to_keep > 0 and hidden_states.size(1) > num_logits_to_keep:
+            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
 

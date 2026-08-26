@@ -145,7 +145,11 @@ def profile_inference(
         # 1. Timed Prefill Phase (TTFT)
         start_prefill = time.perf_counter()
         with torch.no_grad():
-            outputs = model(prompt, use_cache=True)
+            try:
+                outputs = model(prompt, use_cache=True, num_logits_to_keep=1)
+            except TypeError:
+                outputs = model(prompt, use_cache=True)
+
         if device == "cuda":
             torch.cuda.synchronize()
         ttft_ms = (time.perf_counter() - start_prefill) * 1000.0

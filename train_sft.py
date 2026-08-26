@@ -112,7 +112,7 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            # Format ChatML block for this turn
+            # Format ChatML block for this turn (uses native ChatML tokens in SmolLM2)
             formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
             tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
 
@@ -248,20 +248,16 @@ def main():
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # 1. Tokenizer Setup
+    # 1. Tokenizer Setup (Using Native Base Vocabulary)
     if local_rank == 0:
         logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
     tokenizer.model_max_length = args.seq_len
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    special_tokens_dict = {
-        "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
-        "pad_token": "<|im_end|>",
-    }
-    tokenizer.add_special_tokens(special_tokens_dict)
-
-    # 2. Model Loading & Safe Token Embedding Resizing
+    # 2. Model Loading
     if local_rank == 0:
         logger.info(
             f"Loading pre-trained model weights from: {args.pretrained_model_path}"
@@ -271,11 +267,6 @@ def main():
         args.pretrained_model_path, 
         torch_dtype=torch.bfloat16,
     )
-
-    # Safely resize token embeddings AND re-tie weights to preserve lm_head binding
-    if len(tokenizer) != model.config.vocab_size:
-        model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-        model.tie_weights()
 
     # Model runtime configurations
     model.config.pad_token_id = tokenizer.pad_token_id

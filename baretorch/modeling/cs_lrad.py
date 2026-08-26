@@ -32,7 +32,7 @@ class GatedMLP(nn.Module):
 
 
 class LowRankAssociativeDeltaEngine(nn.Module):
-    def __init__(self, d_model=256, num_heads=16, chunk_size=32, rank=8):
+    def __init__(self, d_model=256, num_heads=16, chunk_size=32, rank=8, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -54,53 +54,94 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         
         self.W_swish_gate = nn.Linear(d_model, self.inner_dim, bias=False)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
+        self.resid_drop = nn.Dropout(dropout)
 
     def forward(self, x):
         B, L, D = x.shape
         H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
-        N = L // C  
+        scaling = 1.0 / math.sqrt(d_h)
+
+        N = (L + C - 1) // C
+        pad_len = (C - (L % C)) % C
         
-        Q = F.silu(self.W_q(x).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
-        K = F.silu(self.W_k(x).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
-        V = self.W_v(x).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4)
+        if pad_len > 0:
+            x_padded = F.pad(x, (0, 0, 0, pad_len), value=0)
+        else:
+            x_padded = x
+
+        Q = F.silu(self.W_q(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
+        K = F.silu(self.W_k(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
+        V = self.W_v(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4)
         
-        U = self.W_u(x).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
-        R = self.W_r(x).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
+        U = self.W_u(x_padded).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
+        R = self.W_r(x_padded).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
         
-        gate = torch.clamp(torch.sigmoid(self.W_gate(x)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1), min=1e-3, max=0.999)
-        beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
-        
+        gate = torch.clamp(
+            torch.sigmoid(self.W_gate(x_padded)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1), 
+            min=1e-3, 
+            max=0.999
+        )
+        beta_gate = torch.sigmoid(self.W_beta_gate(x_padded)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
+
+        # Zero-padding validity masking
+        if pad_len > 0:
+            seq_idx = torch.arange(N * C, device=x.device).view(1, 1, N, C, 1)
+            valid_mask = (seq_idx < L).to(dtype=x.dtype)
+            
+            U = U * valid_mask
+            V = V * valid_mask
+            gate = torch.where(valid_mask.bool(), gate, torch.ones_like(gate))
+
         log_gate = torch.log(gate)
         Lambda = torch.cumsum(log_gate, dim=-2)
         exp_Lambda = torch.exp(Lambda)  
         
-        causal_mask = torch.tril(torch.ones(C, C, device=x.device)).view(1, 1, 1, C, C)
-        M_links = torch.exp((Lambda - Lambda.transpose(-1, -2)).masked_fill(causal_mask == 0, float('-inf')))
+        indices = torch.arange(C, device=x.device)
+        causal_mask = (indices[:, None] >= indices[None, :]).view(1, 1, 1, C, C)
         
-        scaling = 1.0 / math.sqrt(d_h)
+        diff = Lambda - Lambda.transpose(-1, -2)
+        diff_masked = torch.where(causal_mask, diff, torch.tensor(-10000.0, device=x.device, dtype=x.dtype))
+        M_links = torch.exp(torch.clamp(diff_masked, max=0.0))
+        
         Y_local = torch.matmul(torch.matmul(Q, K.transpose(-1, -2)) * scaling * M_links, V)  
         
-        chunk_decay_log = torch.sum(log_gate, dim=-2).squeeze(-1) 
+        chunk_decay_log = torch.clamp(torch.sum(log_gate, dim=-2).squeeze(-1), min=-50.0, max=0.0)
         Lambda_chunks = torch.cumsum(chunk_decay_log, dim=2)  
         log_M_chunks = (Lambda_chunks.unsqueeze(-1) - Lambda_chunks.unsqueeze(-2)) - chunk_decay_log.unsqueeze(-1)
         
-        causal_mask_chunks = torch.tril(torch.ones(N, N, device=x.device), diagonal=-1)
-        M_chunks = torch.exp(log_M_chunks.masked_fill(causal_mask_chunks.view(1, 1, N, N) == 0, float('-inf')))
+        c_indices = torch.arange(N, device=x.device)
+        causal_mask_chunks = (c_indices[:, None] > c_indices[None, :]).view(1, 1, N, N)
         
-        U_decayed = (U * beta_gate) * (exp_Lambda[:, :, :, -1:, :] / torch.clamp(exp_Lambda, min=1e-6))
-        S_historical = torch.matmul(M_chunks, torch.matmul(U_decayed.transpose(-1, -2), V).view(B, H, N, r * d_h)).view(B, H, N, r, d_h)
+        log_M_chunks_masked = torch.where(
+            causal_mask_chunks, 
+            log_M_chunks, 
+            torch.tensor(-10000.0, device=x.device, dtype=x.dtype)
+        )
+        M_chunks = torch.exp(torch.clamp(log_M_chunks_masked, max=0.0))
+        
+        exp_Lambda_last = exp_Lambda[:, :, :, -1:, :]
+        exp_Lambda_safe = torch.maximum(exp_Lambda, torch.tensor(1e-6, device=x.device, dtype=x.dtype))
+        U_decayed = (U * beta_gate) * (exp_Lambda_last / exp_Lambda_safe)
+        
+        S_historical_flat = torch.matmul(
+            M_chunks, 
+            torch.matmul(U_decayed.transpose(-1, -2), V).view(B, H, N, r * d_h)
+        )
+        S_historical = S_historical_flat.view(B, H, N, r, d_h)
         
         Y_global = torch.matmul(R * exp_Lambda, S_historical) * scaling  
         
-        Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, L, self.inner_dim)
+        Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, N * C, self.inner_dim)
+        Out = Out[:, :L, :]
         
-        # Calculate last step state for KV cache compatibility
+        output = self.resid_drop(self.W_out(Out * F.silu(self.W_swish_gate(x))))
+
         chunk_decay_last = exp_Lambda[:, :, -1, -1:, :] 
         S_historical_last = S_historical[:, :, -1]      
         S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V[:, :, -1]) 
         S_final = (chunk_decay_last * S_historical_last) + S_local_last
         
-        return self.W_out(Out * F.silu(self.W_swish_gate(x))), S_final
+        return output, S_final
 
     def step_inference(self, x, past_S=None):
         B, L, D = x.shape
@@ -109,16 +150,31 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         Q = F.silu(self.W_q(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
         K = F.silu(self.W_k(x).view(B, L, H, d_h).permute(0, 2, 1, 3))
         V = self.W_v(x).view(B, L, H, d_h).permute(0, 2, 1, 3)
-        U, R = self.W_u(x).view(B, L, H, r).permute(0, 2, 1, 3), self.W_r(x).view(B, L, H, r).permute(0, 2, 1, 3)
+        U = self.W_u(x).view(B, L, H, r).permute(0, 2, 1, 3)
+        R = self.W_r(x).view(B, L, H, r).permute(0, 2, 1, 3)
         
-        gate = torch.clamp(torch.sigmoid(self.W_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), min=1e-3, max=0.999)
+        gate = torch.clamp(
+            torch.sigmoid(self.W_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), 
+            min=1e-3, 
+            max=0.999
+        )
         beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
         
-        S_state = gate * (past_S if past_S is not None else torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)) + \
-                  torch.matmul((U * beta_gate).transpose(-1, -2), V)
+        if past_S is None or not isinstance(past_S, torch.Tensor):
+            past_S = torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)
+
+        # 1. Compute global read from past historical state
+        Y_global = torch.matmul(R, past_S) * (1.0 / math.sqrt(d_h))
         
-        Out = (torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) + torch.matmul(R, S_state)) * (1.0 / math.sqrt(d_h))
-        return self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, D) * F.silu(self.W_swish_gate(x))), S_state
+        # 2. Local self-attention on current single token
+        Y_local = torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) * (1.0 / math.sqrt(d_h))
+        
+        # 3. State update for step t+1: S_t = (gate * S_{t-1}) + U_decayed^T * V
+        S_state = (gate * past_S) + torch.matmul((U * beta_gate).transpose(-1, -2), V)
+        
+        Out = Y_local + Y_global
+        output = self.resid_drop(self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, D) * F.silu(self.W_swish_gate(x))))
+        return output, S_state
 
 
 class LRADDecoderBlock(nn.Module):
@@ -126,7 +182,7 @@ class LRADDecoderBlock(nn.Module):
         super().__init__()
         self.use_grad_checkpointing = use_grad_checkpointing
         self.ln1 = RMSNorm(d_model)
-        self.attn = LowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank)
+        self.attn = LowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank, dropout=dropout)
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 
@@ -260,15 +316,6 @@ class CSLRADModel(CSLRADPreTrainedModel):
         h = inputs_embeds
         next_decoder_cache = [] if use_cache else None
         
-        is_step_inference = (past_key_values is not None) or (seq_length == 1)
-        
-        pad_len = 0
-        if not is_step_inference:
-            chunk_size = self.config.chunk_size
-            pad_len = (chunk_size - (seq_length % chunk_size)) % chunk_size
-            if pad_len > 0:
-                h = F.pad(h, (0, 0, 0, pad_len), value=0)
-        
         all_hidden_states = () if output_hidden_states else None
         
         for i, layer in enumerate(self.layers):
@@ -282,9 +329,6 @@ class CSLRADModel(CSLRADPreTrainedModel):
                 next_decoder_cache.append(next_state)
 
         h = self.final_norm(h)
-        
-        if not is_step_inference and pad_len > 0:
-            h = h[:, :seq_length, :]
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (h,)

@@ -1,3 +1,4 @@
+# /home/martinkb/Desktop/BareTorch_F/baretorch/modeling/transformer.py
 import math
 import torch
 import torch.nn as nn
@@ -38,11 +39,6 @@ class GatedMLP(nn.Module):
 # ==========================================
 
 class RotaryEmbedding(nn.Module):
-    """
-    Export-friendly, dynamic Rotary Position Embeddings (RoPE).
-    Pre-computes static buffers for graph export, but dynamically extends cache 
-    if prompt + generated tokens exceed initial buffer bounds during runtime generation.
-    """
     def __init__(self, dim, max_position_embeddings=8192, base=10000):
         super().__init__()
         self.dim = dim
@@ -52,13 +48,11 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Pre-compute static lookup table up to default max_position_embeddings
         self._set_cos_sin_cache(seq_len=self.max_position_embeddings, device="cpu", dtype=torch.float32)
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         
-        # Handle meta tensor initialization from Hugging Face from_pretrained
         if getattr(self.inv_freq, "is_meta", False) or self.inv_freq.device.type == "meta":
             inv_freq = 1.0 / (
                 self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
@@ -84,35 +78,27 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
     def apply_rope(self, q, k, position_ids):
-        # Bypass .item() evaluation during torch.export / ExecuTorch tracing
-        if not torch.compiler.is_compiling():
-            try:
-                max_pos = position_ids.shape[-1] if position_ids is not None else q.shape[1]
-                if (
-                    self.cos_cached is None 
-                    or max_pos >= self.cos_cached.size(0) 
-                    or self.cos_cached.device != q.device
-                    or self.cos_cached.dtype != q.dtype
-                ):
-                    new_len = max(max_pos + 1024, self.max_position_embeddings)
-                    self._set_cos_sin_cache(seq_len=new_len, device=q.device, dtype=q.dtype)
-            except Exception:
-                pass
+        max_pos = int(position_ids.max().item()) + 1 if position_ids is not None else q.shape[1]
+        
+        if (
+            self.cos_cached is None 
+            or max_pos > self.cos_cached.size(0) 
+            or self.cos_cached.device != q.device
+            or self.cos_cached.dtype != q.dtype
+        ):
+            new_len = max(max_pos + 1024, self.max_position_embeddings)
+            self._set_cos_sin_cache(seq_len=new_len, device=q.device, dtype=q.dtype)
 
         position_ids = position_ids.to(q.device)
-        cos = self.cos_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
-        sin = self.sin_cached[position_ids].unsqueeze(1)  # [B, 1, L, d_h]
+        cos = self.cos_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)  # [B, 1, L, d_h]
+        sin = self.sin_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)  # [B, 1, L, d_h]
 
         q_embed = (q * cos) + (self._rotate_half(q) * sin)
         k_embed = (k * cos) + (self._rotate_half(k) * sin)
-        return q_embed, k_embed
+        return q_embed.to(dtype=q.dtype), k_embed.to(dtype=k.dtype)
 
 
 class CausalSelfAttention(nn.Module):
-    """
-    SOTA Grouped-Query Attention (GQA) with fused Rotary Position Embeddings (RoPE).
-    Utilizes PyTorch's native hardware-accelerated Scaled Dot-Product Attention (SDPA).
-    """
     def __init__(self, d_model, num_heads=16, num_kv_heads=4, dropout=0.1, max_seq_len=4096):
         super().__init__()
         self.d_model = d_model
@@ -138,7 +124,9 @@ class CausalSelfAttention(nn.Module):
         H_q, H_kv, d_h = self.num_heads, self.num_kv_heads, self.head_dim
         
         if position_ids is None:
-            past_len = past_kv[0].size(-2) if past_kv is not None else 0
+            past_len = 0
+            if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) > 0:
+                past_len = past_kv[0].size(-2)
             position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
             
         q = self.W_q(x).view(B, L, H_q, d_h).transpose(1, 2)
@@ -147,7 +135,7 @@ class CausalSelfAttention(nn.Module):
         
         q, k = self.rope.apply_rope(q, k, position_ids)
         
-        if past_kv is not None:
+        if past_kv is not None and isinstance(past_kv, tuple):
             pk, pv = past_kv
             k, v = torch.cat([pk, k], dim=-2), torch.cat([pv, v], dim=-2)
         current_kv = (k, v)
@@ -156,10 +144,12 @@ class CausalSelfAttention(nn.Module):
             k = torch.repeat_interleave(k, self.num_queries_per_kv, dim=1).contiguous()
             v = torch.repeat_interleave(v, self.num_queries_per_kv, dim=1).contiguous()
             
-        is_causal_mask = (past_kv is None)
-        
-        # Dynamically evaluate dropout based on training mode
+        is_causal_mask = (past_kv is None) and (L > 1)
         dropout_p = self.dropout_p if self.training else 0.0
+
+        q = q.to(dtype=x.dtype)
+        k = k.to(dtype=x.dtype)
+        v = v.to(dtype=x.dtype)
 
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=is_causal_mask
@@ -305,7 +295,12 @@ class TransformerModel(TransformerPreTrainedModel):
         next_decoder_cache = [] if use_cache else None
         
         if position_ids is None:
-            past_length = past_key_values[0][0].size(-2) if past_key_values is not None else 0
+            past_length = 0
+            if past_key_values is not None:
+                for layer_past in past_key_values:
+                    if isinstance(layer_past, tuple) and layer_past is not None and len(layer_past) > 0:
+                        past_length = layer_past[0].size(-2)
+                        break
             position_ids = torch.arange(
                 past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
             ).unsqueeze(0)
@@ -427,7 +422,9 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
         for layer_past in past_key_values:
             if layer_past is None:
                 reordered_past += (None,)
-            else:
+            elif isinstance(layer_past, tuple):
                 k, v = layer_past
                 reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
+            else:
+                reordered_past += (layer_past.index_select(0, beam_idx),)
         return reordered_past

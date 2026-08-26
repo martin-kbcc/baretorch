@@ -44,7 +44,7 @@ def parse_args():
         help="Explicit vocabulary size override (if None, auto-detected from tokenizer)."
     )
     
-    # Architecture Flags
+    # Architecture Flags (Fallback if config.json is missing)
     parser.add_argument("--d_model", type=int, default=1152, help="Model hidden dimension.")
     parser.add_argument("--num_heads", type=int, default=16, help="Number of attention/mixer heads.")
     parser.add_argument("--num_layers", type=int, default=24, help="Total transformer/mixer layers.")
@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--limit", type=float, default=None, help="Sample limit per task for smoke testing.")
     
     # Execution & Precision Flags
-    parser.add_argument("--batch_size", type=int, default=16, help="Evaluation batch size.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Evaluation batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on (e.g., cuda, cpu).")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--output_file", type=str, default="benchmark_results.json", help="Path to save output JSON.")
@@ -82,7 +82,10 @@ def build_baretorch_config(args, resolved_vocab_size: int, config_file: str = No
     if config_file and os.path.exists(config_file):
         logger.info(f"Loading BareTorch configuration directly from '{config_file}'...")
         try:
-            return AutoConfig.from_pretrained(config_file)
+            cfg = AutoConfig.from_pretrained(config_file)
+            if resolved_vocab_size is not None:
+                cfg.vocab_size = resolved_vocab_size
+            return cfg
         except Exception as e:
             logger.warning(f"Failed to load via AutoConfig ({e}). Constructing BareTorchConfig manually from flags...")
 
@@ -108,7 +111,7 @@ def build_baretorch_config(args, resolved_vocab_size: int, config_file: str = No
 
 
 def load_baretorch_model(args, resolved_vocab_size: int, device: str, dtype: torch.dtype):
-    """Loads model from directory or state_dict file using CLI-specified parameter flags."""
+    """Loads model cleanly from checkpoint directory or PyTorch state_dict file."""
     checkpoint_path = args.checkpoint_path
     logger.info(f"Loading BareTorch model from checkpoint: '{checkpoint_path}'")
     
@@ -121,10 +124,9 @@ def load_baretorch_model(args, resolved_vocab_size: int, device: str, dtype: tor
             )
             logger.info("Successfully loaded model via AutoModelForCausalLM.")
         except Exception as e:
-            logger.warning(f"AutoModel load failed ({e}). Falling back to manual BareTorchForCausalLM load...")
+            logger.warning(f"AutoModel load failed ({e}). Falling back to BareTorchForCausalLM load...")
             config_file = os.path.join(checkpoint_path, "config.json")
             config = build_baretorch_config(args, resolved_vocab_size, config_file)
-            
             model = BareTorchForCausalLM.from_pretrained(
                 checkpoint_path, 
                 config=config, 
@@ -140,23 +142,20 @@ def load_baretorch_model(args, resolved_vocab_size: int, device: str, dtype: tor
         
         logger.info(f"Loading state dict from file '{checkpoint_path}'...")
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        
         if "model" in state_dict:
             state_dict = state_dict["model"]
         elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
 
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        if missing_keys:
-            logger.warning(f"Missing keys during load: {missing_keys[:5]} ... (total {len(missing_keys)})")
-        if unexpected_keys:
-            logger.warning(f"Unexpected keys during load: {unexpected_keys[:5]} ... (total {len(unexpected_keys)})")
-            
-        model = model.to(dtype=dtype)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"Missing keys during load: {missing[:5]}")
+        if unexpected:
+            logger.warning(f"Unexpected keys during load: {unexpected[:5]}")
     else:
         raise FileNotFoundError(f"Checkpoint path not found: '{checkpoint_path}'")
 
-    model = model.to(device).eval()
+    model = model.to(dtype=dtype).to(device).eval()
     return model
 
 
@@ -186,6 +185,7 @@ def main():
     }
     eval_dtype = dtype_map[args.dtype]
     
+    # 1. Tokenizer Setup
     tokenizer_path = args.checkpoint_path if os.path.isdir(args.checkpoint_path) else args.tokenizer_name
     logger.info(f"Loading tokenizer from: '{tokenizer_path}'")
     try:
@@ -193,20 +193,18 @@ def main():
     except Exception as e:
         logger.warning(f"Could not load tokenizer from '{tokenizer_path}' ({e}). Falling back to '{args.tokenizer_name}'.")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
-        
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        
-    # Determine vocab size: explicit CLI flag takes priority, then tokenizer property
-    if args.vocab_size is not None:
-        resolved_vocab_size = args.vocab_size
-        logger.info(f"Using explicit CLI vocab_size override: {resolved_vocab_size}")
-    else:
-        resolved_vocab_size = getattr(tokenizer, "vocab_size", 49152)
-        logger.info(f"Auto-detected vocab_size from tokenizer: {resolved_vocab_size}")
+
+    # 2. Resolve Final Vocab Size
+    resolved_vocab_size = args.vocab_size if args.vocab_size is not None else len(tokenizer)
+    logger.info(f"Target vocab_size resolved to: {resolved_vocab_size}")
     
+    # 3. Model Loading
     model = load_baretorch_model(args, resolved_vocab_size, args.device, eval_dtype)
     
+    # 4. Wrap with lm-evaluation-harness
     logger.info("Wrapping BareTorch model into lm-evaluation-harness interface...")
     lm_eval_model = HFLM(
         pretrained=model,
@@ -214,6 +212,7 @@ def main():
         batch_size=args.batch_size,
     )
     
+    # 5. Execute Evaluation
     task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
     logger.info(f"Starting evaluation across tasks: {task_list}")
     
