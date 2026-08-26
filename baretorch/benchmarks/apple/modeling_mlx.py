@@ -215,14 +215,17 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         if past_S is None:
             past_S = mx.zeros((B, H, r, d_h), dtype=x.dtype)
 
-        S_decayed = gate * past_S
+        # 1. Global read from historical state (1:1 PyTorch Alignment)
+        Y_global = R @ past_S * scaling
+
+        # 2. Local self-attention on current token
         Y_local = Q @ (mx.transpose(K, (0, 1, 3, 2)) @ V) * scaling
-        Y_global = R @ S_decayed * scaling
-        Out = Y_local + Y_global
 
+        # 3. Update state for step t+1: S_t = (gate * S_{t-1}) + (U * beta_gate)^T @ V
         S_local = mx.transpose(U * beta_gate, (0, 1, 3, 2)) @ V
-        next_S = S_decayed + S_local
+        next_S = (gate * past_S) + S_local
 
+        Out = Y_local + Y_global
         out_flat = mx.reshape(mx.transpose(Out, (0, 2, 1, 3)), (B, L, self.inner_dim))
         return self.W_out(out_flat * nn.silu(swish_raw)), next_S
 
@@ -317,8 +320,6 @@ class BareTorchForCausalLMMLX(nn.Module):
     def __call__(self, input_ids: mx.array, past_key_values: list | None = None):
         hidden_states, next_cache = self.model(input_ids, past_key_values=past_key_values)
         
-        # PREFILL SLICING OPTIMIZATION:
-        # Slice to the last token hidden state BEFORE lm_head to prevent 8.38 GB logit allocations
         if hidden_states.shape[1] > 1:
             hidden_states = hidden_states[:, -1:, :]
             
