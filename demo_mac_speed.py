@@ -25,9 +25,12 @@ def main():
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer", help="Pattern for hybrid layers")
     parser.add_argument("--ctx_len", type=int, default=32768, help="Context prefill length in tokens")
     parser.add_argument("--gen_tokens", type=int, default=60, help="Number of tokens to decode")
+    parser.add_argument("--delay", type=float, default=0.0, help="Optional delay to prevent live GPU contention")
     args = parser.parse_args()
 
-    # Load tokenizer for live token streaming
+    if args.delay > 0:
+        time.sleep(args.delay)
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
         vocab_size = getattr(tokenizer, "vocab_size", 49152)
@@ -40,33 +43,21 @@ def main():
     if args.mode == "baseline":
         print(f"\n📦 Loading Baseline Model '{args.model_id}' from MLX Hub...")
         if not HAS_MLX_LM:
-            raise ImportError("`mlx_lm` is required to run the baseline model. Install via `pip install mlx-lm`.")
+            raise ImportError("`mlx_lm` is required to run the baseline model.")
         
         model, _ = mlx_lm_load(args.model_id)
         param_count_m = count_mlx_params_m(model)
         engine_title = f"BASELINE ({args.model_id})"
     else:
-        # 1. Determine target baseline parameter count (e.g. 360M for SmolLM2-360M)
-        if HAS_MLX_LM:
-            try:
-                temp_model, _ = mlx_lm_load(args.model_id)
-                target_params_m = count_mlx_params_m(temp_model)
-                del temp_model
-            except Exception:
-                target_params_m = 360.0
-        else:
-            target_params_m = 360.0
-
-        # 2. Match BareTorch blueprint using exact benchmark_mlx math
+        target_params_m = 360.0
         print(f"\n⚙️  Matching BareTorch blueprint to ~{target_params_m:.1f}M baseline parameters...")
-        bt_config, predicted_m = find_matching_baretorch_config(
+        bt_config, _ = find_matching_baretorch_config(
             target_params_m=target_params_m,
             target_vocab_size=vocab_size,
             layer_sequence=args.layer_sequence,
             max_seq_len=max_seq_len,
         )
 
-        # 3. Instantiate matched BareTorch MLX model
         model = BareTorchForCausalLMMLX(bt_config)
         model.update(tree_map(lambda p: p.astype(mx.float16), model.parameters()))
         mx.eval(model.parameters())
@@ -79,11 +70,9 @@ def main():
     print(f"⚙️  PARAM COUNT: {param_count_m:.1f}M Params | CONTEXT: {args.ctx_len} Tokens")
     print("=" * 65 + "\n")
 
-    # Generate synthetic 32k context input
     prompt_ids = mx.random.randint(0, vocab_size, (1, args.ctx_len))
     mx.eval(prompt_ids)
 
-    # Timed Prefill Pass
     print(f"⏳ Running Prefill ({args.ctx_len} tokens)...", end="", flush=True)
     t_prefill_start = time.perf_counter()
 
@@ -95,7 +84,12 @@ def main():
         mx.eval(curr_token)
         del outputs
     else:
-        logits, cache = model(prompt_ids)
+        # JIT Compile Prefill
+        def prefill_step_bt(p):
+            return model(p)
+
+        compiled_prefill = mx.compile(prefill_step_bt)
+        logits, cache = compiled_prefill(prompt_ids)
         mx.eval(logits, cache)
         curr_token = mx.argmax(logits[:, -1:, :], axis=-1)
         mx.eval(curr_token)
@@ -105,7 +99,6 @@ def main():
 
     print("⚡ Streaming Decoded Tokens Live:\n" + "-" * 65)
 
-    # Autoregressive Token Decoding Loop
     t_dec_start = time.perf_counter()
 
     if args.mode == "baseline":
@@ -125,8 +118,6 @@ def main():
             return next_tok, next_cache
 
         compiled_step = mx.compile(decode_step_bt)
-        
-        # JIT Warmup step
         curr_token, cache = compiled_step(curr_token, cache)
         mx.eval(curr_token, cache)
 

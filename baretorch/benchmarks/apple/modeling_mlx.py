@@ -157,7 +157,8 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         causal_mask = mx.reshape(causal_mask, (1, 1, 1, C, C))
 
         diff = Lambda - mx.transpose(Lambda, (0, 1, 2, 4, 3))
-        M_links = mx.exp(mx.where(causal_mask, diff, -1e9))
+        # FP16 Safe Masking (-1e4 instead of -1e9)
+        M_links = mx.exp(mx.where(causal_mask, diff, -1e4))
 
         scaling = 1.0 / math.sqrt(d_h)
         Y_local = (Q @ mx.transpose(K, (0, 1, 2, 4, 3))) * scaling * M_links @ V
@@ -169,7 +170,8 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         c_indices = mx.arange(N)
         causal_mask_chunks = c_indices[:, None] > c_indices[None, :]
         causal_mask_chunks = mx.reshape(causal_mask_chunks, (1, 1, N, N))
-        M_chunks = mx.exp(mx.where(causal_mask_chunks, log_M_chunks, -1e9))
+        # FP16 Safe Masking (-1e4 instead of -1e9)
+        M_chunks = mx.exp(mx.where(causal_mask_chunks, log_M_chunks, -1e4))
 
         U_decayed = (U * beta_gate) * (exp_Lambda[:, :, :, -1:, :] / mx.maximum(exp_Lambda, 1e-6))
         S_historical_flat = M_chunks @ mx.reshape(mx.transpose(U_decayed, (0, 1, 2, 4, 3)) @ V, (B, H, N, r * d_h))
@@ -215,13 +217,13 @@ class FusedLowRankAssociativeDeltaEngine(nn.Module):
         if past_S is None:
             past_S = mx.zeros((B, H, r, d_h), dtype=x.dtype)
 
-        # 1. Global read from historical state (1:1 PyTorch Alignment)
+        # 1. Global read from historical state
         Y_global = R @ past_S * scaling
 
         # 2. Local self-attention on current token
         Y_local = Q @ (mx.transpose(K, (0, 1, 3, 2)) @ V) * scaling
 
-        # 3. Update state for step t+1: S_t = (gate * S_{t-1}) + (U * beta_gate)^T @ V
+        # 3. Update state for step t+1
         S_local = mx.transpose(U * beta_gate, (0, 1, 3, 2)) @ V
         next_S = (gate * past_S) + S_local
 

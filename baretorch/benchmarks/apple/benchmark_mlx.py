@@ -22,7 +22,6 @@ except ImportError:
 
 
 def clear_memory():
-    """Flushes Python garbage collection and clears MLX cache/memory stats."""
     gc.collect()
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
@@ -31,14 +30,12 @@ def clear_memory():
 
 
 def get_peak_vram_mb() -> float:
-    """Returns peak Metal GPU memory allocation in MB."""
     if hasattr(mx, "get_peak_memory"):
         return mx.get_peak_memory() / (1024.0 ** 2)
     return 0.0
 
 
 def count_mlx_params_m(model: nn.Module) -> float:
-    """Counts actual instantiated parameters in an unquantized MLX module tree."""
     def _count(tree):
         total = 0
         if isinstance(tree, dict):
@@ -54,7 +51,6 @@ def count_mlx_params_m(model: nn.Module) -> float:
 
 
 def apply_quantization(model: nn.Module, bits: int = 4, group_size: int = 64) -> nn.Module:
-    """Quantizes an MLX Module tree in-place using MLX's native nn.quantize API."""
     if bits in [4, 8]:
         nn.quantize(model, group_size=group_size, bits=bits)
     return model
@@ -68,7 +64,6 @@ def count_baretorch_params_fast(
     rank: int = 8,
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer"
 ) -> float:
-    """Exact BareTorch parameter math matching instantiated MLX modules."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
     full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(num_layers)]
 
@@ -103,7 +98,6 @@ def find_matching_baretorch_config(
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     max_seq_len: int = 32768
 ) -> tuple[BareTorchConfig, float]:
-    """Matches target model size restricting head_dim to [64, 128] for Metal FlashAttention."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
 
     best_cfg = None
@@ -152,7 +146,7 @@ def find_matching_baretorch_config(
                     )
 
     div_pct = (best_diff / target_params_m) * 100
-    print(f"  ⚡ MLX Vocab-Aware Match completed (|Δ| = {best_diff:.2f}M, {div_pct:.2f}%)")
+    print(f"   ⚡ MLX Vocab-Aware Match completed (|Δ| = {best_diff:.2f}M, {div_pct:.2f}%)")
     return best_cfg, best_params_m
 
 
@@ -168,7 +162,7 @@ def benchmark_mlx_model(
 
     try:
         if is_mlx_lm:
-            # Warmup
+            # Baseline Warmup
             w_cache = make_prompt_cache(model)
             w_out = model(prompt, cache=w_cache)
             mx.eval(w_out)
@@ -185,7 +179,6 @@ def benchmark_mlx_model(
             curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
             mx.eval(curr_token)
 
-            # Free prefill output buffer before decode timing
             del outputs
             clear_memory()
 
@@ -198,26 +191,31 @@ def benchmark_mlx_model(
             decode_sec = max(time.perf_counter() - gen_start, 1e-5)
             decode_vram_mb = get_peak_vram_mb()
         else:
+            # JIT Compile Prefill Function
+            def prefill_step_bt(p):
+                return model(p)
+
+            compiled_prefill = mx.compile(prefill_step_bt)
+
             # Warmup
-            w_out, w_cache = model(prompt)
+            w_out, w_cache = compiled_prefill(prompt)
             mx.eval(w_out, w_cache)
             del w_out, w_cache
             clear_memory()
 
             # Timed Prefill
             ttft_start = time.perf_counter()
-            outputs, past_key_values = model(prompt)
+            outputs, past_key_values = compiled_prefill(prompt)
             mx.eval(outputs, past_key_values)
             ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
 
             curr_token = mx.argmax(outputs[:, -1:, :], axis=-1)
             mx.eval(curr_token)
 
-            # Free prefill output buffer before decode timing
             del outputs
             clear_memory()
 
-            # Compile step generation loop with MLX JIT
+            # JIT Compile Decode Step
             def decode_step_bt(tok, p_kv):
                 logits, n_kv = model(tok, past_key_values=p_kv)
                 next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -225,11 +223,10 @@ def benchmark_mlx_model(
 
             compiled_step = mx.compile(decode_step_bt)
 
-            # JIT Graph Warmup step
+            # Warmup Decode Step
             dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
             mx.eval(dummy_tok, past_key_values)
 
-            # Reset peak memory tracker right before generation loop timer
             if hasattr(mx, "reset_peak_memory"):
                 mx.reset_peak_memory()
 
@@ -355,18 +352,18 @@ def main():
 
         if HAS_MLX_LM:
             try:
-                print(f"  • Loading Baseline from MLX/HF Hub...")
+                print(f"   • Loading Baseline from MLX/HF Hub...")
                 hf_model, _ = mlx_lm_load(model_id)
 
                 hf_params_m = count_mlx_params_m(hf_model)
-                print(f"  • Baseline Parameters (Full Precision): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
+                print(f"   • Baseline Parameters (Full Precision): {hf_params_m:.2f}M params (vocab_size={vocab_size})")
 
                 if args.quantize:
-                    print(f"  ⚡ Quantizing Baseline MLX model to INT{args.quantize} (group_size={args.group_size})...")
+                    print(f"   ⚡ Quantizing Baseline MLX model to INT{args.quantize} (group_size={args.group_size})...")
                     hf_model = apply_quantization(hf_model, bits=args.quantize, group_size=args.group_size)
 
                 for ctx in args.prompt_lens:
-                    print(f"  ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
+                    print(f"   ├─ Benchmarking Baseline @ Context: {ctx:<5} tokens...", end="", flush=True)
                     res = benchmark_mlx_model(hf_model, ctx, args.gen_len, vocab_size, is_mlx_lm=True)
                     hf_runs.append(res)
                     print(f" ✅ (TTFT: {format_cell(res['ttft_ms'])} ms | Decode: {format_cell(res['tokens_per_sec'])} tok/s | VRAM: {format_cell(res['decode_vram_mb'])} MB)")
@@ -379,7 +376,7 @@ def main():
         if hf_params_m == 0.0:
             hf_params_m = 1237.0
 
-        print(f"\n  ⚙️ Looking up BareTorch MLX blueprint matching ~{hf_params_m:.2f}M parameters...")
+        print(f"\n   ⚙️ Looking up BareTorch MLX blueprint matching ~{hf_params_m:.2f}M parameters...")
         bt_config, bt_params_m_predicted = find_matching_baretorch_config(
             target_params_m=hf_params_m,
             target_vocab_size=vocab_size,
@@ -388,19 +385,18 @@ def main():
         )
 
         bt_model = BareTorchForCausalLMMLX(bt_config)
-        # Cast parameters to FP16 natively using MLX tree_map
         bt_model.update(tree_map(lambda p: p.astype(mx.float16), bt_model.parameters()))
         actual_bt_params_m = count_mlx_params_m(bt_model)
 
         if args.quantize:
-            print(f"  ⚡ Quantizing BareTorch MLX model to INT{args.quantize} (group_size={args.group_size})...")
+            print(f"   ⚡ Quantizing BareTorch MLX model to INT{args.quantize} (group_size={args.group_size})...")
             bt_model = apply_quantization(bt_model, bits=args.quantize, group_size=args.group_size)
 
-        print(f"  🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
+        print(f"   🎯 Target Params: {hf_params_m:.2f}M | Predicted Math: {bt_params_m_predicted:.2f}M | Actual MLX Instantiated: {actual_bt_params_m:.2f}M (Δ = {abs(actual_bt_params_m - hf_params_m):.2f}M)")
         print(f"     Config: d_model={bt_config.d_model}, num_layers={bt_config.num_layers}, num_heads={bt_config.num_heads}, head_dim={bt_config.d_model // bt_config.num_heads}")
 
         for ctx in args.prompt_lens:
-            print(f"  ├─ Benchmarking BareTorch @ Context: {ctx:<5} tokens...", end="", flush=True)
+            print(f"   ├─ Benchmarking BareTorch @ Context: {ctx:<5} tokens...", end="", flush=True)
             res = benchmark_mlx_model(bt_model, ctx, args.gen_len, vocab_size, is_mlx_lm=False)
             bt_runs.append(res)
             print(f" ✅ (TTFT: {format_cell(res['ttft_ms'])} ms | Decode: {format_cell(res['tokens_per_sec'])} tok/s | VRAM: {format_cell(res['decode_vram_mb'])} MB)")
