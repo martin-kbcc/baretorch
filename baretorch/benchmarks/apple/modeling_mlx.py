@@ -4,39 +4,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-class MLXKVCache:
-    """Pre-allocated contiguous KV-cache buffer to prevent MLX graph re-compilation."""
-    def __init__(self):
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def update_and_fetch(self, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
-        if self.keys is None:
-            self.keys = k
-            self.values = v
-            self.offset = k.shape[-2]
-            return self.keys, self.values
-
-        B, H, L, D = k.shape
-        needed_cap = self.offset + L
-
-        if needed_cap > self.keys.shape[-2]:
-            new_cap = max(self.keys.shape[-2] * 2, needed_cap + 1024)
-            new_k = mx.zeros((B, H, new_cap, D), dtype=k.dtype)
-            new_v = mx.zeros((B, H, new_cap, D), dtype=v.dtype)
-            
-            new_k[:, :, :self.offset, :] = self.keys[:, :, :self.offset, :]
-            new_v[:, :, :self.offset, :] = self.values[:, :, :self.offset, :]
-            self.keys = new_k
-            self.values = new_v
-
-        self.keys[:, :, self.offset:self.offset + L, :] = k
-        self.values[:, :, self.offset:self.offset + L, :] = v
-        self.offset += L
-        return self.keys[:, :, :self.offset, :], self.values[:, :, :self.offset, :]
-
-
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
@@ -96,28 +63,36 @@ class CausalSelfAttention(nn.Module):
         self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len)
         self.W_out = nn.Linear(d_model, d_model, bias=False)
 
-    def __call__(self, x: mx.array, past_kv: MLXKVCache | None = None, position_ids: mx.array | None = None):
+    def __call__(self, x: mx.array, past_kv: tuple | None = None, position_ids: mx.array | None = None):
         B, L, D = x.shape
         H_q, H_kv, d_h = self.num_heads, self.num_kv_heads, self.head_dim
 
-        if past_kv is None:
-            past_kv = MLXKVCache()
+        if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
+            past_len = past_kv[0].shape[-2]
+        else:
+            past_len = 0
 
-        position_ids = mx.arange(past_kv.offset, past_kv.offset + L)[None, :]
+        if position_ids is None:
+            position_ids = mx.arange(past_len, past_len + L)[None, :]
 
         q = mx.transpose(mx.reshape(self.W_q(x), (B, L, H_q, d_h)), (0, 2, 1, 3))
         k = mx.transpose(mx.reshape(self.W_k(x), (B, L, H_kv, d_h)), (0, 2, 1, 3))
         v = mx.transpose(mx.reshape(self.W_v(x), (B, L, H_kv, d_h)), (0, 2, 1, 3))
 
         q, k = self.rope.apply_rope(q, k, position_ids)
-        k_full, v_full = past_kv.update_and_fetch(k, v)
+
+        if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) == 2:
+            pk, pv = past_kv
+            k = mx.concatenate([pk, k], axis=-2)
+            v = mx.concatenate([pv, v], axis=-2)
+        current_kv = (k, v)
 
         scale = 1.0 / math.sqrt(d_h)
-        mask_arg = "causal" if (past_kv.offset == L and L > 1) else None
+        mask_arg = "causal" if (past_kv is None and L > 1) else None
 
-        out = mx.fast.scaled_dot_product_attention(q, k_full, v_full, scale=scale, mask=mask_arg)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask_arg)
         out_flat = mx.reshape(mx.transpose(out, (0, 2, 1, 3)), (B, L, D))
-        return self.W_out(out_flat), past_kv
+        return self.W_out(out_flat), current_kv
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -128,8 +103,8 @@ class TransformerDecoderBlock(nn.Module):
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5))
 
-    def __call__(self, x: mx.array, past_kv: MLXKVCache | None = None):
-        attn_out, current_kv = self.attn(self.ln1(x), past_kv=past_kv)
+    def __call__(self, x: mx.array, past_kv: tuple | None = None, position_ids: mx.array | None = None):
+        attn_out, current_kv = self.attn(self.ln1(x), past_kv=past_kv, position_ids=position_ids)
         x_out = x + attn_out
         x_out = x_out + self.mlp(self.ln2(x_out))
         return x_out, current_kv

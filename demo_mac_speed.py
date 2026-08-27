@@ -1,4 +1,4 @@
-# /home/martinkb/Desktop/BareTorch_F/demo_mac_speed.py
+# /Users/martinkovacevic/Desktop/baretorch/demo_mac_speed.py
 import sys
 import time
 import gc
@@ -50,7 +50,6 @@ def main():
         param_count_m = count_mlx_params_m(model)
         engine_title = f"BASELINE ({args.model_id})"
     else:
-        # Dynamically inspect target baseline parameter count
         if HAS_MLX_LM:
             try:
                 print(f"🔍 Inspecting baseline model '{args.model_id}' to match parameter count...")
