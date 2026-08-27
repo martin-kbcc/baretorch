@@ -4,8 +4,8 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-BareTorch-yellow)](https://huggingface.co/)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](paper.pdf)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20Rampage-yellow)](https://huggingface.co/model-rampage)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://github.com/martin-kbcc/baretorch-experiments/blob/main/paper.pdf)
 
 **BareTorch** is an open-source development ecosystem and model framework built on a **pure GEMM-compliant, kernel-free paradigm**. 
 
@@ -65,24 +65,36 @@ Inference metrics evaluated at strict parameter parity against open-source basel
 ### 1. Installation
 
 ```bash
-git clone [https://github.com/your-org/BareTorch.git](https://github.com/your-org/BareTorch.git)
-cd BareTorch
+git clone [https://github.com/martin-kbcc/baretorch.git](https://github.com/martin-kbcc/baretorch.git)
+cd baretorch
 pip install -e .
 ```
 
-### 2. Hugging Face Integration
+### 2. Pre-Training & Supervised Fine-Tuning
+
+Launch distributed training directly using our pre-configured cloud orchestrators:
+
+```bash
+# 500M Parameter Pre-Training Runway (4x H100)
+bash cloud_runs_0.5B/launch_lrad_hybrid.sh
+
+# 500M Parameter Supervised Fine-Tuning (2x RTX 4090)
+bash cloud_runs_0.5B/launch_lrad_hybrid_sft.sh
+```
+
+### 3. Hugging Face Integration
 
 BareTorch integrates directly with Hugging Face `transformers` out of the box:
 
 ```python
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
 
-# Load model natively via BareTorch AutoModel classes
-config = BareTorchConfig.from_pretrained("baretorch/baretorch-500m-sft")
-model = BareTorchForCausalLM.from_pretrained("baretorch/baretorch-500m-sft", torch_dtype=torch.bfloat16).cuda()
+# Load model natively via BareTorch AutoModel classes from model-rampage org
+config = BareTorchConfig.from_pretrained("model-rampage/baretorch-500m-sft")
+model = BareTorchForCausalLM.from_pretrained("model-rampage/baretorch-500m-sft", torch_dtype=torch.bfloat16).cuda()
 tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M")
 
 prompt = "<|user|>\nWhat makes pure-GEMM architectures fast on long context?<|end|>\n<|assistant|>\n"
@@ -92,16 +104,13 @@ outputs = model.generate(**inputs, max_new_tokens=100)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-### 3. Live Terminal Speed Benchmark
-
-Compare BareTorch side-by-side against standard baseline engines:
+### 4. Benchmarking
 
 ```bash
-# Discrete NVIDIA GPU Run
-PYTHONPATH=. python demo_speed.py --mode baretorch --model_id HuggingFaceTB/SmolLM2-1.7B --ctx_len 32768
-
-# Native Apple Silicon MLX Run
-PYTHONPATH=. python baretorch/benchmarks/apple/benchmark_mlx.py --hf_model_ids HuggingFaceTB/SmolLM2-1.7B --prompt_lens 32768
+# Apple Silicon MLX Multi-Model Suite Evaluation
+PYTHONPATH=. python baretorch/benchmarks/apple/benchmark_mlx.py \
+  --hf_model_ids HuggingFaceTB/SmolLM2-1.7B meta-llama/Llama-3.2-1B Qwen/Qwen3-0.6B \
+  --prompt_lens 512 1024 2048 4096 8192 16384 32768
 ```
 
 ---
@@ -128,17 +137,17 @@ torchrun --nproc_per_node=4 train.py \
 ## 📂 Codebase Organization
 
 ```text
-├── baretorch/                     # Core production framework package
-│   ├── modeling/                  # Pure-GEMM sequence mixers (CS-LRAD, Transformer)
-│   ├── integration/               # Hugging Face Config & Model wrappers
+.
+├── baretorch/                      # Core production framework package
+│   ├── modeling/                   # Pure-GEMM sequence mixers (cs_lrad.py, cs_ttt.py, transformer.py)
+│   ├── integration/                # Hugging Face integration wrappers (configuration_baretorch.py, modeling_baretorch.py)
 │   └── benchmarks/
-│       ├── apple/                 # Native Apple Silicon MLX benchmark suite & modeling
-│       └── nvidia/                # Discrete CUDA PyTorch benchmark suite
-├── cloud_runs_0.5B/               # H100 Cluster & RTX 4090 launch scripts (Pretraining + SFT)
-├── demo_speed.py                  # Live CUDA terminal speed demonstration script
-├── demo_mac_speed.py              # Live Apple Silicon MLX terminal demonstration script
-├── paper.tex                      # Complete academic whitepaper LaTeX source
-└── paper.pdf                      # Compiled academic report
+│       └── apple/                  # Native Apple Silicon MLX suite (modeling_mlx.py, benchmark_mlx.py)
+├── cloud_runs_0.5B/                # Production launch orchestrators
+│   ├── launch_lrad_hybrid.sh       # 500M Foundational Pre-training script (4x H100)
+│   └── launch_lrad_hybrid_sft.sh   # 500M SFT Instruction Tuning script (2x RTX 4090)
+├── train.py                        # Main DDP pre-training script
+└── train_sft.py                    # Main Supervised Fine-Tuning script
 ```
 
 ---
