@@ -7,7 +7,7 @@ import gc
 import argparse
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_map, tree_flatten
 from transformers import AutoTokenizer
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
@@ -22,35 +22,35 @@ except ImportError:
 
 
 def clear_memory():
+    """Flushes Python garbage collection and clears MLX cache/memory stats safely."""
     gc.collect()
-    if hasattr(mx, "clear_cache"):
+    if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+        mx.metal.clear_cache()
+    elif hasattr(mx, "clear_cache"):
         mx.clear_cache()
-    if hasattr(mx, "reset_peak_memory"):
+
+    if hasattr(mx, "metal") and hasattr(mx.metal, "reset_peak_memory"):
+        mx.metal.reset_peak_memory()
+    elif hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
 
 
 def get_peak_vram_mb() -> float:
-    if hasattr(mx, "get_peak_memory"):
+    """Returns peak Metal GPU memory allocation in MB across all MLX versions."""
+    if hasattr(mx, "metal") and hasattr(mx.metal, "get_peak_memory"):
+        return mx.metal.get_peak_memory() / (1024.0 ** 2)
+    elif hasattr(mx, "get_peak_memory"):
         return mx.get_peak_memory() / (1024.0 ** 2)
     return 0.0
 
 
 def count_mlx_params_m(model: nn.Module) -> float:
-    def _count(tree):
-        total = 0
-        if isinstance(tree, dict):
-            for v in tree.values():
-                total += _count(v)
-        elif isinstance(tree, list):
-            for v in tree:
-                total += _count(v)
-        elif hasattr(tree, "size"):
-            total += tree.size
-        return total
-    return _count(model.parameters()) / 1e6
+    """Counts actual instantiated parameters using native MLX tree_flatten."""
+    return sum(v.size for _, v in tree_flatten(model.parameters())) / 1e6
 
 
 def apply_quantization(model: nn.Module, bits: int = 4, group_size: int = 64) -> nn.Module:
+    """Quantizes an MLX Module tree in-place using MLX's native nn.quantize API."""
     if bits in [4, 8]:
         nn.quantize(model, group_size=group_size, bits=bits)
     return model
@@ -64,6 +64,7 @@ def count_baretorch_params_fast(
     rank: int = 8,
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer"
 ) -> float:
+    """Exact BareTorch parameter math matching instantiated MLX modules."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
     full_layer_types = [raw_seq[i % len(raw_seq)] for i in range(num_layers)]
 
@@ -98,6 +99,7 @@ def find_matching_baretorch_config(
     layer_sequence: str = "cs_lrad,cs_lrad,cs_lrad,transformer",
     max_seq_len: int = 32768
 ) -> tuple[BareTorchConfig, float]:
+    """Matches target model size restricting head_dim to [64, 128] for Metal FlashAttention."""
     raw_seq = [s.strip().lower() for s in layer_sequence.split(",") if s.strip()]
 
     best_cfg = None
@@ -145,7 +147,7 @@ def find_matching_baretorch_config(
                         layer_types=full_layer_types
                     )
 
-    div_pct = (best_diff / target_params_m) * 100
+    div_pct = (best_diff / target_params_m) * 100 if target_params_m > 0 else 0.0
     print(f"   ⚡ MLX Vocab-Aware Match completed (|Δ| = {best_diff:.2f}M, {div_pct:.2f}%)")
     return best_cfg, best_params_m
 
@@ -191,13 +193,13 @@ def benchmark_mlx_model(
             decode_sec = max(time.perf_counter() - gen_start, 1e-5)
             decode_vram_mb = get_peak_vram_mb()
         else:
-            # JIT Compile Prefill Function
+            # JIT Compile Prefill Function for static shape prompt
             def prefill_step_bt(p):
                 return model(p)
 
             compiled_prefill = mx.compile(prefill_step_bt)
 
-            # Warmup
+            # Warmup Prefill
             w_out, w_cache = compiled_prefill(prompt)
             mx.eval(w_out, w_cache)
             del w_out, w_cache
@@ -215,24 +217,13 @@ def benchmark_mlx_model(
             del outputs
             clear_memory()
 
-            # JIT Compile Decode Step
-            def decode_step_bt(tok, p_kv):
-                logits, n_kv = model(tok, past_key_values=p_kv)
-                next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-                return next_tok, n_kv
-
-            compiled_step = mx.compile(decode_step_bt)
-
-            # Warmup Decode Step
-            dummy_tok, past_key_values = compiled_step(curr_token, past_key_values)
-            mx.eval(dummy_tok, past_key_values)
-
-            if hasattr(mx, "reset_peak_memory"):
-                mx.reset_peak_memory()
+            clear_memory()
 
             gen_start = time.perf_counter()
+            # Imperative single-step execution avoids JIT re-compilation on growing Transformer KV-cache
             for _ in range(gen_len):
-                curr_token, past_key_values = compiled_step(curr_token, past_key_values)
+                logits, past_key_values = model(curr_token, past_key_values=past_key_values)
+                curr_token = mx.argmax(logits[:, -1:, :], axis=-1)
                 mx.eval(curr_token, past_key_values)
 
             decode_sec = max(time.perf_counter() - gen_start, 1e-5)
