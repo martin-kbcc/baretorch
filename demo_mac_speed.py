@@ -1,6 +1,7 @@
-# /Users/martinkovacevic/Desktop/baretorch/demo_mac_speed.py
+# /home/martinkb/Desktop/BareTorch_F/demo_mac_speed.py
 import sys
 import time
+import gc
 import argparse
 import mlx.core as mx
 from mlx.utils import tree_map
@@ -49,7 +50,22 @@ def main():
         param_count_m = count_mlx_params_m(model)
         engine_title = f"BASELINE ({args.model_id})"
     else:
-        target_params_m = 360.0
+        # Dynamically inspect target baseline parameter count
+        if HAS_MLX_LM:
+            try:
+                print(f"🔍 Inspecting baseline model '{args.model_id}' to match parameter count...")
+                temp_model, _ = mlx_lm_load(args.model_id)
+                target_params_m = count_mlx_params_m(temp_model)
+                del temp_model
+                gc.collect()
+                if hasattr(mx, "clear_cache"):
+                    mx.clear_cache()
+            except Exception as e:
+                print(f"⚠️ Could not load baseline '{args.model_id}' ({e}). Defaulting to 360.0M.")
+                target_params_m = 360.0
+        else:
+            target_params_m = 360.0
+
         print(f"\n⚙️  Matching BareTorch blueprint to ~{target_params_m:.1f}M baseline parameters...")
         bt_config, _ = find_matching_baretorch_config(
             target_params_m=target_params_m,
@@ -63,7 +79,7 @@ def main():
         mx.eval(model.parameters())
         
         param_count_m = count_mlx_params_m(model)
-        engine_title = "BARETORCH CS-LRAD (PURE GEMM)"
+        engine_title = f"BARETORCH CS-LRAD (MATCHING {args.model_id})"
 
     print("\n" + "=" * 65)
     print(f"🚀 ENGINE: {engine_title}")
@@ -84,7 +100,6 @@ def main():
         mx.eval(curr_token)
         del outputs
     else:
-        # JIT Compile Prefill
         def prefill_step_bt(p):
             return model(p)
 
