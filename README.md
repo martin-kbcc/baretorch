@@ -1,86 +1,163 @@
 # BareTorch 🐻🔥
 
-> **Enterprise-Grade, Zero-Kernel Sub-Quadratic Sequence Mixing Framework**
+> **Kernel-Free, Pure GEMM Sub-Quadratic Sequence Architecture for Universal Hardware**
 
-BareTorch is a high-performance, cluster-scale language model framework built entirely under a **pure GEMM-compliant, kernel-free paradigm**[cite: 1]. 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-BareTorch-yellow)](https://huggingface.co/)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](paper.pdf)
 
-By structuring sub-quadratic recurrence into block-parallel chunk segments, BareTorch maps sequential historical state updates directly to optimized BLAS/GEMM routines natively accelerated by all modern hardware backends[cite: 1]. This completely bypasses the compilation and portability lock-in of custom CUDA or Triton kernels, enabling linear $O(N)$ execution scaling natively on arbitrary accelerators (e.g., TPUs, WebGPU, Apple Silicon, or commodity edge devices)[cite: 1].
+**BareTorch** is an open-source development ecosystem and model framework built on a **pure GEMM-compliant, kernel-free paradigm**. 
 
-This repository houses the production core of the BareTorch framework, featuring dynamic hybrid sequencing, gradient checkpointing, and PyTorch compilation integration for scaling up to billions of parameters.
-
-For our historical research diary, baseline comparison files, and proof-of-concept benchmarks, visit the [BareTorch Research Playground](https://github.com/martin-kbcc/baretorch-experiments).
-
----
-
-## 🛠️ Getting Started
-
-### 1. Environment Setup
-We recommend setting up a clean virtual environment using Miniconda:
-
-```bash
-conda create -n baretorch python=3.11 -y
-conda activate baretorch
-pip install torch transformers datasets tensorboard
-```
-
-### 2. Local Pre-training Test
-To verify the framework compiles and trains cleanly on your local workstation, execute our verified hybrid configuration script:
-
-```bash
-bash launch_lrad_hybrid_local.sh
-```
-
-### 3. Scaling to Multi-GPU Cluster (8x H100)
-To launch multi-node or multi-GPU distributed data-parallel pretraining, run our cluster-optimized script:
-
-```bash
-bash launch_lrad_hybrid_cluster.sh
-```
+By structuring sub-quadratic recurrence into block-parallel chunk segments, BareTorch maps sequential historical state updates directly to optimized BLAS/GEMM matrix multiplications natively accelerated by all modern hardware backends. This completely bypasses the compilation and hardware lock-in of custom CUDA or Triton kernels, enabling linear $O(N)$ memory and execution scaling natively across arbitrary accelerators (e.g., NVIDIA CUDA, Apple Silicon MLX, WebGPU, and TPUs).
 
 ---
 
-## 🧩 Designing Custom Architectures Natively
+## 🚀 Key Achievements & Highlights
 
-BareTorch is designed for research agility. Rather than modifying Python files, you can define entirely custom, deep sub-quadratic configurations directly from your bash launcher scripts.
+* **100B Token Foundational Scale-Up:** Pre-trained a **~500M parameter hybrid model** on 100 Billion tokens across $4\times$ NVIDIA H100 GPUs ($2.2690$ final evaluation loss).
+* **Supervised Instruction Tuning (SFT):** Post-trained on `smol-smoltalk` ($2\times$ RTX 4090 GPUs), unlocking massive reasoning leaps: **52.52% HellaSwag Acc-Norm**, **59.18% ARC-Easy**, and **35.41% ARC-Challenge**.
+* **44.98x Faster Apple Silicon MLX Decoding:** At 32,768 context length on an M1 MacBook Pro, BareTorch streams at **29.69 tok/s** while standard MLX chokes at **0.66 tok/s**.
+* **12.51x Faster CUDA Decoding:** Reaches **164.49 tok/s** at 32k context on a single NVIDIA RTX 4090 (vs. **13.15 tok/s** baseline).
+* **Up to 80.6% VRAM Reduction & Zero OOM Crashes:** Replaces linear KV-cache growth with a constant $O(1)$ state update, running long-context generation seamlessly where baselines crash with Out-Of-Memory errors.
 
-Simply supply a comma-separated list of layer targets to `--layer_sequence` and scale `--num_layers`. The framework will dynamically assemble and tile the network blocks:
+---
+
+## 📊 500M Foundational Model Benchmarks
+
+Our flagship **BareTorch 500M 3:1 Hybrid** ($3 \times \text{CS-LRAD} \to 1 \times \text{Transformer}$) was evaluated across standard downstream reasoning tasks before and after Supervised Fine-Tuning (SFT):
+
+| Benchmark Task | Metric | Base (100B Tokens) | SFT (SmolTalk) | Gain |
+| :--- | :---: | :---: | :---: | :---: |
+| **HellaSwag** | Acc / Acc-Norm | 34.84% / 43.69% | 41.31% / **52.52%** | **+8.83%** |
+| **ARC-Easy** | Acc / Acc-Norm | 56.19% / 53.58% | 66.58% / **59.18%** | **+5.60%** |
+| **ARC-Challenge** | Acc / Acc-Norm | 26.11% / 28.92% | 33.70% / **35.41%** | **+6.49%** |
+| **WinoGrande** | Acc | 51.30% | **55.80%** | **+4.50%** |
+| **MMLU (Overall)** | Acc | 24.70% | **25.57%** | **+0.87%** |
+
+---
+
+## ⚡ Empirical Long-Context Inference Scaling (32k Context)
+
+Inference metrics evaluated at strict parameter parity against open-source baselines across context windows from $512 \to 32,768$ tokens:
+
+### 1. Discrete CUDA GPU (NVIDIA RTX 4090 - 24GB)
+
+| Model Pair | Context ($L$) | Prefill Latency (ms) | Local GPU Decode | Peak VRAM |
+| :--- | :---: | :---: | :---: | :---: |
+| **Qwen3 0.6B Match** | 32,768 | **314.89 ms** vs 4,343.26 ms | **164.49 tok/s** vs 13.15 tok/s (**12.51x**) | **1.66 GB** vs 8.58 GB (**-80.6%**) |
+| **SmolLM2 1.7B Match** | 32,768 | **1,134.20 ms** vs 4,292.54 ms | **98.92 tok/s** vs 15.79 tok/s (**6.26x**) | **4.39 GB** vs 15.57 GB (**-71.8%**) |
+| **Llama 3.2 1B Match** | 32,768 | **598.36 ms** vs 2,960.03 ms | **169.24 tok/s** vs 24.44 tok/s (**6.92x**) | **3.02 GB** vs 4.67 GB (**-35.4%**) |
+| **Gemma 2 2B Match** | 32,768 | **1,049.72 ms** (Baseline: 💥 OOM) | **101.51 tok/s** (Baseline: 💥 OOM) | **5.96 GB** (Baseline: 💥 OOM) |
+
+### 2. Apple Silicon Unified Memory (M1 MacBook Pro 16GB - Native MLX)
+
+| Model Pair | Context ($L$) | Prefill Latency (ms) | Local GPU Decode | Peak VRAM |
+| :--- | :---: | :---: | :---: | :---: |
+| **SmolLM2 1.7B Match** | 32,768 | **29.56 s** vs 59.03 s | **29.69 tok/s** vs 0.66 tok/s (**44.98x**) | **3.78 GB** vs 9.97 GB (**-62.1%**) |
+| **Llama 3.2 1B Match** | 32,768 | **18.69 s** vs 41.06 s | **28.42 tok/s** vs 3.29 tok/s (**8.64x**) | **2.81 GB** vs 3.71 GB (**-24.4%**) |
+| **Qwen3 0.6B Match** | 32,768 | **7.06 s** (Baseline: 💥 OOM) | **79.55 tok/s** (Baseline: 💥 OOM) | **1.37 GB** (Baseline: 💥 OOM) |
+
+---
+
+## 🛠️ Quickstart & Usage
+
+### 1. Installation
 
 ```bash
-# Launch an advanced model combining CS-LRAD, CS-TTT, and Attention
-torchrun --nproc_per_node=2 train.py \
+git clone [https://github.com/your-org/BareTorch.git](https://github.com/your-org/BareTorch.git)
+cd BareTorch
+pip install -e .
+```
+
+### 2. Hugging Face Integration
+
+BareTorch integrates directly with Hugging Face `transformers` out of the box:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from baretorch.integration.configuration_baretorch import BareTorchConfig
+from baretorch.integration.modeling_baretorch import BareTorchForCausalLM
+
+# Load model natively via BareTorch AutoModel classes
+config = BareTorchConfig.from_pretrained("baretorch/baretorch-500m-sft")
+model = BareTorchForCausalLM.from_pretrained("baretorch/baretorch-500m-sft", torch_dtype=torch.bfloat16).cuda()
+tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M")
+
+prompt = "<|user|>\nWhat makes pure-GEMM architectures fast on long context?<|end|>\n<|assistant|>\n"
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+outputs = model.generate(**inputs, max_new_tokens=100)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+### 3. Live Terminal Speed Benchmark
+
+Compare BareTorch side-by-side against standard baseline engines:
+
+```bash
+# Discrete NVIDIA GPU Run
+PYTHONPATH=. python demo_speed.py --mode baretorch --model_id HuggingFaceTB/SmolLM2-1.7B --ctx_len 32768
+
+# Native Apple Silicon MLX Run
+PYTHONPATH=. python baretorch/benchmarks/apple/benchmark_mlx.py --hf_model_ids HuggingFaceTB/SmolLM2-1.7B --prompt_lens 32768
+```
+
+---
+
+## 🧩 Designing Custom Hybrid Architectures
+
+Define sub-quadratic sequence mixing topologies directly from CLI or bash launchers using layer sequences:
+
+```bash
+# Launch dynamic DDP pre-training with 3:1 CS-LRAD to Transformer hybrid pattern
+torchrun --nproc_per_node=4 train.py \
     --model_type baretorch \
-    --layer_sequence "cs_lrad,cs_lrad,cs_ttt,transformer" \
-    --num_layers 16 \
-    --d_model 768 \
-    --compile \
-    --grad_checkpointing
+    --layer_sequence "cs_lrad,cs_lrad,cs_lrad,transformer" \
+    --num_layers 24 \
+    --d_model 1152 \
+    --num_heads 16 \
+    --chunk_size 32 \
+    --rank 8 \
+    --compile
 ```
 
 ---
 
-## 📂 Codebase Structure
+## 📂 Codebase Organization
 
 ```text
-├── baretorch/           # Production core package containing all modeling files
-│   ├── modeling/        # Pure-GEMM mathematical modules (CS-LRAD, CS-TTT)
-│   └── configurations/  # Static and dynamic hyperparameter classes
-├── train.py             # Highly flexible distributed data-parallel (DDP) pretraining script
-├── launch_lrad_local.sh # Local dual-GPU verification script (256 hidden dimensions)
-└── launch_lrad_cluster.sh # 500M parameter cluster orchestration script optimized for 8x H100s
+├── baretorch/                     # Core production framework package
+│   ├── modeling/                  # Pure-GEMM sequence mixers (CS-LRAD, Transformer)
+│   ├── integration/               # Hugging Face Config & Model wrappers
+│   └── benchmarks/
+│       ├── apple/                 # Native Apple Silicon MLX benchmark suite & modeling
+│       └── nvidia/                # Discrete CUDA PyTorch benchmark suite
+├── cloud_runs_0.5B/               # H100 Cluster & RTX 4090 launch scripts (Pretraining + SFT)
+├── demo_speed.py                  # Live CUDA terminal speed demonstration script
+├── demo_mac_speed.py              # Live Apple Silicon MLX terminal demonstration script
+├── paper.tex                      # Complete academic whitepaper LaTeX source
+└── paper.pdf                      # Compiled academic report
+```
+
+---
+
+## 📜 Citation
+
+If you use BareTorch in your research or edge deployments, please cite our paper:
+
+```bibtex
+@article{kovacevic2026baretorch,
+  title={BareTorch: Challenging State-of-The-Art Sequence Mixing Topologies via Kernel-Free, Pure GEMM-Compliant Architectures},
+  author={Kovacevic Buvinic, Martin Ignacio},
+  journal={BareTorch Framework Laboratory Technical Report},
+  year={2026}
+}
 ```
 
 ---
 
 ## ⚖️ License
 
-BareTorch is open-source software licensed under the permissive **Apache License 2.0**.
-
-```text
-Copyright 2026 Model Rampage
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
-```# BareTorch: Hardware-Portable Next-Gen Sequences
+BareTorch is open-source software licensed under the **Apache License 2.0**.
