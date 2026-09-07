@@ -1,0 +1,29 @@
+{
+  "architectures": [
+    "BareTorchForCausalLM"
+  ],
+  "bos_token_id": 1,
+  "chunk_size": 32,
+  "d_model": 256,
+  "dropout": 0.1,
+  "dtype": "float32",
+  "eos_token_id": 2,
+  "layer_types": [
+    "cs_lrad",
+    "cs_lrad",
+    "cs_lrad",
+    "transformer"
+  ],
+  "max_seq_len": 2048,
+  "model_type": "baretorch",
+  "num_heads": 4,
+  "num_kv_heads": 1,
+  "num_layers": 4,
+  "pad_token_id": 0,
+  "rank": 16,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.14.1",
+  "use_cache": false,
+  "use_grad_checkpointing": false,
+  "vocab_size": 248077
+}

@@ -20,6 +20,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+# Global tracker for background R2 upload subprocesses
+active_r2_uploads = []
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -216,7 +219,8 @@ def process_shard(
                 "--s3-chunk-size",
                 "64M",
             ]
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            active_r2_uploads.append(p)
 
     return shard_name, True
 
@@ -321,6 +325,15 @@ def main():
             r2_bucket=args.r2_bucket,
             r2_prefix=args.r2_prefix,
         )
+
+    # Synchronize and wait for all background rclone subprocesses across GPUs
+    if args.r2_sync and active_r2_uploads:
+        if rank == 0:
+            print("\n⏳ Waiting for remaining background R2 uploads to complete...")
+        for p in active_r2_uploads:
+            p.wait()
+        if rank == 0:
+            print("✅ All R2 background uploads finished successfully!")
 
     if dist.is_initialized():
         dist.barrier()

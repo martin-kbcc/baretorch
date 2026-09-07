@@ -16,17 +16,18 @@ echo "================================================================="
 echo "🚀 Launching Production TransformerEngine FP8 Extraction via torchrun (8x H100 SXM5)"
 echo "================================================================="
 
-# Utilizing 8x H100s with FlashAttention-2 and full R2 background sync
+# Utilizing 8x H100s with PyTorch Inductor compilation and full R2 background sync
 torchrun --nproc_per_node=8 "${ROOT_DIR}/teacher_inference.py" \
   --input_dir "${INPUT_DIR}" \
   --output_dir "${OUTPUT_DIR}" \
   --model_name "${MODEL_NAME}" \
   --seq_len 2048 \
-  --batch_size 16 \
+  --batch_size 48 \
   --attn_implementation "sdpa" \
   --dtype_input uint32 \
-  --logit_chunk_size 512 \
+  --logit_chunk_size 1024 \
   --use_fp8 \
+  --compile \
   --r2_sync
 
 echo ""

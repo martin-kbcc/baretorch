@@ -2,12 +2,13 @@ import argparse
 import glob
 import logging
 import os
+import random
 import subprocess
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Sampler
 from transformers import (
     AutoTokenizer,
     Trainer,
@@ -54,14 +55,25 @@ MODEL_MAP = {
     "baretorch": (BareTorchConfig, BareTorchForCausalLM),
 }
 
+# High-density datasets preserved for WSD Annealing Phase (Phase 2)
+ANNEALING_DATASETS = {"openr1_math", "finemath_4plus", "cosmopedia_v2"}
+
+# Scaled quotas matching exact 165B dataset mix (2,000 sequences total / ~4.1M tokens)
+GENERAL_QUOTAS = {
+    "fineweb_edu_100bt": 667,
+    "stack_dedup": 424,
+    "dclm_100bt": 303,
+    "finepdfs_100bt": 133,
+}
+
+REASONING_QUOTAS = {
+    "cosmopedia_v2": 340,
+    "finemath_4plus": 121,
+    "openr1_math": 12,
+}
+
 
 def get_wsd_schedule(optimizer, num_warmup_steps, num_decay_steps, num_training_steps, min_lr_ratio=0.0):
-    """
-    Warmup-Stable-Decay (WSD) Learning Rate Schedule.
-    1. Warmup: Linear LR ramp up from 0 to 1.0
-    2. Stable: Holds constant peak LR (1.0)
-    3. Decay: Cosine decay to min_lr_ratio over the final num_decay_steps
-    """
     num_stable_steps = max(0, num_training_steps - num_warmup_steps - num_decay_steps)
 
     def lr_lambda(current_step):
@@ -79,9 +91,54 @@ def get_wsd_schedule(optimizer, num_warmup_steps, num_decay_steps, num_training_
     return LambdaLR(optimizer, lr_lambda)
 
 
-class R2CheckpointCallback(TrainerCallback):
-    """Syncs checkpoints asynchronously to Cloudflare R2 using rclone."""
+class DistributedCurriculumSampler(Sampler):
+    def __init__(self, dataset, num_replicas=None, rank=None, seed=42):
+        if num_replicas is None:
+            num_replicas = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        if rank is None:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.seed = seed
+
+    def __iter__(self):
+        split_idx = getattr(self.dataset, "split_idx", len(self.dataset))
+
+        gen_indices = list(range(0, split_idx))
+        ann_indices = list(range(split_idx, len(self.dataset)))
+
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        if gen_indices:
+            p_gen = torch.randperm(len(gen_indices), generator=g).tolist()
+            gen_shuffled = [gen_indices[i] for i in p_gen]
+        else:
+            gen_shuffled = []
+
+        if ann_indices:
+            p_ann = torch.randperm(len(ann_indices), generator=g).tolist()
+            ann_shuffled = [ann_indices[i] for i in p_ann]
+        else:
+            ann_shuffled = []
+
+        gen_rank = gen_shuffled[self.rank :: self.num_replicas]
+        ann_rank = ann_shuffled[self.rank :: self.num_replicas]
+
+        indices = gen_rank + ann_rank
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.dataset) // self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+
+class R2CheckpointCallback(TrainerCallback):
     def __init__(
         self,
         bucket_name: str = "baretorch-data",
@@ -123,26 +180,98 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 class DistillMemmapDataset(Dataset):
-    """
-    Zero-copy Dataset mapping triplets of binary files:
-    1. packed_tokens (.bin, uint32, shape: [N, seq_len])
-    2. teacher_indices (.bin, uint32, shape: [N, seq_len, 4])
-    3. teacher_values (.bin, float16, shape: [N, seq_len, 4])
-    """
-
-    def __init__(self, data_dir: str, seq_len: int = 2048):
+    def __init__(self, data_dir: str, seq_len: int = 2048, dataset_filter: str = "all", max_samples: int = None):
+        self.data_dir = data_dir
         self.seq_len = seq_len
+        self.dataset_filter = dataset_filter
+        self.max_samples = max_samples
+        self.samples = []
+        self.split_idx = 0
+        self.reload_shards()
 
-        token_files = sorted(glob.glob(os.path.join(data_dir, "*_packed_tokens.bin")))
+    def reload_shards(self):
+        token_files = sorted(glob.glob(os.path.join(self.data_dir, "**/*_packed_tokens.bin"), recursive=True))
         if not token_files:
             raise FileNotFoundError(
-                f"❌ No '*_packed_tokens.bin' files found in '{data_dir}'."
+                f"❌ No '*_packed_tokens.bin' files found in '{self.data_dir}'."
                 " Run teacher_inference.py first!"
             )
 
-        self.samples = []
+        general_samples = []
+        annealing_samples = []
         total_tokens = 0
 
+        for t_path in token_files:
+            prefix = t_path.replace("_packed_tokens.bin", "")
+            idx_path = f"{prefix}_teacher_indices.bin"
+            val_path = f"{prefix}_teacher_values.bin"
+
+            if not (os.path.exists(idx_path) and os.path.exists(val_path)):
+                continue
+
+            is_annealing = any(ds in t_path for ds in ANNEALING_DATASETS)
+
+            if self.dataset_filter == "general" and is_annealing:
+                continue
+            if self.dataset_filter == "reasoning" and not is_annealing:
+                continue
+
+            num_tokens = os.path.getsize(t_path) // 4
+            num_seqs = num_tokens // self.seq_len
+
+            if num_seqs > 0:
+                tok_mmap = np.memmap(t_path, dtype=np.uint32, mode="r", shape=(num_seqs, self.seq_len))
+                idx_mmap = np.memmap(idx_path, dtype=np.uint32, mode="r", shape=(num_seqs, self.seq_len, 4))
+                val_mmap = np.memmap(val_path, dtype=np.float16, mode="r", shape=(num_seqs, self.seq_len, 4))
+
+                target_list = annealing_samples if is_annealing else general_samples
+
+                for s_i in range(num_seqs):
+                    target_list.append((tok_mmap, idx_mmap, val_mmap, s_i))
+
+                total_tokens += num_seqs * self.seq_len
+
+        self.split_idx = len(general_samples)
+        self.samples = general_samples + annealing_samples
+
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = self.samples[: self.max_samples]
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if local_rank == 0:
+            logger.info(f"Loaded dataset track '{self.dataset_filter}' ({len(self.samples):,} sequences) from '{self.data_dir}'")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if len(self.samples) == 0:
+            raise RuntimeError(f"Dataset for filter '{self.dataset_filter}' is empty.")
+
+        s_idx = idx % len(self.samples)
+        tok_mmap, idx_mmap, val_mmap, s_i = self.samples[s_idx]
+
+        tokens = torch.from_numpy(tok_mmap[s_i].astype(np.int64))
+        teacher_indices = torch.from_numpy(idx_mmap[s_i].astype(np.int64))
+        teacher_values = torch.from_numpy(val_mmap[s_i].astype(np.float32))
+
+        return {
+            "input_ids": tokens,
+            "labels": tokens.clone(),
+            "teacher_indices": teacher_indices,
+            "teacher_values": teacher_values,
+        }
+
+
+def build_proportional_val_dataset(data_dir, quotas, seq_len=2048, seed=42):
+    rng = random.Random(seed)
+    collected_samples = []
+
+    for ds_name, target_count in quotas.items():
+        ds_dir = os.path.join(data_dir, ds_name)
+        token_files = sorted(glob.glob(os.path.join(ds_dir, "**/*_packed_tokens.bin"), recursive=True))
+
+        ds_samples = []
         for t_path in token_files:
             prefix = t_path.replace("_packed_tokens.bin", "")
             idx_path = f"{prefix}_teacher_indices.bin"
@@ -160,41 +289,23 @@ class DistillMemmapDataset(Dataset):
                 val_mmap = np.memmap(val_path, dtype=np.float16, mode="r", shape=(num_seqs, seq_len, 4))
 
                 for s_i in range(num_seqs):
-                    self.samples.append((tok_mmap, idx_mmap, val_mmap, s_i))
+                    ds_samples.append((tok_mmap, idx_mmap, val_mmap, s_i))
 
-                total_tokens += num_seqs * seq_len
+        if ds_samples:
+            rng.shuffle(ds_samples)
+            sampled = ds_samples[:target_count]
+            collected_samples.extend(sampled)
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if local_rank == 0:
-            logger.info(f"Loaded {len(token_files)} dataset shard triplet(s) from '{data_dir}'")
-            logger.info(
-                f"   └─ Total Tokens: {total_tokens:,} | Total Sequences (L={seq_len}): {len(self.samples):,}"
-            )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        tok_mmap, idx_mmap, val_mmap, s_i = self.samples[idx]
-
-        tokens = torch.from_numpy(tok_mmap[s_i].astype(np.int64))
-        teacher_indices = torch.from_numpy(idx_mmap[s_i].astype(np.int64))
-        teacher_values = torch.from_numpy(val_mmap[s_i].astype(np.float32))
-
-        return {
-            "input_ids": tokens,
-            "labels": tokens.clone(),
-            "teacher_indices": teacher_indices,
-            "teacher_values": teacher_values,
-        }
+    dataset = DistillMemmapDataset.__new__(DistillMemmapDataset)
+    dataset.data_dir = data_dir
+    dataset.seq_len = seq_len
+    dataset.samples = collected_samples
+    dataset.dataset_filter = "proportional_val"
+    dataset.split_idx = len(collected_samples)
+    return dataset
 
 
 class DistillTrainer(Trainer):
-    """
-    Custom Hugging Face Trainer implementing combined Cross-Entropy, Top-4 KL Divergence Loss,
-    and WSD Learning Rate Scheduler support.
-    """
-
     def __init__(self, *args, alpha_ce=0.5, alpha_kl=0.5, temperature=1.0, decay_steps=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.alpha_ce = alpha_ce
@@ -202,8 +313,17 @@ class DistillTrainer(Trainer):
         self.temperature = temperature
         self.decay_steps = decay_steps
 
+    def _get_train_sampler(self, dataset=None) -> Sampler:
+        target_dataset = dataset if dataset is not None else self.train_dataset
+        if target_dataset is not None:
+            return DistributedCurriculumSampler(target_dataset, seed=self.args.seed)
+        try:
+            return super()._get_train_sampler(dataset)
+        except TypeError:
+            return super()._get_train_sampler()
+
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
-        if self.args.lr_scheduler_type == "wsd":
+        if self.args.lr_scheduler_type in ["wsd", "warmup_stable_decay"]:
             if self.lr_scheduler is None:
                 optimizer = self.optimizer if optimizer is None else optimizer
                 decay_steps = (
@@ -223,31 +343,29 @@ class DistillTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
-        teacher_indices = inputs["teacher_indices"]  # Shape: (B, L, 4)
-        teacher_values = inputs["teacher_values"]    # Shape: (B, L, 4)
+        teacher_indices = inputs["teacher_indices"]
+        teacher_values = inputs["teacher_values"]
 
-        # Student Forward Pass
         outputs = model(input_ids=input_ids)
         student_logits = outputs.logits  # Shape: (B, L, Vocab)
 
-        # 1. Hard Cross-Entropy Loss on Ground-Truth Tokens
-        shift_logits = student_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        # Non-copying view slice
+        shift_logits = student_logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+
+        # 1. Hard Cross-Entropy Loss (flatten via reshape)
         loss_ce = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
             ignore_index=-100,
         )
 
         # 2. Top-4 KL Divergence Soft Distillation Loss
-        shift_student_logits = student_logits[..., :-1, :].contiguous()
-        shift_teacher_indices = teacher_indices[..., 1:, :].contiguous()
-        shift_teacher_values = teacher_values[..., 1:, :].contiguous()
+        shift_teacher_indices = teacher_indices[:, :-1, :]
+        shift_teacher_values = teacher_values[:, :-1, :]
 
-        # Gather student log probabilities corresponding exclusively to teacher's top-4 tokens
-        student_top4_logits = torch.gather(shift_student_logits, dim=-1, index=shift_teacher_indices)
+        student_top4_logits = torch.gather(shift_logits, dim=-1, index=shift_teacher_indices)
 
-        # Softmax over top-4 candidate logits
         p_teacher = F.softmax(shift_teacher_values / self.temperature, dim=-1)
         log_p_student = F.log_softmax(student_top4_logits / self.temperature, dim=-1)
 
@@ -266,14 +384,17 @@ def prepare_dataset(args):
         train_dir = args.data_cache_dir
         val_dir = args.data_cache_dir
 
-    train_dataset = DistillMemmapDataset(data_dir=train_dir, seq_len=args.seq_len)
-    val_dataset = DistillMemmapDataset(data_dir=val_dir, seq_len=args.seq_len)
+    train_dataset = DistillMemmapDataset(data_dir=train_dir, seq_len=args.seq_len, dataset_filter="all")
 
-    if args.max_val_samples is not None and args.max_val_samples > 0:
-        if len(val_dataset) > args.max_val_samples:
-            val_dataset = Subset(val_dataset, range(args.max_val_samples))
+    val_general_dataset = build_proportional_val_dataset(val_dir, GENERAL_QUOTAS, seq_len=args.seq_len)
+    val_reasoning_dataset = build_proportional_val_dataset(val_dir, REASONING_QUOTAS, seq_len=args.seq_len)
 
-    return train_dataset, val_dataset
+    eval_datasets = {
+        "general": val_general_dataset,
+        "reasoning": val_reasoning_dataset,
+    }
+
+    return train_dataset, eval_datasets
 
 
 def main():
@@ -289,9 +410,8 @@ def main():
     parser.add_argument("--model_type", type=str, default="baretorch", choices=list(MODEL_MAP.keys()))
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
     parser.add_argument("--output_dir", type=str, default="./checkpoints_distill_2.5B")
-    parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.8-27B")
+    parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
-    parser.add_argument("--max_val_samples", type=int, default=None)
     parser.add_argument("--tie_embeddings", action="store_true", default=True, help="Tie input & output embedding weights.")
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
@@ -302,14 +422,14 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
 
     # Optimization
-    parser.add_argument("--max_steps", type=int, default=50000)
+    parser.add_argument("--max_steps", type=int, default=1258850)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--scheduler", type=str, default="wsd", help="Scheduler type: 'cosine', 'linear', or 'wsd'")
-    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--warmup_steps", type=int, default=10000)
     parser.add_argument("--decay_steps", type=int, default=None, help="Decay steps for WSD schedule (default: 10% of max_steps)")
     parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum", type=int, default=1)
 
     # Structural Dimensions
     parser.add_argument("--d_model", type=int, default=2048)
@@ -324,8 +444,8 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--grad_checkpointing", action="store_true")
     parser.add_argument("--logging_steps", type=int, default=100)
-    parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--eval_steps", type=int, default=1000)
+    parser.add_argument("--save_steps", type=int, default=25000)
+    parser.add_argument("--eval_steps", type=int, default=10000)
 
     args = parser.parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -354,14 +474,12 @@ def main():
     config = config_cls(**config_args)
     model = model_cls(config)
 
-    # Apply Explicit Weight Tying across Embeddings and Output LM Head
     if args.tie_embeddings:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
         elif hasattr(model, "lm_head") and hasattr(model, "embed_tokens"):
             model.lm_head.weight = model.embed_tokens.weight
 
-    # Accurate Parameter Count (De-duplicating Tied Tensors via Memory Pointers)
     unique_params_dict = {p.data_ptr(): p for p in model.parameters()}
     total_params = sum(p.numel() for p in unique_params_dict.values())
     trainable_params = sum(p.numel() for p in unique_params_dict.values() if p.requires_grad)
@@ -375,7 +493,11 @@ def main():
         logger.info(f"   └─ LR Schedule          : {args.scheduler.upper()} (Warmup={args.warmup_steps} steps)")
         logger.info("=" * 70)
 
-    train_dataset, val_dataset = prepare_dataset(args)
+    train_dataset, eval_datasets = prepare_dataset(args)
+
+    scheduler_type = args.scheduler.lower()
+    if scheduler_type == "wsd":
+        scheduler_type = "warmup_stable_decay"
 
     training_args = TrainingArguments(
         output_dir=f"{args.output_dir}_{args.model_type}",
@@ -384,7 +506,7 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
-        lr_scheduler_type=args.scheduler,
+        lr_scheduler_type=scheduler_type,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         bf16=True,
@@ -396,6 +518,7 @@ def main():
         gradient_checkpointing=args.grad_checkpointing,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
+        remove_unused_columns=False,
     )
 
     callbacks = [R2CheckpointCallback(bucket_name=args.r2_bucket, prefix=args.r2_prefix)] if args.r2_sync else []
@@ -404,7 +527,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=eval_datasets,
         callbacks=callbacks,
         alpha_ce=args.alpha_ce,
         alpha_kl=args.alpha_kl,

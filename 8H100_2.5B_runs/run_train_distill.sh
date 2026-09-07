@@ -28,9 +28,9 @@ PER_GPU_BATCH_SIZE=8    # 8 seqs per GPU x 8 GPUs = 64 seqs/step
 GRAD_ACCUM=1            # Global batch size = 64 seqs/step (~131k tokens/step)
 LEARNING_RATE=3e-4
 SCHEDULER="wsd"
-WARMUP_STEPS=2000
+WARMUP_STEPS=10000
 WEIGHT_DECAY=0.1
-MAX_STEPS=50000
+MAX_STEPS=1258850       # ~165 Billion tokens total (1,258,850 steps * 131,072 tokens/step)
 
 # Distillation Hyperparameters
 ALPHA_CE=0.5
@@ -41,9 +41,9 @@ TEMPERATURE=1.0
 OUTPUT_DIR="${ROOT_DIR}/checkpoints_distill_2.5B_prod"
 DATA_CACHE_DIR="${ROOT_DIR}/teacher_predictions"
 
-LOGGING_STEPS=50
-SAVE_STEPS=1000
-EVAL_STEPS=1000
+LOGGING_STEPS=100
+SAVE_STEPS=25000
+EVAL_STEPS=10000
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -56,6 +56,8 @@ echo "  ├─ Hardware Config   : ${NUM_GPUS}x NVIDIA H100 SXM5 (80GB)"
 echo "  ├─ Tokenizer Name    : ${TOKENIZER_NAME}"
 echo "  ├─ Batch Setup       : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
 echo "  ├─ Step Throughput   : ${TOKENS_PER_STEP} tokens/step (~131k tokens/step)"
+echo "  ├─ Target Dataset    : ~165 Billion Tokens"
+echo "  ├─ Total Steps       : ${MAX_STEPS} steps"
 echo "  ├─ Model Dimension   : d_model=${D_MODEL}, layers=${NUM_LAYERS}, heads=${NUM_HEADS}"
 echo "======================================================================"
 
