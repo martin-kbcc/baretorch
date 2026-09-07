@@ -44,6 +44,12 @@ def parse_args():
         default=True,
         help="Enable NVIDIA TransformerEngine FP8 execution.",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=True,
+        help="Enable torch.compile Inductor fusion on the model backbone.",
+    )
     # Cloudflare R2 Sync Arguments
     parser.add_argument("--r2_sync", action="store_true", help="Sync completed bin files to Cloudflare R2 via rclone.")
     parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="R2 target bucket name.")
@@ -150,7 +156,6 @@ def process_shard(
 
         input_ids = torch.from_numpy(batch_np.astype(np.int64)).to(device, non_blocking=True)
 
-        # Allocate GPU output buffers for the full sequence length of this batch
         batch_indices_gpu = torch.empty((curr_batch_size, seq_len, 4), dtype=torch.int32, device=device)
         batch_values_gpu = torch.empty((curr_batch_size, seq_len, 4), dtype=torch.float16, device=device)
 
@@ -172,7 +177,6 @@ def process_shard(
                     top_logprobs[:, 0, :] = 0.0
                     top_ind[:, 0, :] = 0
 
-                # Assign chunk results directly on GPU (no CPU sync)
                 batch_indices_gpu[:, c_start:c_end, :] = top_ind.to(torch.int32)
                 batch_values_gpu[:, c_start:c_end, :] = top_logprobs.to(torch.float16)
 
@@ -180,7 +184,6 @@ def process_shard(
 
             del input_ids, transformer_outputs, hidden_states
 
-        # Single asynchronous GPU-to-CPU transfer per batch step
         indices_memmap[start_idx:end_idx] = batch_indices_gpu.cpu().numpy()
         values_memmap[start_idx:end_idx] = batch_values_gpu.cpu().numpy()
 
@@ -191,12 +194,10 @@ def process_shard(
     indices_memmap.flush()
     values_memmap.flush()
 
-    # Atomic rename to final binary paths
     os.replace(tmp_packed_path, packed_tokens_path)
     os.replace(tmp_indices_path, indices_path)
     os.replace(tmp_values_path, values_path)
 
-    # Asynchronous Cloudflare R2 Upload
     if r2_sync:
         rel_output_dir = os.path.basename(os.path.normpath(output_dir))
         target_r2_dir = f"{r2_remote}:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}"
@@ -246,7 +247,8 @@ def main():
         print(f"🚀 Initializing TransformerEngine Engine: '{args.model_name}'")
         print(
             f"World Size: {world_size} GPUs | Device: cuda:{local_rank} | "
-            f"Attention: {args.attn_implementation} | TE FP8: {args.use_fp8} | Chunk Size: {args.logit_chunk_size}"
+            f"Attention: {args.attn_implementation} | TE FP8: {args.use_fp8} | "
+            f"Torch Compile: {args.compile} | Chunk Size: {args.logit_chunk_size}"
         )
         if args.r2_sync:
             print(f"☁️ R2 Sync Enabled -> Remote Target: {args.r2_remote}:{args.r2_bucket}/{args.r2_prefix}")
@@ -276,6 +278,13 @@ def main():
         if rank == 0:
             print("⚡ Converting model Linear layers to NVIDIA TransformerEngine modules...")
         replace_linear_with_te(model, device)
+
+    if args.compile:
+        if rank == 0:
+            print("🔥 Compiling model backbone with PyTorch Inductor (mode='reduce-overhead')...")
+        base_model_obj = getattr(model, model.base_model_prefix, model)
+        compiled_base = torch.compile(base_model_obj, mode="reduce-overhead")
+        setattr(model, model.base_model_prefix, compiled_base)
 
     model.eval()
 
