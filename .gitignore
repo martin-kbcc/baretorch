@@ -16,6 +16,7 @@ huggingface/
 data/
 raw_dclm_parquet/
 tokenized_bin/
+tokenized_bin_sample/
 smollm-corpus/
 
 # --- Python & Environment Files ---

@@ -159,9 +159,9 @@ class BareTorchModel(BareTorchPreTrainedModel):
             if isinstance(layer, TransformerDecoderBlock):
                 h, next_state = layer(h, past_kv=past_state, position_ids=position_ids)
             elif isinstance(layer, LRADDecoderBlock):
-                h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
+                h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
             elif isinstance(layer, TTTDecoderBlock):
-                h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
+                h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
                 
             if use_cache:
                 next_decoder_cache.append(next_state)
@@ -245,6 +245,9 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
+        
+        # Soft-clamp logits to ensure sampling probabilities remain strictly finite
+        logits = torch.clamp(logits, min=-50.0, max=50.0)
 
         loss = None
         if labels is not None:

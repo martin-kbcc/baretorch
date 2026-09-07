@@ -15,8 +15,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        input_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_fp32 * torch.rsqrt(variance + self.eps)
+        return (x_norm * self.weight.to(torch.float32)).to(input_dtype)
 
 
 class GatedMLP(nn.Module):
@@ -56,7 +59,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         B, L, D = x.shape
         H, C, d_h, r = self.num_heads, self.chunk_size, self.d_head, self.r
         scaling = 1.0 / math.sqrt(d_h)
@@ -69,6 +72,18 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         else:
             x_padded = x
 
+        # Build unified 2D length/padding mask supporting batch broadcasting
+        if attention_mask is not None:
+            if pad_len > 0:
+                mask_padded = F.pad(attention_mask, (0, pad_len), value=0)
+            else:
+                mask_padded = attention_mask
+            mask_5d = mask_padded.view(B, N, C).unsqueeze(1).unsqueeze(-1).to(dtype=torch.float32, device=x.device)
+        else:
+            seq_idx = torch.arange(N * C, device=x.device)
+            mask_padded = (seq_idx < L).to(dtype=torch.float32).view(1, N, C)
+            mask_5d = mask_padded.unsqueeze(1).unsqueeze(-1)
+
         Q = F.silu(self.W_q(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
         K = F.silu(self.W_k(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4))
         V = self.W_v(x_padded).view(B, N, C, H, d_h).permute(0, 3, 1, 2, 4)
@@ -76,36 +91,32 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         U = self.W_u(x_padded).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
         R = self.W_r(x_padded).view(B, N, C, H, r).permute(0, 3, 1, 2, 4)   
         
-        gate = torch.clamp(
-            torch.sigmoid(self.W_gate(x_padded)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1), 
-            min=1e-3, 
-            max=0.999
+        # Upcast gate and state math to float32 for numerical stability
+        gate_fp32 = torch.clamp(
+            torch.sigmoid(self.W_gate(x_padded).float()).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1), 
+            min=1e-4, 
+            max=0.9999
         )
-        beta_gate = torch.sigmoid(self.W_beta_gate(x_padded)).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
+        beta_gate_fp32 = torch.sigmoid(self.W_beta_gate(x_padded).float()).view(B, N, C, H).permute(0, 3, 1, 2).unsqueeze(-1)
 
-        # Zero-padding validity masking
-        if pad_len > 0:
-            seq_idx = torch.arange(N * C, device=x.device).view(1, 1, N, C, 1)
-            valid_mask = (seq_idx < L).to(dtype=x.dtype)
-            
-            U = U * valid_mask
-            V = V * valid_mask
-            gate = torch.where(valid_mask.bool(), gate, torch.ones_like(gate))
+        U_fp32 = U.float() * mask_5d
+        V_fp32 = V.float() * mask_5d
+        gate_fp32 = torch.where(mask_5d.bool(), gate_fp32, torch.ones_like(gate_fp32))
 
-        log_gate = torch.log(gate)
+        log_gate = torch.log(gate_fp32)
         Lambda = torch.cumsum(log_gate, dim=-2)
-        exp_Lambda = torch.exp(Lambda)  
+        exp_Lambda = torch.exp(torch.clamp(Lambda, min=-30.0, max=0.0))  
         
         indices = torch.arange(C, device=x.device)
         causal_mask = (indices[:, None] >= indices[None, :]).view(1, 1, 1, C, C)
         
         diff = Lambda - Lambda.transpose(-1, -2)
-        diff_masked = torch.where(causal_mask, diff, torch.tensor(-10000.0, device=x.device, dtype=x.dtype))
+        diff_masked = torch.where(causal_mask, diff, torch.tensor(-10000.0, device=x.device, dtype=torch.float32))
         M_links = torch.exp(torch.clamp(diff_masked, max=0.0))
         
-        Y_local = torch.matmul(torch.matmul(Q, K.transpose(-1, -2)) * scaling * M_links, V)  
+        Y_local = torch.matmul(torch.matmul(Q.float(), K.float().transpose(-1, -2)) * scaling * M_links, V_fp32)  
         
-        chunk_decay_log = torch.clamp(torch.sum(log_gate, dim=-2).squeeze(-1), min=-50.0, max=0.0)
+        chunk_decay_log = torch.clamp(torch.sum(log_gate, dim=-2).squeeze(-1), min=-30.0, max=0.0)
         Lambda_chunks = torch.cumsum(chunk_decay_log, dim=2)  
         log_M_chunks = (Lambda_chunks.unsqueeze(-1) - Lambda_chunks.unsqueeze(-2)) - chunk_decay_log.unsqueeze(-1)
         
@@ -115,35 +126,35 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         log_M_chunks_masked = torch.where(
             causal_mask_chunks, 
             log_M_chunks, 
-            torch.tensor(-10000.0, device=x.device, dtype=x.dtype)
+            torch.tensor(-10000.0, device=x.device, dtype=torch.float32)
         )
         M_chunks = torch.exp(torch.clamp(log_M_chunks_masked, max=0.0))
         
-        exp_Lambda_last = exp_Lambda[:, :, :, -1:, :]
-        exp_Lambda_safe = torch.maximum(exp_Lambda, torch.tensor(1e-6, device=x.device, dtype=x.dtype))
-        U_decayed = (U * beta_gate) * (exp_Lambda_last / exp_Lambda_safe)
+        decay = torch.exp(torch.clamp(Lambda[:, :, :, -1:, :] - Lambda, min=-30.0, max=0.0))
+        U_decayed = (U_fp32 * beta_gate_fp32) * decay
         
         S_historical_flat = torch.matmul(
             M_chunks, 
-            torch.matmul(U_decayed.transpose(-1, -2), V).view(B, H, N, r * d_h)
+            torch.matmul(U_decayed.transpose(-1, -2), V_fp32).view(B, H, N, r * d_h)
         )
         S_historical = S_historical_flat.view(B, H, N, r, d_h)
         
-        Y_global = torch.matmul(R * exp_Lambda, S_historical) * scaling  
+        Y_global = torch.matmul(R.float() * exp_Lambda, S_historical) * scaling  
         
-        Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, N * C, self.inner_dim)
+        Out = (Y_local + Y_global).permute(0, 2, 3, 1, 4).contiguous().view(B, N * C, self.inner_dim).to(dtype=x.dtype)
         Out = Out[:, :L, :]
         
         output = self.resid_drop(self.W_out(Out * F.silu(self.W_swish_gate(x))))
 
         chunk_decay_last = exp_Lambda[:, :, -1, -1:, :] 
         S_historical_last = S_historical[:, :, -1]      
-        S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V[:, :, -1]) 
+        S_local_last = torch.matmul(U_decayed[:, :, -1].transpose(-1, -2), V_fp32[:, :, -1]) 
         S_final = (chunk_decay_last * S_historical_last) + S_local_last
+        S_final = torch.clamp(S_final, min=-50.0, max=50.0).to(dtype=x.dtype)
         
         return output, S_final
 
-    def step_inference(self, x, past_S=None):
+    def step_inference(self, x, past_S=None, attention_mask=None):
         B, L, D = x.shape
         H, d_h, r = self.num_heads, self.d_head, self.r
         
@@ -154,27 +165,39 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         R = self.W_r(x).view(B, L, H, r).permute(0, 2, 1, 3)
         
         gate = torch.clamp(
-            torch.sigmoid(self.W_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), 
-            min=1e-3, 
-            max=0.999
+            torch.sigmoid(self.W_gate(x).float()).view(B, L, H).permute(0, 2, 1).unsqueeze(-1), 
+            min=1e-4, 
+            max=0.9999
         )
-        beta_gate = torch.sigmoid(self.W_beta_gate(x)).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
+        beta_gate = torch.sigmoid(self.W_beta_gate(x).float()).view(B, L, H).permute(0, 2, 1).unsqueeze(-1)
         
-        if past_S is None or not isinstance(past_S, torch.Tensor):
-            past_S = torch.zeros(B, H, r, d_h, device=x.device, dtype=x.dtype)
+        if attention_mask is not None:
+            if attention_mask.dim() == 2 and attention_mask.size(1) != L:
+                attn_mask_curr = attention_mask[:, -L:]
+            else:
+                attn_mask_curr = attention_mask
+            mask = attn_mask_curr.view(B, 1, L, 1).to(dtype=torch.float32, device=x.device)
+            U_fp32 = U.float() * mask
+            V_fp32 = V.float() * mask
+            gate = torch.where(mask.bool(), gate, torch.ones_like(gate))
+        else:
+            U_fp32 = U.float()
+            V_fp32 = V.float()
 
-        # 1. Compute global read from past historical state
-        Y_global = torch.matmul(R, past_S) * (1.0 / math.sqrt(d_h))
+        if past_S is None or not isinstance(past_S, torch.Tensor):
+            past_S = torch.zeros(B, H, r, d_h, device=x.device, dtype=torch.float32)
+        else:
+            past_S = past_S.float()
+
+        Y_global = torch.matmul(R.float(), past_S) * (1.0 / math.sqrt(d_h))
+        Y_local = torch.matmul(Q.float(), torch.matmul(K.float().transpose(-1, -2), V_fp32)) * (1.0 / math.sqrt(d_h))
         
-        # 2. Local self-attention on current single token
-        Y_local = torch.matmul(Q, torch.matmul(K.transpose(-1, -2), V)) * (1.0 / math.sqrt(d_h))
+        S_state = (gate * past_S) + torch.matmul((U_fp32 * beta_gate).transpose(-1, -2), V_fp32)
+        S_state = torch.clamp(S_state, min=-50.0, max=50.0)
         
-        # 3. State update for step t+1: S_t = (gate * S_{t-1}) + U_decayed^T * V
-        S_state = (gate * past_S) + torch.matmul((U * beta_gate).transpose(-1, -2), V)
-        
-        Out = Y_local + Y_global
-        output = self.resid_drop(self.W_out(Out.permute(0, 2, 1, 3).contiguous().view(B, L, D) * F.silu(self.W_swish_gate(x))))
-        return output, S_state
+        Out = (Y_local + Y_global).permute(0, 2, 1, 3).contiguous().view(B, L, D).to(dtype=x.dtype)
+        output = self.resid_drop(self.W_out(Out * F.silu(self.W_swish_gate(x))))
+        return output, S_state.to(dtype=x.dtype)
 
 
 class LRADDecoderBlock(nn.Module):
@@ -186,26 +209,26 @@ class LRADDecoderBlock(nn.Module):
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 
-    def forward(self, x, past_state=None, use_cache=False):
-        def _block_forward(x_in, p_state):
+    def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
+        def _block_forward(x_in, p_state, attn_mask):
             h_attn = self.ln1(x_in)
             B, L, _ = x_in.shape
             
             is_step_inference = (p_state is not None) or (L == 1)
             
             if is_step_inference:
-                attn_out, next_state = self.attn.step_inference(h_attn, past_S=p_state)
+                attn_out, next_state = self.attn.step_inference(h_attn, past_S=p_state, attention_mask=attn_mask)
             else:
-                attn_out, next_state = self.attn(h_attn)
+                attn_out, next_state = self.attn(h_attn, attention_mask=attn_mask)
                 
             x_out = x_in + attn_out
             x_out = x_out + self.mlp(self.ln2(x_out))
             return x_out, next_state
         
         if self.use_grad_checkpointing and self.training:
-            return checkpoint.checkpoint(_block_forward, x, past_state, use_reentrant=False)
+            return checkpoint.checkpoint(_block_forward, x, past_state, attention_mask, use_reentrant=False)
         else:
-            return _block_forward(x, past_state)
+            return _block_forward(x, past_state, attention_mask)
 
 
 class CSLRADConfig(PretrainedConfig):
@@ -323,7 +346,12 @@ class CSLRADModel(CSLRADPreTrainedModel):
                 all_hidden_states = all_hidden_states + (h,)
                 
             past_state = past_key_values[i] if past_key_values is not None else None
-            h, next_state = layer(h, past_state=past_state, use_cache=use_cache)
+            h, next_state = layer(
+                h, 
+                past_state=past_state, 
+                use_cache=use_cache, 
+                attention_mask=attention_mask
+            )
                 
             if use_cache:
                 next_decoder_cache.append(next_state)
@@ -399,6 +427,9 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        
+        # Logit Soft-Capping (30.0 * tanh(logits / 30.0))
+        logits = 30.0 * torch.tanh(logits / 30.0)
 
         loss = None
         if labels is not None:
@@ -419,12 +450,13 @@ class CSLRADForCausalLM(CSLRADPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
             "use_cache": kwargs.get("use_cache"),
         }
 

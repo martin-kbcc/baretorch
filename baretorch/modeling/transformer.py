@@ -7,9 +7,6 @@ import torch.utils.checkpoint as checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
-# ==========================================
-# 1. Pure GEMM-Compliant Core Utilities
-# ==========================================
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
@@ -18,8 +15,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x):
-        variance = x.pow(2).mean(-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps) * self.weight
+        input_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_norm = x_fp32 * torch.rsqrt(variance + self.eps)
+        return (x_norm * self.weight.to(torch.float32)).to(input_dtype)
 
 
 class GatedMLP(nn.Module):
@@ -33,10 +33,6 @@ class GatedMLP(nn.Module):
     def forward(self, x):
         return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
-
-# ==========================================
-# 2. Pure PyTorch SOTA Attention & RoPE Modules
-# ==========================================
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=8192, base=10000):
@@ -90,8 +86,8 @@ class RotaryEmbedding(nn.Module):
             self._set_cos_sin_cache(seq_len=new_len, device=q.device, dtype=q.dtype)
 
         position_ids = position_ids.to(q.device)
-        cos = self.cos_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)  # [B, 1, L, d_h]
-        sin = self.sin_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)  # [B, 1, L, d_h]
+        cos = self.cos_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)
+        sin = self.sin_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)
 
         q_embed = (q * cos) + (self._rotate_half(q) * sin)
         k_embed = (k * cos) + (self._rotate_half(k) * sin)
@@ -113,6 +109,10 @@ class CausalSelfAttention(nn.Module):
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         
+        # QK-Norm: Per-head RMSNorm on Query and Key projections
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        
         self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len)
         
         self.dropout_p = dropout
@@ -129,9 +129,13 @@ class CausalSelfAttention(nn.Module):
                 past_len = past_kv[0].size(-2)
             position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
             
-        q = self.W_q(x).view(B, L, H_q, d_h).transpose(1, 2)
-        k = self.W_k(x).view(B, L, H_kv, d_h).transpose(1, 2)
+        q = self.W_q(x).view(B, L, H_q, d_h)
+        k = self.W_k(x).view(B, L, H_kv, d_h)
         v = self.W_v(x).view(B, L, H_kv, d_h).transpose(1, 2)
+        
+        # Apply QK-Norm per head before RoPE application
+        q = self.q_norm(q).transpose(1, 2)
+        k = self.k_norm(k).transpose(1, 2)
         
         q, k = self.rope.apply_rope(q, k, position_ids)
         
@@ -180,10 +184,6 @@ class TransformerDecoderBlock(nn.Module):
         else:
             return _block_forward(x, past_kv, position_ids)
 
-
-# ==========================================
-# 3. Hugging Face Serialization Configuration & Wrappers
-# ==========================================
 
 class TransformerConfig(PretrainedConfig):
     model_type = "transformer"
@@ -388,6 +388,9 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        
+        # Logit Soft-Capping (30.0 * tanh(logits / 30.0))
+        logits = 30.0 * torch.tanh(logits / 30.0)
 
         loss = None
         if labels is not None:
