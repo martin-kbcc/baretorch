@@ -150,12 +150,13 @@ def process_shard(
 
         input_ids = torch.from_numpy(batch_np.astype(np.int64)).to(device, non_blocking=True)
 
+        # Allocate GPU output buffers for the full sequence length of this batch
+        batch_indices_gpu = torch.empty((curr_batch_size, seq_len, 4), dtype=torch.int32, device=device)
+        batch_values_gpu = torch.empty((curr_batch_size, seq_len, 4), dtype=torch.float16, device=device)
+
         with torch.inference_mode(), te.fp8_autocast(enabled=use_fp8, fp8_recipe=fp8_recipe):
             transformer_outputs = base_model(input_ids=input_ids)
             hidden_states = transformer_outputs[0]
-
-            batch_indices = np.zeros((curr_batch_size, seq_len, 4), dtype=np.uint32)
-            batch_values = np.zeros((curr_batch_size, seq_len, 4), dtype=np.float16)
 
             for c_start in range(0, seq_len, logit_chunk_size):
                 c_end = min(c_start + logit_chunk_size, seq_len)
@@ -171,17 +172,19 @@ def process_shard(
                     top_logprobs[:, 0, :] = 0.0
                     top_ind[:, 0, :] = 0
 
-                batch_indices[:, c_start:c_end, :] = top_ind.to(torch.int64).cpu().numpy().astype(np.uint32)
-                batch_values[:, c_start:c_end, :] = top_logprobs.to(torch.float16).cpu().numpy()
+                # Assign chunk results directly on GPU (no CPU sync)
+                batch_indices_gpu[:, c_start:c_end, :] = top_ind.to(torch.int32)
+                batch_values_gpu[:, c_start:c_end, :] = top_logprobs.to(torch.float16)
 
                 del logits_chunk, lse, top_val, top_ind, top_logprobs
 
             del input_ids, transformer_outputs, hidden_states
-            torch.cuda.empty_cache()
 
-        indices_memmap[start_idx:end_idx] = batch_indices
-        values_memmap[start_idx:end_idx] = batch_values
+        # Single asynchronous GPU-to-CPU transfer per batch step
+        indices_memmap[start_idx:end_idx] = batch_indices_gpu.cpu().numpy()
+        values_memmap[start_idx:end_idx] = batch_values_gpu.cpu().numpy()
 
+        del batch_indices_gpu, batch_values_gpu
         batch_pbar.update(curr_batch_size * seq_len)
 
     batch_pbar.close()
