@@ -29,13 +29,13 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True, help="Path to output memmap directory.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--seq_len", type=int, default=2048)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--logit_chunk_size", type=int, default=512, help="Sequence chunk size for lm_head projection.")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--logit_chunk_size", type=int, default=1024, help="Sequence chunk size for lm_head projection.")
     parser.add_argument("--dtype_input", type=str, default="uint32")
     parser.add_argument(
         "--attn_implementation",
         type=str,
-        default="sdpa",
+        default="flash_attention_2",
         choices=["flash_attention_2", "sdpa", "eager"],
     )
     parser.add_argument(
@@ -160,7 +160,7 @@ def process_shard(
         batch_values_gpu = torch.empty((curr_batch_size, seq_len, 4), dtype=torch.float16, device=device)
 
         with torch.inference_mode(), te.fp8_autocast(enabled=use_fp8, fp8_recipe=fp8_recipe):
-            transformer_outputs = base_model(input_ids=input_ids)
+            transformer_outputs = base_model(input_ids=input_ids, use_cache=False)
             hidden_states = transformer_outputs[0]
 
             for c_start in range(0, seq_len, logit_chunk_size):
@@ -224,21 +224,20 @@ def process_shard(
 def main():
     args = parse_args()
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
     if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", device_id=device)
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
     else:
         rank = 0
         world_size = 1
-        local_rank = 0
 
     if rank != 0:
         sys.stdout = open(os.devnull, "w")
-
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
 
     os.makedirs(args.output_dir, exist_ok=True)
 

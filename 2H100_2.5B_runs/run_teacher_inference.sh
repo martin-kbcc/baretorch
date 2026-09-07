@@ -22,11 +22,12 @@ torchrun --nproc_per_node=2 "${ROOT_DIR}/teacher_inference.py" \
   --model_name "${MODEL_NAME}" \
   --seq_len 2048 \
   --batch_size 64 \
-  --attn_implementation "sdpa" \
+  --attn_implementation "flash_attention_2" \
   --dtype_input uint32 \
-  --logit_chunk_size 512 \
+  --logit_chunk_size 1024 \
   --use_fp8 \
-  --r2_sync
+  --r2_sync \
+  "$@"
 
 echo ""
 echo "🎉 Extraction run complete! Outputs saved to: ${OUTPUT_DIR}"
