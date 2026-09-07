@@ -139,7 +139,7 @@ def process_shard(
         disable=(rank != 0),
     )
 
-    fp8_recipe = DelayedScaling(fp8_format=Format.E4M3, amax_history_len=16, amax_compute_algo="max")
+    fp8_recipe = DelayedScaling(fp8_format=Format.E4M3, amax_history_len=16, amax_compute_algo="most_recent")
     base_model = getattr(model, model.base_model_prefix, model)
     lm_head = model.get_output_embeddings()
 
