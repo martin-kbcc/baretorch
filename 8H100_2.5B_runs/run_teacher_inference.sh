@@ -22,7 +22,7 @@ torchrun --nproc_per_node=8 "${ROOT_DIR}/teacher_inference.py" \
   --output_dir "${OUTPUT_DIR}" \
   --model_name "${MODEL_NAME}" \
   --seq_len 2048 \
-  --batch_size 48 \
+  --batch_size 40 \
   --attn_implementation "sdpa" \
   --dtype_input uint32 \
   --logit_chunk_size 1024 \

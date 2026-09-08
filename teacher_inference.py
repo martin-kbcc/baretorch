@@ -20,7 +20,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Global tracker for background R2 upload subprocesses
 active_r2_uploads = []
 
 
@@ -53,7 +52,6 @@ def parse_args():
         default=True,
         help="Enable torch.compile Inductor fusion on the model backbone.",
     )
-    # Cloudflare R2 Sync Arguments
     parser.add_argument("--r2_sync", action="store_true", help="Sync completed bin files to Cloudflare R2 via rclone.")
     parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="R2 target bucket name.")
     parser.add_argument("--r2_remote", type=str, default="r2", help="rclone remote identifier.")
@@ -104,6 +102,7 @@ def process_shard(
     indices_path = os.path.join(output_dir, f"{base_name}_teacher_indices.bin")
     values_path = os.path.join(output_dir, f"{base_name}_teacher_values.bin")
 
+    # Return immediately if shard is fully converted
     if (
         os.path.exists(packed_tokens_path)
         and os.path.exists(indices_path)
@@ -116,10 +115,6 @@ def process_shard(
     tmp_indices_path = indices_path + f".rank{rank}.tmp"
     tmp_values_path = values_path + f".rank{rank}.tmp"
 
-    for tmp in [tmp_packed_path, tmp_indices_path, tmp_values_path]:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-
     dtype_input = np.dtype(dtype_input_str)
     raw_tokens = np.fromfile(shard_path, dtype=dtype_input)
 
@@ -127,19 +122,70 @@ def process_shard(
     if num_seqs == 0:
         return shard_name, False
 
-    packed_tokens = raw_tokens[: num_seqs * seq_len].reshape(num_seqs, seq_len)
-    packed_tokens.tofile(tmp_packed_path)
+    expected_packed_bytes = num_seqs * seq_len * dtype_input.itemsize
+    expected_indices_bytes = num_seqs * seq_len * 4 * 4  # uint32 = 4 bytes
+    expected_values_bytes = num_seqs * seq_len * 4 * 2   # float16 = 2 bytes
 
-    indices_memmap = np.memmap(
-        tmp_indices_path, dtype=np.uint32, mode="w+", shape=(num_seqs, seq_len, 4)
+    # Inspect existing .tmp files for partial extraction progress
+    can_resume = (
+        os.path.exists(tmp_packed_path)
+        and os.path.exists(tmp_indices_path)
+        and os.path.exists(tmp_values_path)
+        and os.path.getsize(tmp_packed_path) == expected_packed_bytes
+        and os.path.getsize(tmp_indices_path) == expected_indices_bytes
+        and os.path.getsize(tmp_values_path) == expected_values_bytes
     )
-    values_memmap = np.memmap(
-        tmp_values_path, dtype=np.float16, mode="w+", shape=(num_seqs, seq_len, 4)
-    )
+
+    start_seq_idx = 0
+
+    if can_resume:
+        try:
+            v_mem = np.memmap(tmp_values_path, dtype=np.float16, mode="r+", shape=(num_seqs, seq_len, 4))
+            for b_idx in range(0, num_seqs, batch_size):
+                check_seq = min(b_idx + batch_size - 1, num_seqs - 1)
+                # Position index 1 in a sequence contains non-zero top-4 logprobs if processed
+                if np.any(v_mem[check_seq, 1, :] != 0):
+                    start_seq_idx = b_idx + batch_size
+                else:
+                    break
+            del v_mem
+            if start_seq_idx > 0:
+                pct = (start_seq_idx / num_seqs) * 100
+                print(f"🔄 [GPU {rank}] Resuming '{shard_name[:25]}' from sequence {start_seq_idx}/{num_seqs} ({pct:.1f}% saved!)")
+        except Exception as e:
+            print(f"⚠️ [GPU {rank}] Could not read temp progress ({e}). Restarting shard.")
+            can_resume = False
+            start_seq_idx = 0
+
+    if not can_resume or start_seq_idx == 0:
+        for tmp in [tmp_packed_path, tmp_indices_path, tmp_values_path]:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+        packed_tokens = raw_tokens[: num_seqs * seq_len].reshape(num_seqs, seq_len)
+        packed_tokens.tofile(tmp_packed_path)
+
+        indices_memmap = np.memmap(
+            tmp_indices_path, dtype=np.uint32, mode="w+", shape=(num_seqs, seq_len, 4)
+        )
+        values_memmap = np.memmap(
+            tmp_values_path, dtype=np.float16, mode="w+", shape=(num_seqs, seq_len, 4)
+        )
+    else:
+        indices_memmap = np.memmap(
+            tmp_indices_path, dtype=np.uint32, mode="r+", shape=(num_seqs, seq_len, 4)
+        )
+        values_memmap = np.memmap(
+            tmp_values_path, dtype=np.float16, mode="r+", shape=(num_seqs, seq_len, 4)
+        )
 
     total_tokens = num_seqs * seq_len
     batch_pbar = tqdm(
         total=total_tokens,
+        initial=start_seq_idx * seq_len,
         desc=f" ⚡ {shard_name[:25]:<25}",
         unit="tok",
         unit_scale=True,
@@ -152,10 +198,12 @@ def process_shard(
     base_model = getattr(model, model.base_model_prefix, model)
     lm_head = model.get_output_embeddings()
 
-    for start_idx in range(0, num_seqs, batch_size):
+    packed_tokens_mmap = np.memmap(tmp_packed_path, dtype=dtype_input, mode="r", shape=(num_seqs, seq_len))
+
+    for start_idx in range(start_seq_idx, num_seqs, batch_size):
         end_idx = min(start_idx + batch_size, num_seqs)
         curr_batch_size = end_idx - start_idx
-        batch_np = packed_tokens[start_idx:end_idx]
+        batch_np = packed_tokens_mmap[start_idx:end_idx]
 
         input_ids = torch.from_numpy(batch_np.astype(np.int64)).to(device, non_blocking=True)
 
@@ -191,11 +239,17 @@ def process_shard(
         values_memmap[start_idx:end_idx] = batch_values_gpu.cpu().numpy()
 
         del batch_indices_gpu, batch_values_gpu
+
+        # Flush to NVMe disk after every batch
+        indices_memmap.flush()
+        values_memmap.flush()
+
         batch_pbar.update(curr_batch_size * seq_len)
 
     batch_pbar.close()
     indices_memmap.flush()
     values_memmap.flush()
+    del indices_memmap, values_memmap, packed_tokens_mmap
 
     os.replace(tmp_packed_path, packed_tokens_path)
     os.replace(tmp_indices_path, indices_path)
@@ -326,7 +380,6 @@ def main():
             r2_prefix=args.r2_prefix,
         )
 
-    # Synchronize and wait for all background rclone subprocesses across GPUs
     if args.r2_sync and active_r2_uploads:
         if rank == 0:
             print("\n⏳ Waiting for remaining background R2 uploads to complete...")

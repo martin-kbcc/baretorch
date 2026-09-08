@@ -21,7 +21,7 @@ smollm-corpus/
 
 # --- Python & Environment Files ---
 __pycache__/
-*.py[cod]
+*.py[cod]ssssssssss
 *$py.class
 .DS_Store
 .env
@@ -34,3 +34,7 @@ baretorch.egg-info/
 *.conf
 .env
 rclone.conf
+
+# --- Startup Deck
+deck.*
+
