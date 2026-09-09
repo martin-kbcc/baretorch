@@ -8,17 +8,16 @@ INPUT_BASE_DIR="${ROOT_DIR}/tokenized_bin"
 OUTPUT_BASE_DIR="${ROOT_DIR}/teacher_predictions"
 MODEL_NAME="Qwen/Qwen3.5-9B"
 
-# PyTorch Memory Management & Distributed Setup
+# PyTorch Memory Management, Offline HF Mode & Distributed Setup
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=4
+export HF_HUB_OFFLINE=1
 
 echo "================================================================="
 echo "🚀 Launching Batch Teacher Logit Extraction across All Datasets (8x H100 SXM)"
 echo "================================================================="
 
-# Iterate over every dataset directory inside tokenized_bin
 for DATASET_PATH in "${INPUT_BASE_DIR}"/*/; do
-    # Remove trailing slash to extract dataset directory name
     DATASET_NAME="$(basename "${DATASET_PATH}")"
 
     DATASET_INPUT="${DATASET_PATH}"
