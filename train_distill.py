@@ -220,14 +220,11 @@ class DistillMemmapDataset(Dataset):
             num_seqs = num_tokens // self.seq_len
 
             if num_seqs > 0:
-                tok_mmap = np.memmap(t_path, dtype=np.uint32, mode="r", shape=(num_seqs, self.seq_len))
-                idx_mmap = np.memmap(idx_path, dtype=np.uint32, mode="r", shape=(num_seqs, self.seq_len, 4))
-                val_mmap = np.memmap(val_path, dtype=np.float16, mode="r", shape=(num_seqs, self.seq_len, 4))
-
                 target_list = annealing_samples if is_annealing else general_samples
 
                 for s_i in range(num_seqs):
-                    target_list.append((tok_mmap, idx_mmap, val_mmap, s_i))
+                    # Store path strings to allow lazy memmap creation inside worker processes
+                    target_list.append((t_path, idx_path, val_path, s_i))
 
                 total_tokens += num_seqs * self.seq_len
 
@@ -249,7 +246,12 @@ class DistillMemmapDataset(Dataset):
             raise RuntimeError(f"Dataset for filter '{self.dataset_filter}' is empty.")
 
         s_idx = idx % len(self.samples)
-        tok_mmap, idx_mmap, val_mmap, s_i = self.samples[s_idx]
+        t_path, idx_path, val_path, s_i = self.samples[s_idx]
+
+        # Lazy memmap access per worker execution slice
+        tok_mmap = np.memmap(t_path, dtype=np.uint32, mode="r", shape=(-1, self.seq_len))
+        idx_mmap = np.memmap(idx_path, dtype=np.uint32, mode="r", shape=(-1, self.seq_len, 4))
+        val_mmap = np.memmap(val_path, dtype=np.float16, mode="r", shape=(-1, self.seq_len, 4))
 
         tokens = torch.from_numpy(tok_mmap[s_i].astype(np.int64))
         teacher_indices = torch.from_numpy(idx_mmap[s_i].astype(np.int64))
@@ -284,12 +286,8 @@ def build_proportional_val_dataset(data_dir, quotas, seq_len=2048, seed=42):
             num_seqs = num_tokens // seq_len
 
             if num_seqs > 0:
-                tok_mmap = np.memmap(t_path, dtype=np.uint32, mode="r", shape=(num_seqs, seq_len))
-                idx_mmap = np.memmap(idx_path, dtype=np.uint32, mode="r", shape=(num_seqs, seq_len, 4))
-                val_mmap = np.memmap(val_path, dtype=np.float16, mode="r", shape=(num_seqs, seq_len, 4))
-
                 for s_i in range(num_seqs):
-                    ds_samples.append((tok_mmap, idx_mmap, val_mmap, s_i))
+                    ds_samples.append((t_path, idx_path, val_path, s_i))
 
         if ds_samples:
             rng.shuffle(ds_samples)
@@ -369,7 +367,9 @@ class DistillTrainer(Trainer):
         p_teacher = F.softmax(shift_teacher_values / self.temperature, dim=-1)
         log_p_student = F.log_softmax(student_top4_logits / self.temperature, dim=-1)
 
-        loss_kl = F.kl_div(log_p_student, p_teacher, reduction="batchmean") * (self.temperature ** 2)
+        # Token-normalized KL divergence to match Cross-Entropy loss scale
+        num_tokens = shift_logits.size(0) * shift_logits.size(1)
+        loss_kl = (F.kl_div(log_p_student, p_teacher, reduction="sum") / num_tokens) * (self.temperature ** 2)
 
         total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl)
 
@@ -530,7 +530,7 @@ def main():
         eval_dataset=eval_datasets,
         callbacks=callbacks,
         alpha_ce=args.alpha_ce,
-        alpha_kl=args.alpha_kl,
+        alpha_kl=alpha_kl,
         temperature=args.temperature,
         decay_steps=args.decay_steps,
     )
