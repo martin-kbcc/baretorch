@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import warnings
+from datetime import timedelta
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -287,7 +288,11 @@ def main():
     torch.cuda.set_device(device)
 
     if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=device,
+            timeout=timedelta(seconds=18000),
+        )
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
     else:
