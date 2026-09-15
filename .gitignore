@@ -18,6 +18,8 @@ raw_dclm_parquet/
 tokenized_bin/
 tokenized_bin_sample/
 smollm-corpus/
+teacher_predictions_sample/
+teacher_predictions/
 
 # --- Python & Environment Files ---
 __pycache__/

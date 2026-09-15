@@ -5,37 +5,84 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Configuration
-REMOTE_PATH="r2:baretorch-data/tokenized_bin/dclm_100bt"
-LOCAL_TARGET_DIR="${ROOT_DIR}/tokenized_bin_sample"
+REMOTE_BUCKET="r2:baretorch-data/tokenized_bin"
+LOCAL_TARGET_DIR="${ROOT_DIR}/tokenized_bin"
+RANDOM_SEED=42
 
 echo "================================================================="
-echo "📥 Fetching Sample Token Test Sample from Cloudflare R2 (Local Run)"
+echo "📥 Fetching Deterministic stack_dedup Subset (12% Target Ratio)"
+echo "================================================================="
+echo "Target Root Directory: ${LOCAL_TARGET_DIR}"
+echo "Deterministic Seed:    ${RANDOM_SEED}"
 echo "================================================================="
 
-mkdir -p "${LOCAL_TARGET_DIR}/train"
-mkdir -p "${LOCAL_TARGET_DIR}/val"
+# Target dataset track: stack_dedup at 12% ratio (~24B tokens)
+DATASETS=(
+  "stack_dedup:0.12"
+)
 
-# Fetch validation shards
-echo "Downloading validation shards..."
-rclone copy "${REMOTE_PATH}/val/" "${LOCAL_TARGET_DIR}/val/" \
-  --include "shard_00000.bin" \
-  --progress \
-  --transfers 4 \
-  --s3-chunk-size 64M \
-  --ignore-checksum \
-  --s3-disable-checksum \
-  --fast-list
+mkdir -p "${LOCAL_TARGET_DIR}"
+TEMP_LIST_DIR=$(mktemp -d)
+trap 'rm -rf "${TEMP_LIST_DIR}"' EXIT
 
-# Fetch initial training shards
-echo "Downloading sample training shards..."
-rclone copy "${REMOTE_PATH}/train/" "${LOCAL_TARGET_DIR}/train/" \
-  --include "shard_00002.bin" \
-  --progress \
-  --transfers 4 \
-  --s3-chunk-size 64M \
-  --ignore-checksum \
-  --s3-disable-checksum \
-  --fast-list
+for entry in "${DATASETS[@]}"; do
+  DATASET_NAME="${entry%%:*}"
+  RATIO="${entry#*:}"
+
+  REMOTE_DATASET_PATH="${REMOTE_BUCKET}/${DATASET_NAME}"
+  LOCAL_DATASET_DIR="${LOCAL_TARGET_DIR}/${DATASET_NAME}"
+  LIST_FILE="${TEMP_LIST_DIR}/${DATASET_NAME}_files.txt"
+
+  mkdir -p "${LOCAL_DATASET_DIR}"
+
+  echo ""
+  echo "🔍 Listing shards for '${DATASET_NAME}' (Target Sampling Ratio: ${RATIO})..."
+
+  rclone lsf --recursive "${REMOTE_DATASET_PATH}" | python3 -c "
+import random, sys, math
+
+seed = int(sys.argv[1])
+ratio = float(sys.argv[2])
+raw_lines = sys.stdin.read().strip().splitlines()
+
+files = [f.strip() for f in raw_lines if f.strip().endswith('.bin') and not f.strip().endswith('.tmp')]
+files.sort()
+
+if ratio < 1.0:
+    rng = random.Random(seed)
+    rng.shuffle(files)
+    raw_target = math.ceil(len(files) * ratio)
+    # Round down to nearest multiple of 8 (also guarantees event distribution on 2 GPUs)
+    num_to_select = max(8, (raw_target // 8) * 8) if raw_target >= 8 else raw_target
+    files = files[:num_to_select]
+    files.sort()
+
+for f in files:
+    print(f)
+" "${RANDOM_SEED}" "${RATIO}" > "${LIST_FILE}"
+
+  FETCH_COUNT=$(wc -l < "${LIST_FILE}" | tr -d ' ')
+  echo "📦 Selected ${FETCH_COUNT} shards deterministically for '${DATASET_NAME}'."
+
+  if [ "${FETCH_COUNT}" -eq 0 ]; then
+    echo "⚠️ Warning: No matching binary files found for ${DATASET_NAME}. Skipping download."
+    continue
+  fi
+
+  echo "⬇️ Syncing files for '${DATASET_NAME}'..."
+  rclone copy "${REMOTE_DATASET_PATH}" "${LOCAL_DATASET_DIR}" \
+    --files-from "${LIST_FILE}" \
+    --progress \
+    --transfers 16 \
+    --s3-chunk-size 64M \
+    --ignore-checksum \
+    --s3-disable-checksum \
+    --fast-list
+
+done
 
 echo ""
-echo "🎉 Local sample dataset ready at: ${LOCAL_TARGET_DIR}"
+echo "================================================================="
+echo "🎉 stack_dedup Dataset Sync Complete!"
+echo "Data location: ${LOCAL_DATASET_DIR}"
+echo "================================================================="

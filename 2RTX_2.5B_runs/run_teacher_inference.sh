@@ -4,28 +4,48 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-INPUT_DIR="${ROOT_DIR}/tokenized_bin_sample"
-OUTPUT_DIR="${ROOT_DIR}/teacher_predictions_sample"
+INPUT_BASE_DIR="${ROOT_DIR}/tokenized_bin"
+OUTPUT_BASE_DIR="${ROOT_DIR}/teacher_predictions"
 MODEL_NAME="Qwen/Qwen3.5-9B"
 
-# PCIe Multi-GPU & PyTorch Memory Management Overrides
+# PyTorch Memory Management, Offline HF Mode & Distributed Setup
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS=4
+export HF_HUB_OFFLINE=1
 
 echo "================================================================="
-echo "🚀 Launching TransformerEngine FP8 Extraction via torchrun (Dual RTX 4090)"
+echo "🚀 Launching Batch Teacher Logit Extraction across the stack (2x RTX 4090)"
 echo "================================================================="
 
-# Using nproc_per_node=2 to utilize both RTX 4090s via PyTorch DDP
-torchrun --nproc_per_node=2 "${ROOT_DIR}/teacher_inference.py" \
-  --input_dir "${INPUT_DIR}" \
-  --output_dir "${OUTPUT_DIR}" \
-  --model_name "${MODEL_NAME}" \
-  --seq_len 2048 \
-  --batch_size 4 \
-  --attn_implementation "sdpa" \
-  --dtype_input uint32 \
-  --logit_chunk_size 512 \
-  --use_fp8
+for DATASET_PATH in "${INPUT_BASE_DIR}"/*/; do
+    DATASET_NAME="$(basename "${DATASET_PATH}")"
+
+    DATASET_INPUT="${DATASET_PATH}"
+    DATASET_OUTPUT="${OUTPUT_BASE_DIR}/${DATASET_NAME}"
+
+    echo ""
+    echo "-----------------------------------------------------------------"
+    echo "📂 Processing Dataset: ${DATASET_NAME}"
+    echo "📥 Input:  ${DATASET_INPUT}"
+    echo "📤 Output: ${DATASET_OUTPUT}"
+    echo "-----------------------------------------------------------------"
+
+    mkdir -p "${DATASET_OUTPUT}"
+
+    torchrun --nproc_per_node=2 "${ROOT_DIR}/teacher_inference.py" \
+      --input_dir "${DATASET_INPUT}" \
+      --output_dir "${DATASET_OUTPUT}" \
+      --model_name "${MODEL_NAME}" \
+      --seq_len 2048 \
+      --batch_size 4 \
+      --attn_implementation "sdpa" \
+      --dtype_input uint32 \
+      --logit_chunk_size 512 \
+      --use_fp8 \
+      --compile 
+
+    echo "✅ Completed extraction for: ${DATASET_NAME}"
+done
 
 echo ""
-echo "🎉 Extraction run complete! Outputs saved to: ${OUTPUT_DIR}"
+echo "🎉 Production batch extraction complete across all datasets! Outputs synced to R2."

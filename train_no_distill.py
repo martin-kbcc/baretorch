@@ -220,7 +220,10 @@ class R2CheckpointCallback(TrainerCallback):
                 )
 
 
-class DistillMemmapDataset(Dataset):
+class StandardMemmapDataset(Dataset):
+    """
+    Zero-copy memory-mapped dataset loading only raw tokenized uint32 binaries.
+    """
     def __init__(self, data_dir: str, seq_len: int = 2048, dataset_filter: str = "all", max_samples: int = None):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -242,7 +245,6 @@ class DistillMemmapDataset(Dataset):
         if not token_files:
             raise FileNotFoundError(
                 f"❌ No '*_packed_tokens.bin' files found in '{self.data_dir}'."
-                " Run teacher_inference.py first!"
             )
 
         general_samples = []
@@ -250,13 +252,6 @@ class DistillMemmapDataset(Dataset):
         total_tokens = 0
 
         for t_path in token_files:
-            prefix = t_path.replace("_packed_tokens.bin", "")
-            idx_path = f"{prefix}_teacher_indices.bin"
-            val_path = f"{prefix}_teacher_values.bin"
-
-            if not (os.path.exists(idx_path) and os.path.exists(val_path)):
-                continue
-
             is_annealing = any(ds in t_path for ds in ANNEALING_DATASETS)
 
             if self.dataset_filter == "general" and is_annealing:
@@ -271,7 +266,7 @@ class DistillMemmapDataset(Dataset):
                 target_list = annealing_samples if is_annealing else general_samples
 
                 for s_i in range(num_seqs):
-                    target_list.append((t_path, idx_path, val_path, s_i))
+                    target_list.append((t_path, s_i))
 
                 total_tokens += num_seqs * self.seq_len
 
@@ -293,21 +288,14 @@ class DistillMemmapDataset(Dataset):
             raise RuntimeError(f"Dataset for filter '{self.dataset_filter}' is empty.")
 
         s_idx = idx % len(self.samples)
-        t_path, idx_path, val_path, s_i = self.samples[s_idx]
+        t_path, s_i = self.samples[s_idx]
 
         tok_mmap = self._get_mmap(t_path, np.uint32, (-1, self.seq_len))
-        idx_mmap = self._get_mmap(idx_path, np.uint32, (-1, self.seq_len, 4))
-        val_mmap = self._get_mmap(val_path, np.float16, (-1, self.seq_len, 4))
-
         tokens = torch.from_numpy(tok_mmap[s_i].astype(np.int64))
-        teacher_indices = torch.from_numpy(idx_mmap[s_i].astype(np.int64))
-        teacher_values = torch.from_numpy(val_mmap[s_i].astype(np.float32))
 
         return {
             "input_ids": tokens,
             "labels": tokens.clone(),
-            "teacher_indices": teacher_indices,
-            "teacher_values": teacher_values,
         }
 
 
@@ -328,19 +316,12 @@ def build_proportional_val_dataset(
 
         ds_samples = []
         for t_path in token_files:
-            prefix = t_path.replace("_packed_tokens.bin", "")
-            idx_path = f"{prefix}_teacher_indices.bin"
-            val_path = f"{prefix}_teacher_values.bin"
-
-            if not (os.path.exists(idx_path) and os.path.exists(val_path)):
-                continue
-
             num_tokens = os.path.getsize(t_path) // 4
             num_seqs = num_tokens // seq_len
 
             if num_seqs > 0:
                 for s_i in range(num_seqs):
-                    ds_samples.append((t_path, idx_path, val_path, s_i))
+                    ds_samples.append((t_path, s_i))
 
         if ds_samples:
             rng.shuffle(ds_samples)
@@ -352,7 +333,7 @@ def build_proportional_val_dataset(
             final_sample_count = min(target_from_fraction, target_from_cap)
             collected_samples.extend(ds_samples[:final_sample_count])
 
-    dataset = DistillMemmapDataset.__new__(DistillMemmapDataset)
+    dataset = StandardMemmapDataset.__new__(StandardMemmapDataset)
     dataset.data_dir = data_dir
     dataset.seq_len = seq_len
     dataset.samples = collected_samples
@@ -362,12 +343,9 @@ def build_proportional_val_dataset(
     return dataset
 
 
-class DistillTrainer(Trainer):
-    def __init__(self, *args, alpha_ce=0.5, alpha_kl=0.5, temperature=1.0, decay_steps=None, **kwargs):
+class StandardTrainer(Trainer):
+    def __init__(self, *args, decay_steps=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.alpha_ce = alpha_ce
-        self.alpha_kl = alpha_kl
-        self.temperature = temperature
         self.decay_steps = decay_steps
 
     def _get_train_sampler(self, dataset=None) -> Sampler:
@@ -409,10 +387,11 @@ class DistillTrainer(Trainer):
         return super().create_scheduler(num_training_steps, optimizer)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Standard Causal LM Next-Token Cross-Entropy Loss computation.
+        """
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
-        teacher_indices = inputs["teacher_indices"]
-        teacher_values = inputs["teacher_values"]
 
         outputs = model(input_ids=input_ids)
         student_logits = outputs.logits  # Shape: (B, L, Vocab)
@@ -420,40 +399,13 @@ class DistillTrainer(Trainer):
         shift_logits = student_logits[:, :-1, :]
         shift_labels = labels[:, 1:]
 
-        # 1. Hard Cross-Entropy Loss
         loss_ce = F.cross_entropy(
             shift_logits.reshape(-1, shift_logits.size(-1)),
             shift_labels.reshape(-1),
             ignore_index=-100,
         )
 
-        # 2. Memory-Efficient Chunked Full-Vocabulary Sparse KL Loss
-        shift_teacher_indices = teacher_indices[:, :-1, :]
-        shift_teacher_values = teacher_values[:, :-1, :]
-
-        p_teacher_full = F.softmax(shift_teacher_values / self.temperature, dim=-1)
-        
-        num_tokens = shift_logits.size(0) * shift_logits.size(1)
-        loss_kl_sum = 0.0
-        chunk_size = 512  # Sequence slice size to prevent VRAM spikes on large vocabularies
-
-        for c_start in range(0, shift_logits.size(1), chunk_size):
-            c_end = min(c_start + chunk_size, shift_logits.size(1))
-
-            c_logits = shift_logits[:, c_start:c_end, :]
-            c_teacher_idx = shift_teacher_indices[:, c_start:c_end, :]
-            c_p_teacher = p_teacher_full[:, c_start:c_end, :]
-
-            c_log_p_student = F.log_softmax(c_logits / self.temperature, dim=-1)
-            c_student_top4_log_p = torch.gather(c_log_p_student, dim=-1, index=c_teacher_idx)
-
-            loss_kl_sum += F.kl_div(c_student_top4_log_p, c_p_teacher, reduction="sum")
-
-        loss_kl = (loss_kl_sum / num_tokens) * (self.temperature ** 2)
-
-        total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl)
-
-        return (total_loss, outputs) if return_outputs else total_loss
+        return (loss_ce, outputs) if return_outputs else loss_ce
 
 
 def prepare_dataset(args):
@@ -464,7 +416,7 @@ def prepare_dataset(args):
         train_dir = args.data_cache_dir
         val_dir = args.data_cache_dir
 
-    train_dataset = DistillMemmapDataset(data_dir=train_dir, seq_len=args.seq_len, dataset_filter="all")
+    train_dataset = StandardMemmapDataset(data_dir=train_dir, seq_len=args.seq_len, dataset_filter="all")
 
     # Target 10M tokens total (~4,882 sequences)
     val_general_dataset = build_proportional_val_dataset(
@@ -490,22 +442,17 @@ def main():
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
 
-    parser = argparse.ArgumentParser(description="BareTorch Knowledge Distillation Engine")
+    parser = argparse.ArgumentParser(description="BareTorch Standard Pre-training Engine (No Distillation)")
 
     # Architecture & Data
     parser.add_argument("--model_type", type=str, default="baretorch", choices=list(MODEL_MAP.keys()))
     parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_distill_2.5B")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_no_distill_2.5B")
     parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
     parser.add_argument("--tie_embeddings", action="store_true", default=True, help="Tie input & output embedding weights.")
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
-
-    # Distillation Parameters
-    parser.add_argument("--alpha_ce", type=float, default=0.5)
-    parser.add_argument("--alpha_kl", type=float, default=0.5)
-    parser.add_argument("--temperature", type=float, default=1.0)
 
     # Optimization
     parser.add_argument("--max_steps", type=int, default=1258850)
@@ -585,7 +532,7 @@ def main():
 
     if local_rank == 0:
         logger.info("=" * 70)
-        logger.info(f"🤖 Model Architecture Initialized: {args.model_type}")
+        logger.info(f"🤖 Standard Model Initialized: {args.model_type} (No Distillation)")
         logger.info(f"   ├─ Tied Embeddings     : {args.tie_embeddings}")
         logger.info(f"   ├─ Total Parameters     : {total_params / 1e9:.3f} Billion ({total_params:,})")
         logger.info(f"   ├─ Trainable Parameters : {trainable_params / 1e9:.3f} Billion ({trainable_params:,})")
@@ -614,7 +561,7 @@ def main():
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_total_limit=3,
-        torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
+        torch_compile=False,
         gradient_checkpointing=args.grad_checkpointing,
         ddp_find_unused_parameters=False,
         dataloader_num_workers=4,
@@ -636,15 +583,12 @@ def main():
         if local_rank == 0:
             logger.info("Cloudflare R2 Sync DISABLED. Running in local mode (disk checkpoints only).")
 
-    trainer = DistillTrainer(
+    trainer = StandardTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_datasets,
         callbacks=callbacks,
-        alpha_ce=alpha_ce_val if 'alpha_ce_val' in locals() else args.alpha_ce,
-        alpha_kl=alpha_kl_val if 'alpha_kl_val' in locals() else args.alpha_kl,
-        temperature=args.temperature,
         decay_steps=args.decay_steps,
     )
 
