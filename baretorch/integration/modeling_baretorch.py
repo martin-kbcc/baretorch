@@ -70,7 +70,8 @@ class BareTorchModel(BareTorchPreTrainedModel):
                     num_kv_heads=config.num_kv_heads,
                     dropout=config.dropout,
                     max_seq_len=config.max_seq_len,
-                    use_grad_checkpointing=config.use_grad_checkpointing
+                    use_grad_checkpointing=config.use_grad_checkpointing,
+                    use_qk_norm=getattr(config, "use_qk_norm", False)
                 )
             elif layer_type == "cs_lrad":
                 block = LRADDecoderBlock(

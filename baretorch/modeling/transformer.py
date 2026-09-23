@@ -95,12 +95,13 @@ class RotaryEmbedding(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads=16, num_kv_heads=4, dropout=0.1, max_seq_len=4096):
+    def __init__(self, d_model, num_heads=16, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_qk_norm=False):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
+        self.use_qk_norm = use_qk_norm
         
         assert num_heads % num_kv_heads == 0, "Query heads must be perfectly divisible by KV heads."
         self.num_queries_per_kv = num_heads // num_kv_heads
@@ -109,12 +110,12 @@ class CausalSelfAttention(nn.Module):
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         
-        # QK-Norm: Per-head RMSNorm on Query and Key projections
-        self.q_norm = RMSNorm(self.head_dim)
-        self.k_norm = RMSNorm(self.head_dim)
+        # CONDITIONAL QK-Norm
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
         
         self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len)
-        
         self.dropout_p = dropout
         self.W_out = nn.Linear(d_model, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
@@ -133,9 +134,13 @@ class CausalSelfAttention(nn.Module):
         k = self.W_k(x).view(B, L, H_kv, d_h)
         v = self.W_v(x).view(B, L, H_kv, d_h).transpose(1, 2)
         
-        # Apply QK-Norm per head before RoPE application
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
+        # CONDITIONAL FORWARD PASS
+        if self.use_qk_norm:
+            q = self.q_norm(q).transpose(1, 2)
+            k = self.k_norm(k).transpose(1, 2)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
         
         q, k = self.rope.apply_rope(q, k, position_ids)
         
@@ -164,11 +169,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class TransformerDecoderBlock(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_grad_checkpointing=False):
+    def __init__(self, d_model, num_heads, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_grad_checkpointing=False, use_qk_norm=False):
         super().__init__()
         self.use_grad_checkpointing = use_grad_checkpointing
         self.ln1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, num_heads, num_kv_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(d_model, num_heads, num_kv_heads, dropout, max_seq_len, use_qk_norm)
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 

@@ -1,14 +1,13 @@
-# /home/martinkb/Desktop/BareTorch_F/train_grpo.py
+# /home/martinkb/Desktop/BareTorch_F/train_dpo.py
 
 import argparse
 import logging
 import os
-import re
 import subprocess
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainerCallback
-from trl import GRPOConfig, GRPOTrainer
+from trl import DPOConfig, DPOTrainer
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
 
@@ -70,50 +69,36 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 # ==============================================================================
-#                           Rule-Based Reward Functions
+#                           ChatML Formatting Utility
 # ==============================================================================
-def format_reward_func(completions, **kwargs):
-    """Rewards the model (+1.0) if it formats reasoning inside <think>...</think> tags."""
-    rewards = []
-    pattern = r"^<think>\n.*?\n</think>\n"
-    for completion in completions:
-        # Get completion text
-        text = completion[0]["content"] if isinstance(completion, list) else completion
-        if re.search(pattern, text, re.DOTALL):
-            rewards.append(1.0)
-        elif "<think>" in text and "</think>" in text:
-            rewards.append(0.5)
-        else:
-            rewards.append(0.0)
-    return rewards
+def format_dpo_sample(example):
+    """
+    Formats raw dataset rows into strict ChatML strings for DPOTrainer.
+    Handles both conversational message lists and raw prompt/chosen/rejected strings.
+    """
+    prompt = example.get("prompt", example.get("question", example.get("instruction", "")))
+    chosen = example.get("chosen", "")
+    rejected = example.get("rejected", "")
 
+    # Handle conversational message lists
+    if isinstance(prompt, list):
+        prompt = "\n".join([f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in prompt])
+    else:
+        prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-def extract_boxed_answer(text):
-    """Extracts answer inside \\boxed{...} tag."""
-    match = re.search(r"\\boxed\{([^}]+)\}", text)
-    if match:
-        return match.group(1).strip()
-    return None
+    if isinstance(chosen, list):
+        chosen = chosen[-1]["content"] if len(chosen) > 0 else ""
+    if isinstance(rejected, list):
+        rejected = rejected[-1]["content"] if len(rejected) > 0 else ""
 
+    formatted_chosen = f"{chosen}<|im_end|>\n"
+    formatted_rejected = f"{rejected}<|im_end|>\n"
 
-def accuracy_reward_func(completions, answer, **kwargs):
-    """Rewards the model (+2.0) if the boxed final answer matches the dataset ground truth."""
-    rewards = []
-    for completion, target in zip(completions, answer):
-        text = completion[0]["content"] if isinstance(completion, list) else completion
-        pred = extract_boxed_answer(text)
-        
-        # Clean target string if it contains GSM8K style answer (#### 42)
-        if "####" in target:
-            clean_target = target.split("####")[-1].strip()
-        else:
-            clean_target = target.strip()
-
-        if pred is not None and pred.lower() == clean_target.lower():
-            rewards.append(2.0)
-        else:
-            rewards.append(0.0)
-    return rewards
+    return {
+        "prompt": prompt,
+        "chosen": formatted_chosen,
+        "rejected": formatted_rejected,
+    }
 
 
 # ==============================================================================
@@ -127,21 +112,21 @@ def main():
         torch.cuda.set_device(local_rank)
 
     parser = argparse.ArgumentParser(
-        description="BareTorch Stage 2: Group Relative Policy Optimization (GRPO) Engine"
+        description="BareTorch Stage 3: Direct Preference Optimization (DPO) Engine"
     )
 
     # Checkpoint Paths
     parser.add_argument(
-        "--sft_model_path",
+        "--model_path",
         type=str,
-        default="./checkpoints_300m_sft",
-        help="Path to SFT-aligned BareTorch checkpoint folder.",
+        default="./checkpoints_300m_grpo",
+        help="Path to SFT/GRPO-aligned BareTorch checkpoint folder.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints_300m_grpo",
-        help="Directory to save RL-trained weights.",
+        default="./checkpoints_300m_dpo",
+        help="Directory to save final DPO aligned weights.",
     )
 
     # Tokenizer & Dataset
@@ -154,23 +139,28 @@ def main():
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default="openai/gsm8k",
-        help="Hugging Face dataset identifier for RL training.",
+        default="argilla/ultrafeedback-binarized-preferences-cleaned",
+        help="Hugging Face preference dataset identifier.",
     )
     parser.add_argument(
         "--dataset_config",
         type=str,
-        default="main",
+        default=None,
         help="Dataset subset/config name.",
     )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=0,
+        help="Sub-sample N rows for fast iteration. Set to 0 for full dataset.",
+    )
 
-    # RL Hyperparameters
-    parser.add_argument("--num_generations", type=int, default=4, help="Group size (G) rollouts per prompt.")
-    parser.add_argument("--max_prompt_length", type=int, default=512)
-    parser.add_argument("--max_completion_length", type=int, default=1024)
-    parser.add_argument("--learning_rate", type=float, default=5e-6, help="GRPO learning rate.")
-    parser.add_argument("--beta", type=float, default=0.04, help="KL penalty factor relative to reference policy.")
-    parser.add_argument("--batch_size", type=int, default=2, help="Per-GPU prompt batch size.")
+    # DPO Hyperparameters
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO temperature scaling factor.")
+    parser.add_argument("--learning_rate", type=float, default=5e-7, help="DPO learning rate.")
+    parser.add_argument("--max_length", type=int, default=2048, help="Max sequence length (prompt + response).")
+    parser.add_argument("--max_prompt_length", type=int, default=1024, help="Max prompt sequence length.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Per-GPU batch size.")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps.")
     parser.add_argument("--num_epochs", type=int, default=1)
 
@@ -204,56 +194,67 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Model Loading
+    # 2. Policy Model Loading
     if local_rank == 0:
-        logger.info(f"Loading SFT model weights from: {args.sft_model_path}")
+        logger.info(f"Loading input model weights from: {args.model_path}")
 
     model = BareTorchForCausalLM.from_pretrained(
-        args.sft_model_path,
+        args.model_path,
         torch_dtype=torch.bfloat16,
     )
 
     model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = True  # Enable KV cache for fast GRPO rollout sampling
+    model.config.use_cache = False  # Disable KV cache during training
 
-    # 3. Load & Format Dataset
+    # 3. Load & Process Dataset
     if local_rank == 0:
-        logger.info(f"Loading RL Dataset '{args.dataset_name}'...")
+        logger.info(f"Loading Preference Dataset '{args.dataset_name}'...")
 
-    raw_dataset = load_dataset(args.dataset_name, args.dataset_config, split="train")
+    dataset_kwargs = {}
+    if args.dataset_config and args.dataset_config.lower() not in ("default", "none", "null"):
+        dataset_kwargs["name"] = args.dataset_config
 
-    def format_prompt(example):
-        system_prompt = (
-            "A conversation between User and Assistant. The user asks a question, "
-            "and the Assistant solves it step by step. The assistant MUST write its reasoning "
-            "process inside <think>...</think> tags and provide the final answer inside \\boxed{}."
+    raw_dataset = load_dataset(args.dataset_name, split="train", **dataset_kwargs)
+
+    if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
+        if local_rank == 0:
+            logger.info(f"✂️ Sub-sampling dataset to {args.max_samples:,} rows.")
+        raw_dataset = raw_dataset.select(range(args.max_samples))
+
+    formatted_dataset = raw_dataset.map(
+        format_dpo_sample,
+        remove_columns=raw_dataset.column_names,
+    )
+
+    dataset_split = formatted_dataset.train_test_split(test_size=0.05, seed=42)
+    train_data = dataset_split["train"]
+    val_data = dataset_split["test"]
+
+    if local_rank == 0:
+        logger.info(
+            f"Dataset split complete: {len(train_data):,} training samples | "
+            f"{len(val_data):,} validation samples."
         )
-        prompt_text = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{example['question']}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        return {"prompt": prompt_text, "answer": example["answer"]}
 
-    train_dataset = raw_dataset.map(format_prompt, remove_columns=raw_dataset.column_names)
-
-    # 4. GRPO Trainer Configuration
-    grpo_args = GRPOConfig(
+    # 4. DPO Config Setup
+    dpo_args = DPOConfig(
         output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
         beta=args.beta,
-        num_generations=args.num_generations,
+        learning_rate=args.learning_rate,
+        max_length=args.max_length,
         max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.num_epochs,
-        logging_steps=10,
+        logging_steps=50,
+        eval_strategy="steps",
+        eval_steps=200,
         save_strategy="steps",
-        save_steps=100,
+        save_steps=500,
         save_total_limit=2,
         bf16=True,
-        use_vllm=False,  # Set to True if using vLLM engine for generation acceleration
+        remove_unused_columns=False,
     )
 
     enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
@@ -266,26 +267,44 @@ def main():
             logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}'")
         callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
 
-    # 5. Initialize & Run GRPOTrainer
-    trainer = GRPOTrainer(
+    # 5. Initialize & Run DPOTrainer
+    trainer = DPOTrainer(
         model=model,
-        reward_funcs=[format_reward_func, accuracy_reward_func],
-        args=grpo_args,
-        train_dataset=train_dataset,
+        ref_model=None,  # Passing None creates an implicit reference copy of the policy model
+        args=dpo_args,
+        train_dataset=train_data,
+        eval_dataset=val_data,
         processing_class=tokenizer,
         callbacks=callbacks,
     )
 
     if local_rank == 0:
-        logger.info("🧠 Starting Stage 2: Group Relative Policy Optimization (GRPO)...")
+        logger.info("⚖️ Starting Stage 3: Direct Preference Optimization (DPO)...")
 
     trainer.train()
 
     if local_rank == 0:
-        logger.info(f"Saving final GRPO checkpoint to '{args.output_dir}'...")
+        logger.info(f"Saving final DPO model weights to '{args.output_dir}'...")
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-        logger.info("✅ Stage 2: GRPO RL completed successfully!")
+        logger.info("✅ Stage 3: DPO Preference Alignment completed successfully!")
+
+        if enable_r2_sync:
+            rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+            target_r2_path = f"r2:{r2_bucket}/{r2_prefix.strip('/')}/{rel_output_dir}"
+            logger.info(f"📤 Syncing final DPO model weights to Cloudflare R2 ({target_r2_path})...")
+            cmd = [
+                "rclone",
+                "copy",
+                args.output_dir,
+                target_r2_path,
+                "--transfers",
+                "8",
+                "--s3-chunk-size",
+                "64M",
+            ]
+            subprocess.run(cmd, check=False)
+            logger.info("✅ Final DPO weights successfully uploaded to Cloudflare R2!")
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()

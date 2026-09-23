@@ -34,6 +34,7 @@ class BareTorchConfig(PretrainedConfig):
         dropout=0.1,
         max_seq_len=4096,
         use_grad_checkpointing=False,
+        use_qk_norm=False,
         layer_types=None,  # Dynamic sequence mapping list, e.g. ["transformer", "cs_lrad", "cs_ttt"]
         pad_token_id=0,
         bos_token_id=1,
@@ -56,6 +57,7 @@ class BareTorchConfig(PretrainedConfig):
         self.dropout = dropout
         self.max_seq_len = max_seq_len
         self.use_grad_checkpointing = use_grad_checkpointing
+        self.use_qk_norm = use_qk_norm
         self.use_cache = kwargs.get("use_cache", True)
 
         # If no explicit layer order is specified, default to an alternating rotation

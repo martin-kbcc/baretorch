@@ -62,7 +62,7 @@ ANNEALING_DATASETS = {"openr1_math", "finemath_4plus", "cosmopedia_v2"}
 GENERAL_RATIOS = {
     "fineweb_edu_100bt": 0.40,  # ~40% of general track
     "stack_dedup": 0.30,        # ~30% of general track
-    "dclm_100bt": 0.20,         # ~20% of general track
+    "dclm_100bt": 0.20,          # ~20% of general track
     "finepdfs_100bt": 0.10,     # ~10% of general track
 }
 
@@ -409,48 +409,80 @@ class DistillTrainer(Trainer):
         return super().create_scheduler(num_training_steps, optimizer)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        import torch.utils.checkpoint as cp
+
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
         teacher_indices = inputs["teacher_indices"]
         teacher_values = inputs["teacher_values"]
 
-        outputs = model(input_ids=input_ids)
-        student_logits = outputs.logits  # Shape: (B, L, Vocab)
+        outputs = model(input_ids=input_ids, output_hidden_states=True)
 
-        shift_logits = student_logits[:, :-1, :]
+        hidden_states = getattr(outputs, "hidden_states", None)
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None and hasattr(model, "module"):
+            lm_head = getattr(model.module, "lm_head", None)
+
+        
+        last_hidden = hidden_states[-1]
+        shift_hidden = last_hidden[:, :-1, :]
         shift_labels = labels[:, 1:]
-
-        # 1. Hard Cross-Entropy Loss
-        loss_ce = F.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.size(-1)),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-        # 2. Memory-Efficient Chunked Full-Vocabulary Sparse KL Loss
         shift_teacher_indices = teacher_indices[:, :-1, :]
         shift_teacher_values = teacher_values[:, :-1, :]
 
         p_teacher_full = F.softmax(shift_teacher_values / self.temperature, dim=-1)
-        
-        num_tokens = shift_logits.size(0) * shift_logits.size(1)
-        loss_kl_sum = 0.0
-        chunk_size = 512  # Sequence slice size to prevent VRAM spikes on large vocabularies
 
-        for c_start in range(0, shift_logits.size(1), chunk_size):
-            c_end = min(c_start + chunk_size, shift_logits.size(1))
+        B, L_shift, _ = shift_hidden.shape
+        num_tokens = B * L_shift
+        chunk_size = 512  # Safe chunk size
 
-            c_logits = shift_logits[:, c_start:c_end, :]
+        total_loss_ce = 0.0
+        total_loss_kl = 0.0
+
+        # ---------------------------------------------------------
+        # INNER FUNCTION FOR GRADIENT CHECKPOINTING
+        # ---------------------------------------------------------
+        def compute_chunk(c_hid, c_lbl, c_t_idx, c_t_p):
+            c_log = lm_head(c_hid)
+            ce = F.cross_entropy(
+                c_log.reshape(-1, c_log.size(-1)),
+                c_lbl.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            lps = F.log_softmax(c_log / self.temperature, dim=-1)
+            st_top4 = torch.gather(lps, dim=-1, index=c_t_idx)
+            kl = F.kl_div(st_top4, c_t_p, reduction="sum")
+            return ce, kl
+
+        for c_start in range(0, L_shift, chunk_size):
+            c_end = min(c_start + chunk_size, L_shift)
+
+            c_hidden = shift_hidden[:, c_start:c_end, :]
+            c_labels = shift_labels[:, c_start:c_end]
             c_teacher_idx = shift_teacher_indices[:, c_start:c_end, :]
             c_p_teacher = p_teacher_full[:, c_start:c_end, :]
 
-            c_log_p_student = F.log_softmax(c_logits / self.temperature, dim=-1)
-            c_student_top4_log_p = torch.gather(c_log_p_student, dim=-1, index=c_teacher_idx)
+            # Apply gradient checkpointing to discard massive intermediate logits
+            if c_hidden.requires_grad:
+                c_loss_ce, c_loss_kl = cp.checkpoint(
+                    compute_chunk,
+                    c_hidden,
+                    c_labels,
+                    c_teacher_idx,
+                    c_p_teacher,
+                    use_reentrant=False
+                )
+            else:
+                c_loss_ce, c_loss_kl = compute_chunk(
+                    c_hidden, c_labels, c_teacher_idx, c_p_teacher
+                )
 
-            loss_kl_sum += F.kl_div(c_student_top4_log_p, c_p_teacher, reduction="sum")
+            total_loss_ce += c_loss_ce
+            total_loss_kl += c_loss_kl
 
-        loss_kl = (loss_kl_sum / num_tokens) * (self.temperature ** 2)
-
+        loss_ce = total_loss_ce / num_tokens
+        loss_kl = (total_loss_kl / num_tokens) * (self.temperature ** 2)
         total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl)
 
         return (total_loss, outputs) if return_outputs else total_loss
@@ -499,6 +531,7 @@ def main():
     parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
     parser.add_argument("--tie_embeddings", action="store_true", default=True, help="Tie input & output embedding weights.")
+    parser.add_argument("--use_qk_norm", action="store_true", default=True, help="Enable per-head QK-Normalization in attention layers.")
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
 
@@ -550,6 +583,7 @@ def main():
         "max_seq_len": args.seq_len,
         "num_kv_heads": max(1, args.num_heads // 4),
         "use_grad_checkpointing": args.grad_checkpointing,
+        "use_qk_norm": args.use_qk_norm,
         "tie_word_embeddings": args.tie_embeddings,
     }
 
@@ -587,6 +621,7 @@ def main():
         logger.info("=" * 70)
         logger.info(f"🤖 Model Architecture Initialized: {args.model_type}")
         logger.info(f"   ├─ Tied Embeddings     : {args.tie_embeddings}")
+        logger.info(f"   ├─ QK Normalization    : {args.use_qk_norm}")
         logger.info(f"   ├─ Total Parameters     : {total_params / 1e9:.3f} Billion ({total_params:,})")
         logger.info(f"   ├─ Trainable Parameters : {trainable_params / 1e9:.3f} Billion ({trainable_params:,})")
         logger.info(f"   └─ LR Schedule          : {args.scheduler.upper()} (Warmup={args.warmup_steps} steps)")

@@ -83,9 +83,8 @@ class R2CheckpointCallback(TrainerCallback):
 def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
     """Packs multi-turn ChatML conversations into dense 2048-token blocks.
 
-    Eliminates padding tokens completely, preventing CS-LRAD recurrent state
-    contamination, guaranteeing static tensor shapes for torch.compile, and
-    maximizing training throughput.
+    Applies completion-only loss masking by setting user/system turns AND 
+    assistant header tags ('<|im_start|>assistant\n') to -100.
     """
     if local_rank == 0:
         logger.info(
@@ -112,24 +111,26 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            # Format ChatML block for this turn (uses native ChatML tokens in SmolLM2)
-            formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
-            tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
-
-            all_input_ids.extend(tokens)
-
-            # Apply loss masking (compute loss ONLY on assistant completions)
             if role == "assistant":
-                all_labels.extend(tokens)
+                header_str = f"<|im_start|>{role}\n"
+                header_tokens = tokenizer.encode(header_str, add_special_tokens=False)
+                
+                body_str = f"{content}<|im_end|>\n"
+                body_tokens = tokenizer.encode(body_str, add_special_tokens=False)
+
+                all_input_ids.extend(header_tokens + body_tokens)
+                all_labels.extend([-100] * len(header_tokens) + body_tokens)
             else:
+                formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
+                tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
+
+                all_input_ids.extend(tokens)
                 all_labels.extend([-100] * len(tokens))
 
-        # Continuously extract max_seq_len-token blocks
         while len(all_input_ids) >= max_seq_len:
             chunk_input_ids = all_input_ids[:max_seq_len]
             chunk_labels = all_labels[:max_seq_len]
 
-            # Guarantee at least one valid assistant target token exists in shifted labels
             if any(lbl != -100 for lbl in chunk_labels[1:]):
                 packed_samples.append({
                     "input_ids": chunk_input_ids,
@@ -149,7 +150,6 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
 
 
 def main():
-    # Distributed Initialization for torchrun
     if "LOCAL_RANK" in os.environ:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend="nccl")
@@ -164,13 +164,13 @@ def main():
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
-        default="./checkpoints_500m_hybrid_baretorch/checkpoint-190735",
+        default="./checkpoints_300M_6B/checkpoint-91552",
         help="Path to pre-trained BareTorch checkpoint folder.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints_500m_sft",
+        default="./checkpoints_300m_sft",
         help="Directory to save fine-tuned SFT weights.",
     )
 
@@ -178,7 +178,7 @@ def main():
     parser.add_argument(
         "--tokenizer_name",
         type=str,
-        default="HuggingFaceTB/SmolLM2-360M",
+        default="Qwen/Qwen3.5-9B",
         help="Hugging Face tokenizer identifier.",
     )
     parser.add_argument(
@@ -248,16 +248,14 @@ def main():
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    # 1. Tokenizer Setup (Using Native Base Vocabulary)
     if local_rank == 0:
         logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
     tokenizer.model_max_length = args.seq_len
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Model Loading
     if local_rank == 0:
         logger.info(
             f"Loading pre-trained model weights from: {args.pretrained_model_path}"
@@ -268,12 +266,10 @@ def main():
         torch_dtype=torch.bfloat16,
     )
 
-    # Model runtime configurations
     model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = False  # Disable KV caching during training
+    model.config.use_cache = False
     model.config.use_grad_checkpointing = args.grad_checkpointing
 
-    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
     if args.compile:
         if local_rank == 0:
             logger.info(
@@ -287,15 +283,12 @@ def main():
                 compiled_blocks += 1
         if local_rank == 0:
             logger.info(
-                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent"
-                " sub-module(s)."
+                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s)."
             )
 
-    # 3. Load & Process Dataset with Sequence Packing
     if local_rank == 0:
         logger.info(
-            f"Loading SFT Dataset '{args.dataset_name}' (Config:"
-            f" {args.dataset_config})..."
+            f"Loading SFT Dataset '{args.dataset_name}' (Config: {args.dataset_config})..."
         )
 
     dataset_kwargs = {}
@@ -309,28 +302,24 @@ def main():
     if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
         if local_rank == 0:
             logger.info(
-                f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to"
-                f" {args.max_samples:,} rows."
+                f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to {args.max_samples:,} rows."
             )
         raw_dataset = raw_dataset.select(range(args.max_samples))
 
-    # Pack conversations into dense, zero-padded 2048-token sequences
     processed_dataset = pack_chatml_dataset(
         raw_dataset, tokenizer, max_seq_len=args.seq_len, local_rank=local_rank
     )
 
-    # Split 5% off for validation
     dataset_split = processed_dataset.train_test_split(test_size=0.05, seed=42)
     train_data = dataset_split["train"]
     val_data = dataset_split["test"]
 
     if local_rank == 0:
         logger.info(
-            f"Dataset split complete: {len(train_data):,} training samples |"
-            f" {len(val_data):,} validation samples."
+            f"Dataset split complete: {len(train_data):,} training samples | "
+            f"{len(val_data):,} validation samples."
         )
 
-    # 4. Training Configurations
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -356,12 +345,7 @@ def main():
         dataloader_pin_memory=True,
     )
 
-    # Detect R2 sync activation via argument or environment variables
-    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
     r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
     r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
 
@@ -369,17 +353,14 @@ def main():
     if enable_r2_sync:
         if local_rank == 0:
             logger.info(
-                f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' |"
-                f" Prefix: '{r2_prefix}'"
+                f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'"
             )
         callbacks.append(
             R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix)
         )
     else:
         if local_rank == 0:
-            logger.info(
-                "R2 sync disabled. Running in local mode (disk checkpoints only)."
-            )
+            logger.info("R2 sync disabled. Running in local mode (disk checkpoints only).")
 
     trainer = Trainer(
         model=model,
@@ -390,13 +371,11 @@ def main():
         callbacks=callbacks,
     )
 
-    # 5. Launch Supervised Fine-Tuning
     if local_rank == 0:
         logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT)...")
 
     trainer.train()
 
-    # Save final model and tokenizer config
     if local_rank == 0:
         logger.info(f"Saving final SFT checkpoint to '{args.output_dir}'...")
         trainer.save_model(args.output_dir)
@@ -423,9 +402,7 @@ def main():
                 "64M",
             ]
             subprocess.run(cmd, check=False)
-            logger.info(
-                "✅ Final SFT weights successfully uploaded to Cloudflare R2!"
-            )
+            logger.info("✅ Final SFT weights successfully uploaded to Cloudflare R2!")
 
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
