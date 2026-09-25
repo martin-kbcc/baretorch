@@ -674,7 +674,6 @@ def main():
         gradient_checkpointing=args.grad_checkpointing,
         fsdp="shard_grad_op",  # Shards AdamW optimizer states across GPUs (ZeRO-2)
         fsdp_config={
-            "min_num_params": 100000000,  # Auto-wraps only large layer blocks (>100M params), leaving root tied embeddings intact
             "limit_all_gathers": True,
         },
         ddp_find_unused_parameters=False,
