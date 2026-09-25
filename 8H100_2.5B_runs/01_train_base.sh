@@ -93,7 +93,6 @@ torchrun --nproc_per_node=${NUM_GPUS} "${ROOT_DIR}/train_distill.py" \
     --alpha_kl ${ALPHA_KL} \
     --temperature ${TEMPERATURE} \
     --use_qk_norm \
-    --tie_embeddings \
     --compile \
     --logging_steps ${LOGGING_STEPS} \
     --save_steps ${SAVE_STEPS} \

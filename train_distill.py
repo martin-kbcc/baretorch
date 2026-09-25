@@ -551,7 +551,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints_distill_2.5B")
     parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
-    parser.add_argument("--tie_embeddings", action="store_true", default=True, help="Tie input & output embedding weights.")
+    parser.add_argument("--tie_embeddings", action="store_true", default=False, help="Tie input & output embedding weights.")
     parser.add_argument("--use_qk_norm", action="store_true", default=True, help="Enable per-head QK-Normalization in attention layers.")
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
