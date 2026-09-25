@@ -95,6 +95,7 @@ torchrun --nproc_per_node=${NUM_GPUS} "${ROOT_DIR}/train_distill.py" \
     --use_qk_norm \
     --tie_embeddings \
     --compile \
+    --grad_checkpointing \
     --logging_steps ${LOGGING_STEPS} \
     --save_steps ${SAVE_STEPS} \
     --eval_steps ${EVAL_STEPS} \
