@@ -621,6 +621,26 @@ def main():
         elif hasattr(model, "lm_head") and hasattr(model, "embed_tokens"):
             model.lm_head.weight = model.embed_tokens.weight
 
+    # Dynamically extract layer class names so FSDP auto-wraps ONLY intermediate decoder blocks
+    layer_cls_set = set()
+    layers_attr = getattr(model, "layers", None)
+    if layers_attr is None and hasattr(model, "model"):
+        layers_attr = getattr(model.model, "layers", None)
+
+    if layers_attr is not None:
+        for layer_mod in layers_attr:
+            layer_cls_set.add(layer_mod.__class__.__name__)
+    else:
+        for name, module in model.named_modules():
+            c_name = module.__class__.__name__
+            if any(k in c_name.lower() or k in name.lower() for k in ["layer", "block", "decoder"]):
+                if module is not model and module is not getattr(model, "model", None):
+                    layer_cls_set.add(c_name)
+
+    fsdp_layer_cls = list(layer_cls_set)
+    if local_rank == 0:
+        logger.info(f"FSDP Transformer Layer Classes to Wrap: {fsdp_layer_cls}")
+
     # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
     if args.compile:
         if local_rank == 0:
@@ -674,6 +694,7 @@ def main():
         gradient_checkpointing=args.grad_checkpointing,
         fsdp="shard_grad_op",  # Shards AdamW optimizer states across GPUs (ZeRO-2)
         fsdp_config={
+            "transformer_layer_cls_to_wrap": fsdp_layer_cls,
             "limit_all_gathers": True,
         },
         ddp_find_unused_parameters=False,
