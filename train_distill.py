@@ -6,6 +6,8 @@ import random
 import subprocess
 import numpy as np
 import torch
+# Enable TF32 for Tensor Core acceleration
+torch.set_float32_matmul_precision("high")
 import torch.serialization
 
 # 1. Comprehensive allowlist for NumPy types in PyTorch 2.6+
