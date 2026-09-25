@@ -13,13 +13,13 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 # Hardware Setup (8x H100 SXM5 80GB Cluster)
 NUM_GPUS=8
 
-# BareTorch Model Architecture
+# BareTorch Model Architecture (Adjusted to 2.5B Untied)
 MODEL_TYPE="baretorch"
 LAYER_SEQUENCE="cs_lrad,cs_lrad,cs_lrad,transformer"
 TOKENIZER_NAME="Qwen/Qwen3.5-9B"
 D_MODEL=2048
 NUM_HEADS=16
-NUM_LAYERS=36
+NUM_LAYERS=24
 SEQ_LEN=2048
 RANK=16
 
@@ -61,7 +61,7 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 echo "======================================================================"
 echo "🚀 Launching Production BareTorch Distillation Engine (8x H100 SXM5 80GB)"
 echo "  ├─ Hardware Config   : ${NUM_GPUS}x NVIDIA H100 SXM5 (80GB)"
-echo "  ├─ Model Dimension   : d_model=${D_MODEL}, layers=${NUM_LAYERS}, heads=${NUM_HEADS} (3.29B Params)"
+echo "  ├─ Model Dimension   : d_model=${D_MODEL}, layers=${NUM_LAYERS}, heads=${NUM_HEADS} (~2.53B Untied)"
 echo "  ├─ Batch Setup       : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
 echo "  ├─ Step Throughput   : ${TOKENS_PER_STEP} tokens/step (~524k tokens/step)"
 echo "  ├─ Target Dataset    : 50 Billion Tokens"
