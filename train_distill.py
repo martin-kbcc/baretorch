@@ -8,6 +8,8 @@ import numpy as np
 import torch
 # Enable TF32 for Tensor Core acceleration
 torch.set_float32_matmul_precision("high")
+# Bypass the buggy cuDNN attention backend during Evaluation
+torch.backends.cuda.enable_cudnn_sdp(False)
 import torch.serialization
 
 # 1. Comprehensive allowlist for NumPy types in PyTorch 2.6+
