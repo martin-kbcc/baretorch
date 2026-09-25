@@ -445,7 +445,6 @@ class DistillTrainer(Trainer):
         if lm_head is None and hasattr(model, "module"):
             lm_head = getattr(model.module, "lm_head", None)
 
-        
         last_hidden = hidden_states[-1]
         shift_hidden = last_hidden[:, :-1, :]
         shift_labels = labels[:, 1:]
@@ -456,25 +455,37 @@ class DistillTrainer(Trainer):
 
         B, L_shift, _ = shift_hidden.shape
         num_tokens = B * L_shift
-        chunk_size = 512  # Safe chunk size
+        
+        # Reduced chunk size from 512 to 128 to keep peak 248k-vocab logit tensors under 1 GB
+        chunk_size = getattr(self.args, "chunk_size", 128)
 
         total_loss_ce = 0.0
         total_loss_kl = 0.0
 
-        # ---------------------------------------------------------
-        # INNER FUNCTION FOR GRADIENT CHECKPOINTING
-        # ---------------------------------------------------------
-        def compute_chunk(c_hid, c_lbl, c_t_idx, c_t_p):
-            c_log = lm_head(c_hid)
+        # Memory-optimized chunk worker using logsumexp + top-4 gather
+        def compute_chunk(c_hid, c_lbl, c_t_idx, c_p_teacher):
+            # 1. Project to vocabulary logits scaled by temperature
+            c_log = lm_head(c_hid) / self.temperature
+            
+            # 2. Cross-entropy loss on full student unscaled logits
             ce = F.cross_entropy(
-                c_log.reshape(-1, c_log.size(-1)),
+                (c_log * self.temperature).reshape(-1, c_log.size(-1)),
                 c_lbl.reshape(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
-            lps = F.log_softmax(c_log / self.temperature, dim=-1)
-            st_top4 = torch.gather(lps, dim=-1, index=c_t_idx)
-            kl = F.kl_div(st_top4, c_t_p, reduction="sum")
+            
+            # 3. Log-Sum-Exp over vocab dimension -> shape [B, chunk, 1] (negligible VRAM)
+            lse = torch.logsumexp(c_log, dim=-1, keepdim=True)
+            
+            # 4. Gather student scaled logits ONLY at teacher top-4 indices -> shape [B, chunk, 4]
+            c_t_log = torch.gather(c_log, dim=-1, index=c_t_idx)
+            
+            # 5. Exact log_softmax at top-4 positions without allocating full [B, chunk, 248320] tensor
+            st_top4 = c_t_log - lse
+            
+            # 6. KL divergence on top-4 probability vectors
+            kl = F.kl_div(st_top4, c_p_teacher, reduction="sum")
             return ce, kl
 
         for c_start in range(0, L_shift, chunk_size):
@@ -485,7 +496,6 @@ class DistillTrainer(Trainer):
             c_teacher_idx = shift_teacher_indices[:, c_start:c_end, :]
             c_p_teacher = p_teacher_full[:, c_start:c_end, :]
 
-            # Apply gradient checkpointing to discard massive intermediate logits
             if c_hidden.requires_grad:
                 c_loss_ce, c_loss_kl = cp.checkpoint(
                     compute_chunk,
@@ -493,7 +503,7 @@ class DistillTrainer(Trainer):
                     c_labels,
                     c_teacher_idx,
                     c_p_teacher,
-                    use_reentrant=False
+                    use_reentrant=False,
                 )
             else:
                 c_loss_ce, c_loss_kl = compute_chunk(

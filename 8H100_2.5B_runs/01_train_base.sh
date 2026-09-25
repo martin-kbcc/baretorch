@@ -24,10 +24,10 @@ SEQ_LEN=2048
 RANK=16
 
 # Optimization & Batching for 80GB H100 VRAM
-# Global Batch = 8 GPUs * 4 per-device batch * 8 grad accum = 256 sequences/step
+# Global Batch = 8 GPUs * 8 per-device batch * 4 grad accum = 256 sequences/step
 # Token Throughput = 256 * 2048 = 524,288 tokens/step (~0.52M tokens/step)
-PER_GPU_BATCH_SIZE=4
-GRAD_ACCUM=8
+PER_GPU_BATCH_SIZE=8
+GRAD_ACCUM=4
 LEARNING_RATE=5e-4
 SCHEDULER="wsd"
 WARMUP_STEPS=2000
@@ -95,7 +95,6 @@ torchrun --nproc_per_node=${NUM_GPUS} "${ROOT_DIR}/train_distill.py" \
     --use_qk_norm \
     --tie_embeddings \
     --compile \
-    --grad_checkpointing \
     --logging_steps ${LOGGING_STEPS} \
     --save_steps ${SAVE_STEPS} \
     --eval_steps ${EVAL_STEPS} \
