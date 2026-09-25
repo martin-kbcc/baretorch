@@ -551,7 +551,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints_distill_2.5B")
     parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
-    parser.add_argument("--tie_embeddings", action="store_true", default=False, help="Tie input & output embedding weights.")
+    parser.add_argument("--tie_embeddings", action="store_true", default=True, help="Tie input & output embedding weights.")
     parser.add_argument("--use_qk_norm", action="store_true", default=True, help="Enable per-head QK-Normalization in attention layers.")
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
@@ -673,6 +673,10 @@ def main():
         torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
         gradient_checkpointing=args.grad_checkpointing,
         fsdp="shard_grad_op",  # Shards AdamW optimizer states across GPUs (ZeRO-2)
+        fsdp_config={
+            "min_num_params": 100000000,  # Auto-wraps only large layer blocks (>100M params), leaving root tied embeddings intact
+            "limit_all_gathers": True,
+        },
         ddp_find_unused_parameters=False,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
