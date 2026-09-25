@@ -7,6 +7,7 @@ import subprocess
 import numpy as np
 import torch
 import torch.serialization
+
 # 1. Comprehensive allowlist for NumPy types in PyTorch 2.6+
 safe_numpy_types = [np.dtype, np.ndarray]
 for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
@@ -22,12 +23,14 @@ try:
     torch.serialization.add_safe_globals(safe_numpy_types)
 except Exception:
     pass
+
 # 2. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
 _orig_torch_load = torch.load
 def _patched_torch_load(*args, **kwargs):
     kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
 torch.load = _patched_torch_load
+
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset, Sampler
@@ -455,37 +458,23 @@ class DistillTrainer(Trainer):
 
         B, L_shift, _ = shift_hidden.shape
         num_tokens = B * L_shift
-        
-        # Reduced chunk size from 512 to 128 to keep peak 248k-vocab logit tensors under 1 GB
-        chunk_size = getattr(self.args, "chunk_size", 128)
+        chunk_size = 512  # Original safe chunk size
 
         total_loss_ce = 0.0
         total_loss_kl = 0.0
 
-        # Memory-optimized chunk worker using logsumexp + top-4 gather
-        def compute_chunk(c_hid, c_lbl, c_t_idx, c_p_teacher):
-            # 1. Project to vocabulary logits scaled by temperature
-            c_log = lm_head(c_hid) / self.temperature
-            
-            # 2. Cross-entropy loss on full student unscaled logits
+        # Exact original workstation loss computation
+        def compute_chunk(c_hid, c_lbl, c_t_idx, c_t_p):
+            c_log = lm_head(c_hid)
             ce = F.cross_entropy(
-                (c_log * self.temperature).reshape(-1, c_log.size(-1)),
+                c_log.reshape(-1, c_log.size(-1)),
                 c_lbl.reshape(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
-            
-            # 3. Log-Sum-Exp over vocab dimension -> shape [B, chunk, 1] (negligible VRAM)
-            lse = torch.logsumexp(c_log, dim=-1, keepdim=True)
-            
-            # 4. Gather student scaled logits ONLY at teacher top-4 indices -> shape [B, chunk, 4]
-            c_t_log = torch.gather(c_log, dim=-1, index=c_t_idx)
-            
-            # 5. Exact log_softmax at top-4 positions without allocating full [B, chunk, 248320] tensor
-            st_top4 = c_t_log - lse
-            
-            # 6. KL divergence on top-4 probability vectors
-            kl = F.kl_div(st_top4, c_p_teacher, reduction="sum")
+            lps = F.log_softmax(c_log / self.temperature, dim=-1)
+            st_top4 = torch.gather(lps, dim=-1, index=c_t_idx)
+            kl = F.kl_div(st_top4, c_t_p, reduction="sum")
             return ce, kl
 
         for c_start in range(0, L_shift, chunk_size):
@@ -683,6 +672,7 @@ def main():
         save_total_limit=3,
         torch_compile=False,  # Explicitly False; targeted compilation applied directly to CS-LRAD above
         gradient_checkpointing=args.grad_checkpointing,
+        fsdp="shard_grad_op",  # Shards AdamW optimizer states across GPUs (ZeRO-2)
         ddp_find_unused_parameters=False,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,

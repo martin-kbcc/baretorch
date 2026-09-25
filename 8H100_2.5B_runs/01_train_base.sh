@@ -23,20 +23,20 @@ NUM_LAYERS=36
 SEQ_LEN=2048
 RANK=16
 
-# Optimization & Batching for 80GB H100 VRAM
-# Global Batch = 8 GPUs * 4 per-device batch * 8 grad accum = 256 sequences/step
+# Optimization & Batching for 80GB H100 VRAM + FSDP (ZeRO-2)
+# Global Batch = 8 GPUs * 16 per-device batch * 2 grad accum = 256 sequences/step
 # Token Throughput = 256 * 2048 = 524,288 tokens/step (~0.52M tokens/step)
-PER_GPU_BATCH_SIZE=4
-GRAD_ACCUM=8
+PER_GPU_BATCH_SIZE=16
+GRAD_ACCUM=2
 LEARNING_RATE=5e-4
 SCHEDULER="wsd"
-WARMUP_STEPS=2000
+WARMUP_STEPS=1000
 
-# 100 Billion Tokens Target Calculation:
-# Total Steps = 100,000,000,000 / 524,288 ≈ 190,735 steps
-MAX_STEPS=190735
-# 15% High-Density WSD Annealing Phase (~15.0 Billion Tokens)
-DECAY_STEPS=28610     
+# 50 Billion Tokens Target Calculation:
+# Total Steps = 50,000,000,000 / 524,288 ≈ 95,368 steps
+MAX_STEPS=95368
+# 15% High-Density WSD Annealing Phase (~7.5 Billion Tokens)
+DECAY_STEPS=14305     
 WEIGHT_DECAY=0.1
 
 # Distillation Hyperparameters
@@ -45,9 +45,9 @@ ALPHA_KL=0.5
 TEMPERATURE=1.0
 
 # Output Paths & Cloud Persistence
-OUTPUT_DIR="${ROOT_DIR}/checkpoints_distill_2.5B_100BT"
+OUTPUT_DIR="${ROOT_DIR}/checkpoints_distill_2.5B_50BT"
 DATA_CACHE_DIR="${ROOT_DIR}/teacher_predictions"
-R2_PREFIX="checkpoints_2.5B_100BT"
+R2_PREFIX="checkpoints_2.5B_50BT"
 
 LOGGING_STEPS=250
 SAVE_STEPS=5000       # Checkpoint and sync to Cloudflare R2 every ~2.62B tokens
@@ -64,7 +64,7 @@ echo "  ├─ Hardware Config   : ${NUM_GPUS}x NVIDIA H100 SXM5 (80GB)"
 echo "  ├─ Model Dimension   : d_model=${D_MODEL}, layers=${NUM_LAYERS}, heads=${NUM_HEADS} (2.5B Params)"
 echo "  ├─ Batch Setup       : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
 echo "  ├─ Step Throughput   : ${TOKENS_PER_STEP} tokens/step (~524k tokens/step)"
-echo "  ├─ Target Dataset    : 100 Billion Tokens"
+echo "  ├─ Target Dataset    : 50 Billion Tokens"
 echo "  ├─ Total Steps       : ${MAX_STEPS} steps"
 echo "  ├─ WSD Annealing     : Warmup=${WARMUP_STEPS} steps | Decay=${DECAY_STEPS} steps"
 echo "  └─ Cloud Sync        : Active -> Cloudflare R2 (${R2_PREFIX})"
@@ -95,7 +95,6 @@ torchrun --nproc_per_node=${NUM_GPUS} "${ROOT_DIR}/train_distill.py" \
     --use_qk_norm \
     --tie_embeddings \
     --compile \
-    --grad_checkpointing \
     --logging_steps ${LOGGING_STEPS} \
     --save_steps ${SAVE_STEPS} \
     --eval_steps ${EVAL_STEPS} \
