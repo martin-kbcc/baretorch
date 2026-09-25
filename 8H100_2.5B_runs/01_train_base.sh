@@ -49,9 +49,9 @@ OUTPUT_DIR="${ROOT_DIR}/checkpoints_distill_2.5B_50BT"
 DATA_CACHE_DIR="${ROOT_DIR}/teacher_predictions"
 R2_PREFIX="checkpoints_2.5B_50BT"
 
-LOGGING_STEPS=10
-SAVE_STEPS=10      # Checkpoint and sync to Cloudflare R2 every ~2.62B tokens
-EVAL_STEPS=10
+LOGGING_STEPS=250
+SAVE_STEPS=2000      # Checkpoint and sync to Cloudflare R2 every ~1.04B tokens
+EVAL_STEPS=2000
 
 mkdir -p "$OUTPUT_DIR"
 
