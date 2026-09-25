@@ -5,8 +5,8 @@ import logging
 import os
 import subprocess
 import numpy as np
-from datasets import Dataset, load_dataset
 import torch
+from datasets import Dataset, load_dataset, interleave_datasets
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
@@ -17,6 +17,9 @@ from transformers import (
 )
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
+
+# Disable Hugging Face Rust parallelism warnings/deadlocks in torchrun
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ==============================================================================
 #                                Logging Configuration
@@ -81,19 +84,21 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
-    """Packs multi-turn ChatML conversations into dense 2048-token blocks.
+    """Packs multi-turn ChatML conversations using Whole-Sample Packing.
 
-    Applies completion-only loss masking by setting user/system turns AND 
-    assistant header tags ('<|im_start|>assistant\n') to -100.
+    Guarantees no conversation is cut in half across sequence boundaries.
+    Applies completion-only loss masking (-100 for prompts/headers).
+    Uses compact NumPy memory buffers to eliminate CPU RAM OOMs.
     """
     if local_rank == 0:
         logger.info(
-            "📦 Packing ChatML conversations into dense 2048-token blocks..."
+            "📦 Packing ChatML conversations (Whole-Sample Packing, High Memory Efficiency)..."
         )
 
-    all_input_ids = []
-    all_labels = []
+    vocab_size = len(tokenizer)
     packed_samples = []
+    current_ids = []
+    current_labels = []
 
     iterator = tqdm(
         raw_dataset,
@@ -107,6 +112,9 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
         if not messages:
             continue
 
+        sample_ids = []
+        sample_labels = []
+
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -114,36 +122,74 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
             if role == "assistant":
                 header_str = f"<|im_start|>{role}\n"
                 header_tokens = tokenizer.encode(header_str, add_special_tokens=False)
-                
                 body_str = f"{content}<|im_end|>\n"
                 body_tokens = tokenizer.encode(body_str, add_special_tokens=False)
 
-                all_input_ids.extend(header_tokens + body_tokens)
-                all_labels.extend([-100] * len(header_tokens) + body_tokens)
+                sample_ids.extend(header_tokens + body_tokens)
+                sample_labels.extend([-100] * len(header_tokens) + body_tokens)
             else:
                 formatted_turn = f"<|im_start|>{role}\n{content}<|im_end|>\n"
                 tokens = tokenizer.encode(formatted_turn, add_special_tokens=False)
 
-                all_input_ids.extend(tokens)
-                all_labels.extend([-100] * len(tokens))
+                sample_ids.extend(tokens)
+                sample_labels.extend([-100] * len(tokens))
 
-        while len(all_input_ids) >= max_seq_len:
-            chunk_input_ids = all_input_ids[:max_seq_len]
-            chunk_labels = all_labels[:max_seq_len]
+        if len(sample_ids) > max_seq_len:
+            continue
 
-            if any(lbl != -100 for lbl in chunk_labels[1:]):
+        if len(current_ids) + len(sample_ids) > max_seq_len:
+            pad_len = max_seq_len - len(current_ids)
+            chunk_ids = current_ids + [tokenizer.pad_token_id] * pad_len
+            chunk_labels = current_labels + [-100] * pad_len
+            chunk_mask = [1] * len(current_ids) + [0] * pad_len
+
+            if any(lbl != -100 for lbl in chunk_labels):
+                clean_ids = [
+                    t if (0 <= t < vocab_size) else tokenizer.pad_token_id
+                    for t in chunk_ids
+                ]
+                clean_labels = [
+                    lbl if (0 <= lbl < vocab_size or lbl == -100) else -100
+                    for lbl in chunk_labels
+                ]
+
                 packed_samples.append({
-                    "input_ids": chunk_input_ids,
-                    "labels": chunk_labels,
-                    "attention_mask": [1] * max_seq_len,
+                    "input_ids": np.array(clean_ids, dtype=np.int32),
+                    "labels": np.array(clean_labels, dtype=np.int32),
+                    "attention_mask": np.array(chunk_mask, dtype=np.int8),
                 })
 
-            all_input_ids = all_input_ids[max_seq_len:]
-            all_labels = all_labels[max_seq_len:]
+            current_ids = []
+            current_labels = []
+
+        current_ids.extend(sample_ids)
+        current_labels.extend(sample_labels)
+
+    if current_ids:
+        pad_len = max_seq_len - len(current_ids)
+        chunk_ids = current_ids + [tokenizer.pad_token_id] * pad_len
+        chunk_labels = current_labels + [-100] * pad_len
+        chunk_mask = [1] * len(current_ids) + [0] * pad_len
+
+        if any(lbl != -100 for lbl in chunk_labels):
+            clean_ids = [
+                t if (0 <= t < vocab_size) else tokenizer.pad_token_id
+                for t in chunk_ids
+            ]
+            clean_labels = [
+                lbl if (0 <= lbl < vocab_size or lbl == -100) else -100
+                for lbl in chunk_labels
+            ]
+
+            packed_samples.append({
+                "input_ids": np.array(clean_ids, dtype=np.int32),
+                "labels": np.array(clean_labels, dtype=np.int32),
+                "attention_mask": np.array(chunk_mask, dtype=np.int8),
+            })
 
     if local_rank == 0:
         logger.info(
-            f"✅ Packing complete: Created {len(packed_samples):,} dense {max_seq_len}-token sequences."
+            f"✅ Packing complete: Created {len(packed_samples):,} whole-sample packed {max_seq_len}-token sequences."
         )
 
     return Dataset.from_list(packed_samples)
@@ -160,7 +206,6 @@ def main():
         description="BareTorch Stage 1: Supervised Fine-Tuning (SFT) Engine"
     )
 
-    # Checkpoint Paths
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
@@ -174,24 +219,11 @@ def main():
         help="Directory to save fine-tuned SFT weights.",
     )
 
-    # Tokenizer & Dataset Parameters
     parser.add_argument(
         "--tokenizer_name",
         type=str,
         default="Qwen/Qwen3.5-9B",
         help="Hugging Face tokenizer identifier.",
-    )
-    parser.add_argument(
-        "--dataset_name",
-        type=str,
-        default="HuggingFaceTB/smol-smoltalk",
-        help="Hugging Face SFT dataset path.",
-    )
-    parser.add_argument(
-        "--dataset_config",
-        type=str,
-        default="default",
-        help="Dataset subset/config name (e.g., 'default' or 'all').",
     )
     parser.add_argument(
         "--max_samples",
@@ -200,7 +232,6 @@ def main():
         help="Sub-sample N rows for fast iteration. Set to 0 for full dataset.",
     )
 
-    # Hyperparameters
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument(
         "--batch_size", type=int, default=4, help="Per-GPU batch size."
@@ -225,7 +256,6 @@ def main():
         help="Enable gradient checkpointing.",
     )
 
-    # Cloud Storage / Sync
     parser.add_argument(
         "--r2_sync",
         action="store_true",
@@ -245,7 +275,6 @@ def main():
     )
 
     args = parser.parse_args()
-
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if local_rank == 0:
@@ -286,29 +315,65 @@ def main():
                 f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s)."
             )
 
+    # --------------------------------------------------------------------------
+    # Distributed Rank-0 Dataset Preparation and Disk Caching
+    # --------------------------------------------------------------------------
+    cache_dir = os.path.join(args.output_dir, "packed_dataset")
+
     if local_rank == 0:
-        logger.info(
-            f"Loading SFT Dataset '{args.dataset_name}' (Config: {args.dataset_config})..."
-        )
+        if not os.path.exists(cache_dir):
+            logger.info("Loading SFT Datasets (60% Chat / 20% Code / 20% Math)...")
 
-    dataset_kwargs = {}
-    if args.dataset_config and args.dataset_config.lower() not in ("default", "none", "null"):
-        dataset_kwargs["name"] = args.dataset_config
+            ds_chat = load_dataset("HuggingFaceTB/smoltalk", "all", split="train")
 
-    raw_dataset = load_dataset(
-        args.dataset_name, split="train", **dataset_kwargs
-    )
-
-    if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
-        if local_rank == 0:
-            logger.info(
-                f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to {args.max_samples:,} rows."
+            ds_code = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K", split="train")
+            ds_code = ds_code.map(
+                lambda x: {
+                    "messages": [
+                        {"role": "user", "content": x["instruction"]},
+                        {"role": "assistant", "content": x["response"]},
+                    ]
+                },
+                remove_columns=ds_code.column_names,
             )
-        raw_dataset = raw_dataset.select(range(args.max_samples))
 
-    processed_dataset = pack_chatml_dataset(
-        raw_dataset, tokenizer, max_seq_len=args.seq_len, local_rank=local_rank
-    )
+            ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train")
+            ds_math = ds_math.map(
+                lambda x: {
+                    "messages": [
+                        {"role": "user", "content": x["problem"]},
+                        {"role": "assistant", "content": x["solution"]},
+                    ]
+                },
+                remove_columns=ds_math.column_names,
+            )
+
+            raw_dataset = interleave_datasets(
+                [ds_chat, ds_code, ds_math],
+                probabilities=[0.60, 0.20, 0.20],
+                seed=42,
+            )
+
+            if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
+                logger.info(
+                    f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to {args.max_samples:,} rows."
+                )
+                raw_dataset = raw_dataset.select(range(args.max_samples))
+
+            processed_dataset = pack_chatml_dataset(
+                raw_dataset, tokenizer, max_seq_len=args.seq_len, local_rank=local_rank
+            )
+            logger.info(f"💾 Caching packed dataset to '{cache_dir}'...")
+            processed_dataset.save_to_disk(cache_dir)
+        else:
+            logger.info(f"⚡ Found pre-packed dataset at '{cache_dir}'. Fast-loading from disk...")
+
+    # Wait for Rank 0 to finish dataset preparation and disk write
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    # Load dataset from disk fast on all ranks
+    processed_dataset = Dataset.load_from_disk(cache_dir)
 
     dataset_split = processed_dataset.train_test_split(test_size=0.05, seed=42)
     train_data = dataset_split["train"]
@@ -371,10 +436,23 @@ def main():
         callbacks=callbacks,
     )
 
+    checkpoint_to_resume = None
+    if os.path.exists(training_args.output_dir):
+        existing_checkpoints = [
+            d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")
+        ]
+        if existing_checkpoints:
+            checkpoint_to_resume = True
+            if local_rank == 0:
+                logger.info(
+                    f"Found existing SFT checkpoint(s) in '{training_args.output_dir}'."
+                    " Resuming training automatically..."
+                )
+
     if local_rank == 0:
         logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT)...")
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=checkpoint_to_resume)
 
     if local_rank == 0:
         logger.info(f"Saving final SFT checkpoint to '{args.output_dir}'...")

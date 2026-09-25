@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================================"
-echo "Step 2: Launching 300M BareTorch Pre-Training (6B Tokens)"
+echo "Step 2: Launching 300M BareTorch Pre-Training (2B Tokens)"
 echo "============================================================"
 
 # Dual RTX 4090 DDP configuration:

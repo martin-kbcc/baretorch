@@ -6,6 +6,28 @@ import random
 import subprocess
 import numpy as np
 import torch
+import torch.serialization
+# 1. Comprehensive allowlist for NumPy types in PyTorch 2.6+
+safe_numpy_types = [np.dtype, np.ndarray]
+for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
+    try:
+        mod = __import__(mod_path, fromlist=["scalar", "_reconstruct"])
+        if hasattr(mod, "scalar"):
+            safe_numpy_types.append(mod.scalar)
+        if hasattr(mod, "_reconstruct"):
+            safe_numpy_types.append(mod._reconstruct)
+    except (ImportError, AttributeError):
+        pass
+try:
+    torch.serialization.add_safe_globals(safe_numpy_types)
+except Exception:
+    pass
+# 2. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
+_orig_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import Dataset, Sampler
