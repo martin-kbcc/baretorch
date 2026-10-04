@@ -1,6 +1,6 @@
 from transformers import PretrainedConfig, AutoConfig
 
-# Direct absolute imports of our modular layer-specific configurations to maintain registry coverage
+# Direct absolute imports of our modular layer-specific configurations
 from baretorch.modeling.cs_lrad import CSLRADConfig
 from baretorch.modeling.transformer import TransformerConfig
 from baretorch.modeling.cs_ttt import CSTTTConfig
@@ -16,8 +16,6 @@ from baretorch.modeling.cs_lrad_cs_ttt_transformer import CSLRADCSTTTTransformer
 class BareTorchConfig(PretrainedConfig):
     """
     Unified Master Configuration for the BareTorch Framework.
-    Allows developers to dynamically instantiate any hybrid or pure sequence mixing topology
-    using a single consolidated config schema.
     """
     model_type = "baretorch"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -35,16 +33,19 @@ class BareTorchConfig(PretrainedConfig):
         max_seq_len=4096,
         use_grad_checkpointing=False,
         use_qk_norm=False,
-        layer_types=None,  # Dynamic sequence mapping list, e.g. ["transformer", "cs_lrad", "cs_ttt"]
+        layer_types=None,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        tie_word_embeddings=False,
+        auto_map=None,
         **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
         self.vocab_size = vocab_size
@@ -59,8 +60,13 @@ class BareTorchConfig(PretrainedConfig):
         self.use_grad_checkpointing = use_grad_checkpointing
         self.use_qk_norm = use_qk_norm
         self.use_cache = kwargs.get("use_cache", True)
+        
+        # Explicit auto_map attribute for Hugging Face integration compatibility
+        self.auto_map = auto_map if auto_map is not None else {
+            "AutoConfig": "baretorch.BareTorchConfig",
+            "AutoModelForCausalLM": "baretorch.BareTorchForCausalLM",
+        }
 
-        # If no explicit layer order is specified, default to an alternating rotation
         if layer_types is None:
             self.layer_types = []
             for i in range(num_layers):
@@ -79,10 +85,7 @@ class BareTorchConfig(PretrainedConfig):
 # 2. Hugging Face Global AutoConfig Registration
 # ==========================================
 
-# Register the master configuration
 AutoConfig.register("baretorch", BareTorchConfig)
-
-# Register specific architecture configurations for granular serialization paths
 AutoConfig.register("cs_lrad", CSLRADConfig)
 AutoConfig.register("transformer", TransformerConfig)
 AutoConfig.register("cs_ttt", CSTTTConfig)

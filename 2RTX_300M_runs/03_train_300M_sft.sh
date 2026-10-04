@@ -7,6 +7,7 @@ export OMP_NUM_THREADS=4
 export TORCH_CPP_MIN_LOG_LEVEL=2
 export NCCL_DEBUG=WARN
 export TOKENIZERS_PARALLELISM=false
+export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=3600
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -39,6 +40,12 @@ TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
 
 mkdir -p "$OUTPUT_DIR"
 
+# Clean stale dataset cache to force whole-sample packing of the new 50/20/15/15 dataset mix
+if [ -d "${OUTPUT_DIR}/packed_dataset" ]; then
+    echo "🧹 Removing stale packed dataset cache at ${OUTPUT_DIR}/packed_dataset to rebuild with new 4-way mixture..."
+    rm -rf "${OUTPUT_DIR}/packed_dataset"
+fi
+
 echo "======================================================================"
 echo "🚀 Launching BareTorch 300M Stage 1 SFT Engine (Dual-GPU Workstation)"
 echo "  ├─ Foundation Checkpoint : ${PRETRAINED_MODEL_PATH}"
@@ -46,7 +53,7 @@ echo "  ├─ Output Directory      : ${OUTPUT_DIR}"
 echo "  ├─ Hardware Setup        : ${NUM_GPUS}x NVIDIA GPUs"
 echo "  ├─ Batch Setup           : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
 echo "  ├─ Step Throughput       : ${TOKENS_PER_STEP} tokens/step (~65k tokens/step)"
-echo "  ├─ SFT Dataset Mix       : 60% Chat / 20% Code / 20% Math"
+echo "  ├─ SFT Dataset Mix       : 50% Chat / 20% Code / 15% Math / 15% Reasoning (R1 CoT)"
 echo "  ├─ Dataset Sample Limit  : ${MAX_SAMPLES} sequences (~600M tokens)"
 echo "  └─ Cloud Sync            : Active -> Cloudflare R2 (${R2_PREFIX})"
 echo "======================================================================"

@@ -1,11 +1,14 @@
-# /home/martinkb/Desktop/BareTorch_F/baretorch/modeling/transformer.py
+# baretorch/modeling/transformer.py
 import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
+
+logger = logging.getLogger(__name__)
 
 
 class RMSNorm(nn.Module):
@@ -74,7 +77,14 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
     def apply_rope(self, q, k, position_ids):
-        max_pos = int(position_ids.max().item()) + 1 if position_ids is not None else q.shape[1]
+        # Prevent RoPE tensor broadcasting mismatch during single-token decoding steps
+        if position_ids is not None and position_ids.shape[-1] != q.shape[-2]:
+            if q.shape[-2] == 1:
+                position_ids = position_ids[:, -1:]
+            else:
+                position_ids = position_ids[:, -q.shape[-2]:]
+
+        max_pos = int(position_ids.max().item()) + 1 if position_ids is not None else q.shape[-2]
         
         if (
             self.cos_cached is None 
@@ -94,6 +104,32 @@ class RotaryEmbedding(nn.Module):
         return q_embed.to(dtype=q.dtype), k_embed.to(dtype=k.dtype)
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Standard Grouped-Query Attention (GQA) head expansion helper."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def unwrap_kv_pair(past_kv):
+    """Strictly extracts matching (key_tensor, value_tensor) pair without history cross-contamination."""
+    if past_kv is None:
+        return None, None
+        
+    p_item = past_kv
+    while isinstance(p_item, (tuple, list)) and len(p_item) > 0 and not isinstance(p_item[0], torch.Tensor):
+        p_item = p_item[0]
+        
+    if isinstance(p_item, (tuple, list)) and len(p_item) >= 2:
+        pk, pv = p_item[0], p_item[1]
+        if isinstance(pk, torch.Tensor) and isinstance(pv, torch.Tensor):
+            return pk, pv
+            
+    return None, None
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads=16, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_qk_norm=False):
         super().__init__()
@@ -110,7 +146,6 @@ class CausalSelfAttention(nn.Module):
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         
-        # CONDITIONAL QK-Norm
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
@@ -120,21 +155,20 @@ class CausalSelfAttention(nn.Module):
         self.W_out = nn.Linear(d_model, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
 
-    def forward(self, x, past_kv=None, position_ids=None):
+    def forward(self, x, past_kv=None, position_ids=None, attention_mask=None):
         B, L, D = x.shape
         H_q, H_kv, d_h = self.num_heads, self.num_kv_heads, self.head_dim
         
+        pk_past, pv_past = unwrap_kv_pair(past_kv)
+
         if position_ids is None:
-            past_len = 0
-            if past_kv is not None and isinstance(past_kv, tuple) and len(past_kv) > 0:
-                past_len = past_kv[0].size(-2)
+            past_len = pk_past.size(-2) if pk_past is not None else 0
             position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
             
         q = self.W_q(x).view(B, L, H_q, d_h)
         k = self.W_k(x).view(B, L, H_kv, d_h)
         v = self.W_v(x).view(B, L, H_kv, d_h).transpose(1, 2)
         
-        # CONDITIONAL FORWARD PASS
         if self.use_qk_norm:
             q = self.q_norm(q).transpose(1, 2)
             k = self.k_norm(k).transpose(1, 2)
@@ -144,15 +178,28 @@ class CausalSelfAttention(nn.Module):
         
         q, k = self.rope.apply_rope(q, k, position_ids)
         
-        if past_kv is not None and isinstance(past_kv, tuple):
-            pk, pv = past_kv
-            k, v = torch.cat([pk, k], dim=-2), torch.cat([pv, v], dim=-2)
+        # Safely concatenate KV past states
+        if pk_past is not None and pv_past is not None:
+            if pk_past.shape[-2] != pv_past.shape[-2]:
+                min_len = min(pk_past.shape[-2], pv_past.shape[-2])
+                pk_past = pk_past[..., :min_len, :]
+                pv_past = pv_past[..., :min_len, :]
+            
+            k = torch.cat([pk_past, k], dim=-2)
+            v = torch.cat([pv_past, v], dim=-2)
+            
         current_kv = (k, v)
         
         if H_kv != H_q:
-            k = torch.repeat_interleave(k, self.num_queries_per_kv, dim=1).contiguous()
-            v = torch.repeat_interleave(v, self.num_queries_per_kv, dim=1).contiguous()
-            
+            k = repeat_kv(k, self.num_queries_per_kv)
+            v = repeat_kv(v, self.num_queries_per_kv)
+
+        if k.shape[-2] != v.shape[-2]:
+            raise ValueError(
+                f"❌ Key/Value sequence length mismatch before SDPA! "
+                f"Key shape: {k.shape}, Value shape: {v.shape}"
+            )
+
         is_causal_mask = (past_kv is None) and (L > 1)
         dropout_p = self.dropout_p if self.training else 0.0
 
@@ -160,8 +207,16 @@ class CausalSelfAttention(nn.Module):
         k = k.to(dtype=x.dtype)
         v = v.to(dtype=x.dtype)
 
+        sdpa_mask = None
+        if attention_mask is not None and is_causal_mask:
+            causal_bool = torch.ones((L, L), dtype=torch.bool, device=q.device).tril()
+            causal_bool = causal_bool.view(1, 1, L, L).expand(B, 1, L, L)
+            pad_bool = attention_mask.bool().view(B, 1, 1, L)
+            sdpa_mask = causal_bool & pad_bool
+            is_causal_mask = False
+
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=is_causal_mask
+            q, k, v, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal_mask
         )
         
         out_flat = out.transpose(1, 2).contiguous().view(B, L, D)
@@ -177,17 +232,17 @@ class TransformerDecoderBlock(nn.Module):
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 
-    def forward(self, x, past_kv=None, position_ids=None):
-        def _block_forward(x_in, p_kv, pos_ids):
-            attn_out, current_kv = self.attn(self.ln1(x_in), past_kv=p_kv, position_ids=pos_ids)
+    def forward(self, x, past_kv=None, position_ids=None, attention_mask=None):
+        def _block_forward(x_in, p_kv, pos_ids, attn_mask):
+            attn_out, current_kv = self.attn(self.ln1(x_in), past_kv=p_kv, position_ids=pos_ids, attention_mask=attn_mask)
             x_out = x_in + attn_out
             x_out = x_out + self.mlp(self.ln2(x_out))
             return x_out, current_kv
         
         if self.use_grad_checkpointing and self.training:
-            return checkpoint.checkpoint(_block_forward, x, past_kv, position_ids, use_reentrant=False)
+            return checkpoint.checkpoint(_block_forward, x, past_kv, position_ids, attention_mask, use_reentrant=False)
         else:
-            return _block_forward(x, past_kv, position_ids)
+            return _block_forward(x, past_kv, position_ids, attention_mask)
 
 
 class TransformerConfig(PretrainedConfig):
@@ -304,11 +359,19 @@ class TransformerModel(TransformerPreTrainedModel):
             if past_key_values is not None:
                 for layer_past in past_key_values:
                     if isinstance(layer_past, tuple) and layer_past is not None and len(layer_past) > 0:
-                        past_length = layer_past[0].size(-2)
-                        break
-            position_ids = torch.arange(
-                past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
-            ).unsqueeze(0)
+                        p_item = layer_past[0]
+                        while isinstance(p_item, (tuple, list)) and len(p_item) > 0:
+                            p_item = p_item[0]
+                        if isinstance(p_item, torch.Tensor):
+                            past_length = p_item.size(-2)
+                            break
+            
+            if attention_mask is not None and past_length == 0:
+                position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
+            else:
+                position_ids = torch.arange(
+                    past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
+                ).unsqueeze(0)
 
         all_hidden_states = () if output_hidden_states else None
         
@@ -317,7 +380,7 @@ class TransformerModel(TransformerPreTrainedModel):
                 all_hidden_states = all_hidden_states + (h,)
                 
             past_kv = past_key_values[i] if past_key_values is not None else None
-            h, current_kv = layer(h, past_kv=past_kv, position_ids=position_ids)
+            h, current_kv = layer(h, past_kv=past_kv, position_ids=position_ids, attention_mask=attention_mask)
                 
             if use_cache:
                 next_decoder_cache.append(current_kv)
@@ -394,7 +457,6 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         
-        # Logit Soft-Capping (30.0 * tanh(logits / 30.0))
         logits = 30.0 * torch.tanh(logits / 30.0)
 
         loss = None
@@ -416,12 +478,13 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
             "use_cache": kwargs.get("use_cache"),
         }
 

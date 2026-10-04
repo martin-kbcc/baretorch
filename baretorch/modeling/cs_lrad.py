@@ -214,6 +214,10 @@ class LRADDecoderBlock(nn.Module):
             h_attn = self.ln1(x_in)
             B, L, _ = x_in.shape
             
+            # Unwrap tuple if passed from Hugging Face KV cache
+            if isinstance(p_state, tuple) and len(p_state) > 0:
+                p_state = p_state[0]
+
             is_step_inference = (p_state is not None) or (L == 1)
             
             if is_step_inference:
@@ -223,7 +227,10 @@ class LRADDecoderBlock(nn.Module):
                 
             x_out = x_in + attn_out
             x_out = x_out + self.mlp(self.ln2(x_out))
-            return x_out, next_state
+            
+            # Return 2-tuple for HF DynamicCache compatibility
+            cache_out = (next_state, next_state) if use_cache else None
+            return x_out, cache_out
         
         if self.use_grad_checkpointing and self.training:
             return checkpoint.checkpoint(_block_forward, x, past_state, attention_mask, use_reentrant=False)

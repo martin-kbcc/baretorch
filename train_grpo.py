@@ -1,10 +1,12 @@
 # /home/martinkb/Desktop/BareTorch_F/train_grpo.py
 
 import argparse
+import inspect
 import logging
 import os
 import re
 import subprocess
+import warnings
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainerCallback
@@ -70,40 +72,69 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 # ==============================================================================
-#                           Rule-Based Reward Functions
+#                               Rule-Based Reward Functions
 # ==============================================================================
 def format_reward_func(completions, **kwargs):
-    """Rewards the model (+1.0) if it formats reasoning inside <think>...</think> tags."""
+    """
+    Rewards the completion for closing the reasoning block with </think> 
+    and providing a boxed final answer \\boxed{...}.
+    
+    Note: Since <think> is prefixed in the prompt header, completions start 
+    directly inside the reasoning trace.
+    """
     rewards = []
-    pattern = r"^<think>\n.*?\n</think>\n"
     for completion in completions:
-        # Get completion text
         text = completion[0]["content"] if isinstance(completion, list) else completion
-        if re.search(pattern, text, re.DOTALL):
-            rewards.append(1.0)
-        elif "<think>" in text and "</think>" in text:
+        
+        has_think_end = "</think>" in text
+        has_boxed = "\\boxed{" in text
+
+        if has_think_end and has_boxed:
+            # Check if </think> occurs BEFORE \boxed{
+            think_end_idx = text.find("</think>")
+            boxed_idx = text.find("\\boxed{")
+            if think_end_idx < boxed_idx:
+                rewards.append(1.0)
+            else:
+                rewards.append(0.5)  # Both present, but wrong structural order
+        elif has_think_end:
             rewards.append(0.5)
+        elif has_boxed:
+            rewards.append(0.2)
         else:
             rewards.append(0.0)
     return rewards
 
 
 def extract_boxed_answer(text):
-    """Extracts answer inside \\boxed{...} tag."""
-    match = re.search(r"\\boxed\{([^}]+)\}", text)
-    if match:
-        return match.group(1).strip()
+    """Extracts answer inside \\boxed{...} tag supporting nested LaTeX braces."""
+    idx = text.rfind("\\boxed{")
+    if idx == -1:
+        return None
+    i = idx + len("\\boxed{")
+    num_open_braces = 1
+    chars = []
+    while i < len(text) and num_open_braces > 0:
+        c = text[i]
+        if c == '{':
+            num_open_braces += 1
+        elif c == '}':
+            num_open_braces -= 1
+        if num_open_braces > 0:
+            chars.append(c)
+        i += 1
+    if num_open_braces == 0:
+        return "".join(chars).strip()
     return None
 
 
 def accuracy_reward_func(completions, answer, **kwargs):
-    """Rewards the model (+2.0) if the boxed final answer matches the dataset ground truth."""
+    """Rewards the model (+2.0) if the boxed final answer matches ground truth."""
     rewards = []
     for completion, target in zip(completions, answer):
         text = completion[0]["content"] if isinstance(completion, list) else completion
         pred = extract_boxed_answer(text)
         
-        # Clean target string if it contains GSM8K style answer (#### 42)
         if "####" in target:
             clean_target = target.split("####")[-1].strip()
         else:
@@ -117,7 +148,7 @@ def accuracy_reward_func(completions, answer, **kwargs):
 
 
 # ==============================================================================
-#                                Main Engine
+#                                  Main Engine
 # ==============================================================================
 def main():
     if "LOCAL_RANK" in os.environ:
@@ -142,6 +173,13 @@ def main():
         type=str,
         default="./checkpoints_300m_grpo",
         help="Directory to save RL-trained weights.",
+    )
+
+    # Architecture Flags
+    parser.add_argument(
+        "--tie_word_embeddings",
+        action="store_true",
+        help="Explicitly tie lm_head.weight to token_embedding.weight.",
     )
 
     # Tokenizer & Dataset
@@ -204,17 +242,27 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Model Loading
+    # Enforce right-padding for CS-LRAD chunk alignment
+    tokenizer.padding_side = "right"
+
+    # 2. Policy Model Loading
     if local_rank == 0:
-        logger.info(f"Loading SFT model weights from: {args.sft_model_path}")
+        logger.info(f"Loading SFT Model from: {args.sft_model_path}")
 
     model = BareTorchForCausalLM.from_pretrained(
         args.sft_model_path,
         torch_dtype=torch.bfloat16,
     )
 
+    if args.tie_word_embeddings:
+        model.lm_head.weight = model.model.token_embedding.weight
+        model.config.tie_word_embeddings = True
+        model.tie_weights()
+    elif getattr(model.config, "tie_word_embeddings", False):
+        model.tie_weights()
+
     model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = True  # Enable KV cache for fast GRPO rollout sampling
+    model.config.use_cache = True
 
     # 3. Load & Format Dataset
     if local_rank == 0:
@@ -231,30 +279,40 @@ def main():
         prompt_text = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
             f"<|im_start|>user\n{example['question']}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
+            f"<|im_start|>assistant\n<think>\n"
         )
+        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+        if len(prompt_tokens) > args.max_prompt_length:
+            prompt_tokens = prompt_tokens[-args.max_prompt_length:]
+            prompt_text = tokenizer.decode(prompt_tokens)
+
         return {"prompt": prompt_text, "answer": example["answer"]}
 
     train_dataset = raw_dataset.map(format_prompt, remove_columns=raw_dataset.column_names)
 
     # 4. GRPO Trainer Configuration
-    grpo_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        beta=args.beta,
-        num_generations=args.num_generations,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        num_train_epochs=args.num_epochs,
-        logging_steps=10,
-        save_strategy="steps",
-        save_steps=100,
-        save_total_limit=2,
-        bf16=True,
-        use_vllm=False,  # Set to True if using vLLM engine for generation acceleration
-    )
+    grpo_kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "beta": args.beta,
+        "num_generations": args.num_generations,
+        "max_completion_length": args.max_completion_length,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "num_train_epochs": args.num_epochs,
+        "logging_steps": 10,
+        "save_strategy": "steps",
+        "save_steps": 100,
+        "save_total_limit": 2,
+        "bf16": True,
+        "use_vllm": False,
+    }
+
+    sig = inspect.signature(GRPOConfig.__init__)
+    if "max_prompt_length" in sig.parameters:
+        grpo_kwargs["max_prompt_length"] = args.max_prompt_length
+
+    grpo_args = GRPOConfig(**grpo_kwargs)
 
     enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
     r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)

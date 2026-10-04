@@ -9,7 +9,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Universal Dataset Shard Sanitizer & Token Counter")
     parser.add_argument("--data_dir", type=str, required=True, help="Target directory containing .bin shards")
     parser.add_argument("--vocab_size", type=int, default=248320, help="Maximum allowed vocabulary size (Qwen3.5 default: 248320)")
-    parser.add_argument("--eos_id", type=int, default=151643, help="Token ID to replace invalid tokens with")
+    parser.add_argument("--eos_id", type=int, default=248046, help="Token ID to replace invalid tokens with")
     parser.add_argument("--max_allowed_bad", type=int, default=100, help="Max bad tokens allowed for auto-repair before quarantine")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length for calculating sequence counts")
     parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of parallel CPU worker processes")

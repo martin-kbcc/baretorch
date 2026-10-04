@@ -1,6 +1,7 @@
 # --- Large Model Checkpoints & Shards ---
 output_*/
 checkpoints_*/
+checkpoint-*/
 runs/
 pte_models_apple/*
 *.pt

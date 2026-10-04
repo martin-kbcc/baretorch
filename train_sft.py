@@ -1,11 +1,44 @@
-# /home/martinkb/Desktop/BareTorch_F/train_sft.py
-
 import argparse
 import logging
 import os
 import subprocess
 import numpy as np
 import torch
+import torch.serialization
+from datetime import timedelta
+
+# Disable Hugging Face Rust parallelism warnings/deadlocks in torchrun
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# 1. Enable TF32 for Tensor Core acceleration
+torch.set_float32_matmul_precision("high")
+
+# 2. Bypass buggy cuDNN attention backend during Evaluation / no_grad
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+# 3. Comprehensive allowlist for NumPy types in PyTorch 2.6+
+safe_numpy_types = [np.dtype, np.ndarray]
+for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
+    try:
+        mod = __import__(mod_path, fromlist=["scalar", "_reconstruct"])
+        if hasattr(mod, "scalar"):
+            safe_numpy_types.append(mod.scalar)
+        if hasattr(mod, "_reconstruct"):
+            safe_numpy_types.append(mod._reconstruct)
+    except (ImportError, AttributeError):
+        pass
+try:
+    torch.serialization.add_safe_globals(safe_numpy_types)
+except Exception:
+    pass
+
+# 4. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
+_orig_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 from datasets import Dataset, load_dataset, interleave_datasets
 from tqdm import tqdm
 from transformers import (
@@ -17,9 +50,6 @@ from transformers import (
 )
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
-
-# Disable Hugging Face Rust parallelism warnings/deadlocks in torchrun
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ==============================================================================
 #                                Logging Configuration
@@ -198,7 +228,10 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
 def main():
     if "LOCAL_RANK" in os.environ:
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=60)  # Extends timeout to 1 hour
+            )
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
 
@@ -209,13 +242,13 @@ def main():
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
-        default="./checkpoints_300M_6B/checkpoint-91552",
+        default="./checkpoints_distill_2.5B_50BT_baretorch",
         help="Path to pre-trained BareTorch checkpoint folder.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints_300m_sft",
+        default="./checkpoints_2.5B_sft",
         help="Directory to save fine-tuned SFT weights.",
     )
 
@@ -234,13 +267,13 @@ def main():
 
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument(
-        "--batch_size", type=int, default=4, help="Per-GPU batch size."
+        "--batch_size", type=int, default=8, help="Per-GPU batch size."
     )
     parser.add_argument(
-        "--grad_accum", type=int, default=4, help="Gradient accumulation steps."
+        "--grad_accum", type=int, default=2, help="Gradient accumulation steps."
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=3e-5, help="SFT learning rate."
+        "--learning_rate", type=float, default=2e-5, help="SFT learning rate."
     )
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -322,10 +355,12 @@ def main():
 
     if local_rank == 0:
         if not os.path.exists(cache_dir):
-            logger.info("Loading SFT Datasets (60% Chat / 20% Code / 20% Math)...")
+            logger.info("Loading SFT Datasets (50% Chat / 20% Code / 15% Math / 15% Reasoning)...")
 
+            # 1. 50% Chat Anchor
             ds_chat = load_dataset("HuggingFaceTB/smoltalk", "all", split="train")
 
+            # 2. 20% Code
             ds_code = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K", split="train")
             ds_code = ds_code.map(
                 lambda x: {
@@ -337,21 +372,58 @@ def main():
                 remove_columns=ds_code.column_names,
             )
 
+            # 3. 15% Math (NuminaMath-CoT with <think> tag injection)
             ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train")
-            ds_math = ds_math.map(
-                lambda x: {
-                    "messages": [
-                        {"role": "user", "content": x["problem"]},
-                        {"role": "assistant", "content": x["solution"]},
-                    ]
-                },
-                remove_columns=ds_math.column_names,
-            )
+            def format_math_with_think(x):
+                problem = x["problem"]
+                solution = x["solution"]
+                if "####" in solution:
+                    reasoning, answer = solution.rsplit("####", 1)
+                    formatted_content = (
+                        f"<think>\n{reasoning.strip()}\n</think>\n\n"
+                        f"The final answer is \\boxed{{{answer.strip()}}}."
+                    )
+                else:
+                    formatted_content = f"<think>\n{solution.strip()}\n</think>"
 
+                return {
+                    "messages": [
+                        {"role": "user", "content": problem},
+                        {"role": "assistant", "content": formatted_content},
+                    ]
+                }
+            ds_math = ds_math.map(format_math_with_think, remove_columns=ds_math.column_names)
+
+            # 4. 15% DeepSeek-R1 Distilled Reasoning (Bespoke-Stratos-17k)
+            ds_reasoning = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train")
+            def format_stratos_reasoning(x):
+                if "messages" in x and x["messages"]:
+                    messages = x["messages"]
+                else:
+                    system_msg = x.get("system", "")
+                    user_q = x.get("question", x.get("problem", x.get("prompt", "")))
+                    reasoning = x.get("reasoning", "")
+                    response = x.get("response", x.get("solution", ""))
+
+                    user_content = f"{system_msg}\n\n{user_q}".strip() if system_msg else user_q
+                    if reasoning:
+                        assistant_content = f"<think>\n{reasoning.strip()}\n</think>\n\n{response.strip()}"
+                    else:
+                        assistant_content = response.strip()
+
+                    messages = [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": assistant_content},
+                    ]
+                return {"messages": messages}
+            ds_reasoning = ds_reasoning.map(format_stratos_reasoning, remove_columns=ds_reasoning.column_names)
+
+            # Interleave into single dataset with 50/20/15/15 ratio
             raw_dataset = interleave_datasets(
-                [ds_chat, ds_code, ds_math],
-                probabilities=[0.60, 0.20, 0.20],
+                [ds_chat, ds_code, ds_math, ds_reasoning],
+                probabilities=[0.50, 0.20, 0.15, 0.15],
                 seed=42,
+                stopping_strategy="all_exhausted",
             )
 
             if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
@@ -385,6 +457,7 @@ def main():
             f"{len(val_data):,} validation samples."
         )
 
+    # Standard PyTorch DistributedDataParallel (DDP) configuration
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -396,7 +469,7 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         bf16=True,
-        logging_steps=250,
+        logging_steps=100,
         eval_strategy="steps",
         eval_steps=250,
         save_strategy="steps",
@@ -404,7 +477,6 @@ def main():
         save_total_limit=2,
         torch_compile=False,
         gradient_checkpointing=args.grad_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
@@ -450,7 +522,7 @@ def main():
                 )
 
     if local_rank == 0:
-        logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT)...")
+        logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT) in DDP Mode...")
 
     trainer.train(resume_from_checkpoint=checkpoint_to_resume)
 

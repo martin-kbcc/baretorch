@@ -191,23 +191,38 @@ class TTTDecoderBlock(nn.Module):
     def __init__(self, d_model, num_heads, chunk_size=32, rank=8, dropout=0.1, use_grad_checkpointing=False):
         super().__init__()
         self.use_grad_checkpointing = use_grad_checkpointing
-        self.norm1 = RMSNorm(d_model)
-        self.ttt = ChunkwiseTestTimeTrainingEngine(d_model, num_heads, chunk_size, rank, dropout)
-        self.norm2 = RMSNorm(d_model)
-        self.mlp = GatedMLP(d_model, dropout)
+        self.ln1 = RMSNorm(d_model)
+        self.attn = TestTimeTrainingEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank, dropout=dropout)
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 
-    def forward(self, x, past_state=None, use_cache=False):
-        residual = x
-        normed_x = self.norm1(x)
+    def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
+        def _block_forward(x_in, p_state, attn_mask):
+            h_attn = self.ln1(x_in)
+            B, L, _ = x_in.shape
+            
+            # Unwrap tuple if passed from Hugging Face KV cache
+            if isinstance(p_state, tuple) and len(p_state) > 0:
+                p_state = p_state[0]
+
+            is_step_inference = (p_state is not None) or (L == 1)
+            
+            if is_step_inference:
+                attn_out, next_state = self.attn.step_inference(h_attn, past_S=p_state, attention_mask=attn_mask)
+            else:
+                attn_out, next_state = self.attn(h_attn, attention_mask=attn_mask)
+                
+            x_out = x_in + attn_out
+            x_out = x_out + self.mlp(self.ln2(x_out))
+            
+            # Return 2-tuple for HF DynamicCache compatibility
+            cache_out = (next_state, next_state) if use_cache else None
+            return x_out, cache_out
+        
         if self.use_grad_checkpointing and self.training:
-            ttt_out, next_state = torch.utils.checkpoint.checkpoint(self.ttt, normed_x, past_state, use_cache)
+            return checkpoint.checkpoint(_block_forward, x, past_state, attention_mask, use_reentrant=False)
         else:
-            ttt_out, next_state = self.ttt(normed_x, past_state, use_cache)
-        x = residual + ttt_out
-
-        residual = x
-        x = residual + self.mlp(self.norm2(x))
-        return x, next_state
+            return _block_forward(x, past_state, attention_mask)
 
 
 class CSTTTPreTrainedModel(PreTrainedModel):

@@ -39,14 +39,17 @@ class BareTorchPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _set_gradient_checkpointing(self, module, value=True, **kwargs):
-        if isinstance(module, (BareTorchModel, BareTorchForCausalLM)):
-            module.gradient_checkpointing = value
-            if hasattr(module, "config"):
-                module.config.use_grad_checkpointing = value
-        if hasattr(module, "use_grad_checkpointing"):
-            module.use_grad_checkpointing = value
-            module.gradient_checkpointing = value
+    # Modern Hugging Face Gradient Checkpointing Signature (uses 'enable' instead of 'value')
+    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
+        if isinstance(self, (BareTorchModel, BareTorchForCausalLM)):
+            self.gradient_checkpointing = enable
+            if hasattr(self, "config"):
+                self.config.use_grad_checkpointing = enable
+        for module in self.modules():
+            if hasattr(module, "use_grad_checkpointing"):
+                module.use_grad_checkpointing = enable
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = enable
 
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
         if "past_key_values" not in model_kwargs:
@@ -135,19 +138,36 @@ class BareTorchModel(BareTorchPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.token_embedding(input_ids)
 
+        # CRITICAL FIX FOR GRPO ROLLOUTS:
+        # If past_key_values is present and seq_length > 1 (e.g. inputs_embeds passed during generation),
+        # slice inputs_embeds to the last token [:, -1:, :] so we only process the new token step.
+        if past_key_values is not None and inputs_embeds.size(1) > 1:
+            inputs_embeds = inputs_embeds[:, -1:, :]
+            batch_size, seq_length, _ = inputs_embeds.shape
+
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
         
-        if position_ids is None or position_ids.shape[-1] != seq_length:
+        # Calculate robust position_ids for hybrid CS-LRAD + Transformer batching
+        if position_ids is None:
             past_length = 0
             if past_key_values is not None:
-                for cache in past_key_values:
-                    if cache is not None and isinstance(cache, tuple) and len(cache) > 0:  # Transformer KV cache
-                        past_length = cache[0].size(-2)
-                        break
-            position_ids = torch.arange(
-                past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
-            ).unsqueeze(0)
+                for idx, layer_past in enumerate(past_key_values):
+                    if isinstance(self.layers[idx], TransformerDecoderBlock):
+                        if isinstance(layer_past, tuple) and len(layer_past) > 0 and layer_past[0] is not None:
+                            p_item = layer_past[0]
+                            while isinstance(p_item, (tuple, list)) and len(p_item) > 0:
+                                p_item = p_item[0]
+                            if isinstance(p_item, torch.Tensor):
+                                past_length = p_item.size(-2)
+                                break
+                        
+            if attention_mask is not None and past_length == 0:
+                position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
+            else:
+                position_ids = torch.arange(
+                    past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
+                ).unsqueeze(0)
 
         all_hidden_states = () if output_hidden_states else None
         
@@ -158,7 +178,8 @@ class BareTorchModel(BareTorchPreTrainedModel):
             past_state = past_key_values[i] if past_key_values is not None else None
             
             if isinstance(layer, TransformerDecoderBlock):
-                h, next_state = layer(h, past_kv=past_state, position_ids=position_ids)
+                # Now passing attention_mask down to the Transformer block
+                h, next_state = layer(h, past_kv=past_state, position_ids=position_ids, attention_mask=attention_mask)
             elif isinstance(layer, LRADDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
             elif isinstance(layer, TTTDecoderBlock):
@@ -184,6 +205,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
 
 class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.token_embedding.weight"}
+    supports_gradient_checkpointing = True
     _supports_cache_class = False
     _supports_static_cache = False
     _supports_quantized_cache = False
@@ -246,6 +268,10 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
+
+        # Fail-safe against non-finite values during sampling rollouts
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         
         # Soft-clamp logits to ensure sampling probabilities remain strictly finite
         logits = torch.clamp(logits, min=-50.0, max=50.0)

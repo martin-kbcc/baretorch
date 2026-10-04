@@ -1,11 +1,44 @@
-# /home/martinkb/Desktop/BareTorch_F/llm_benchmark.py
 import os
 import json
 import argparse
 import logging
+import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+import torch.serialization
 
+# Disable Hugging Face Rust parallelism warnings/deadlocks
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# 1. Enable TF32 for GPU acceleration
+torch.set_float32_matmul_precision("high")
+
+# 2. Bypass cuDNN attention backend during Evaluation / no_grad
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+# 3. Comprehensive allowlist for NumPy types in PyTorch 2.6+
+safe_numpy_types = [np.dtype, np.ndarray]
+for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
+    try:
+        mod = __import__(mod_path, fromlist=["scalar", "_reconstruct"])
+        if hasattr(mod, "scalar"):
+            safe_numpy_types.append(mod.scalar)
+        if hasattr(mod, "_reconstruct"):
+            safe_numpy_types.append(mod._reconstruct)
+    except (ImportError, AttributeError):
+        pass
+try:
+    torch.serialization.add_safe_globals(safe_numpy_types)
+except Exception:
+    pass
+
+# 4. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
+_orig_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _orig_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 import lm_eval
 from lm_eval.models.huggingface import HFLM
 from lm_eval.evaluator import simple_evaluate
@@ -34,7 +67,7 @@ def parse_args():
     parser.add_argument(
         "--tokenizer_name", 
         type=str, 
-        default="HuggingFaceTB/SmolLM2-360M", 
+        default="Qwen/Qwen3.5-9B", 
         help="Tokenizer checkpoint name/path to load if not embedded in checkpoint_path."
     )
     parser.add_argument(
@@ -44,8 +77,8 @@ def parse_args():
         help="Explicit vocabulary size override (if None, auto-detected from tokenizer)."
     )
     
-    # Architecture Flags (Fallback if config.json is missing)
-    parser.add_argument("--d_model", type=int, default=1152, help="Model hidden dimension.")
+    # Architecture Flags (Aligned with BareTorch Defaults)
+    parser.add_argument("--d_model", type=int, default=2048, help="Model hidden dimension.")
     parser.add_argument("--num_heads", type=int, default=16, help="Number of attention/mixer heads.")
     parser.add_argument("--num_layers", type=int, default=24, help="Total transformer/mixer layers.")
     parser.add_argument(
@@ -55,7 +88,7 @@ def parse_args():
         help="Comma-separated layer pattern sequence."
     )
     parser.add_argument("--chunk_size", type=int, default=32, help="CS-LRAD chunk size.")
-    parser.add_argument("--rank", type=int, default=8, help="CS-LRAD projection rank.")
+    parser.add_argument("--rank", type=int, default=16, help="CS-LRAD projection rank.")
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Maximum sequence context length.")
     
     # Task & Evaluation Flags
@@ -69,7 +102,7 @@ def parse_args():
     parser.add_argument("--limit", type=float, default=None, help="Sample limit per task for smoke testing.")
     
     # Execution & Precision Flags
-    parser.add_argument("--batch_size", type=int, default=1, help="Evaluation batch size.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Evaluation batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run evaluation on (e.g., cuda, cpu).")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--output_file", type=str, default="benchmark_results.json", help="Path to save output JSON.")
@@ -78,16 +111,16 @@ def parse_args():
 
 
 def build_baretorch_config(args, resolved_vocab_size: int, config_file: str = None) -> BareTorchConfig:
-    """Builds BareTorchConfig from file if available, otherwise constructs from CLI args."""
+    """Builds BareTorchConfig directly from config.json if available, else constructs from CLI args."""
     if config_file and os.path.exists(config_file):
         logger.info(f"Loading BareTorch configuration directly from '{config_file}'...")
         try:
-            cfg = AutoConfig.from_pretrained(config_file)
+            cfg = BareTorchConfig.from_json_file(config_file)
             if resolved_vocab_size is not None:
                 cfg.vocab_size = resolved_vocab_size
             return cfg
         except Exception as e:
-            logger.warning(f"Failed to load via AutoConfig ({e}). Constructing BareTorchConfig manually from flags...")
+            logger.warning(f"Failed to load via BareTorchConfig.from_json_file ({e}). Constructing from flags...")
 
     pattern = [s.strip() for t in args.layer_sequence.split(",") if (s := t.strip())]
     repeats = (args.num_layers + len(pattern) - 1) // len(pattern)
@@ -107,53 +140,97 @@ def build_baretorch_config(args, resolved_vocab_size: int, config_file: str = No
         chunk_size=args.chunk_size,
         rank=args.rank,
         max_seq_len=args.max_seq_len,
+        tie_word_embeddings=False,
     )
 
 
 def load_baretorch_model(args, resolved_vocab_size: int, device: str, dtype: torch.dtype):
-    """Loads model cleanly from checkpoint directory or PyTorch state_dict file."""
+    """Loads model with explicit FSDP/DDP key cleaning, dynamic tied-embedding binding, and strict error handling."""
     checkpoint_path = args.checkpoint_path
     logger.info(f"Loading BareTorch model from checkpoint: '{checkpoint_path}'")
     
-    if os.path.isdir(checkpoint_path):
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                checkpoint_path,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-            )
-            logger.info("Successfully loaded model via AutoModelForCausalLM.")
-        except Exception as e:
-            logger.warning(f"AutoModel load failed ({e}). Falling back to BareTorchForCausalLM load...")
-            config_file = os.path.join(checkpoint_path, "config.json")
-            config = build_baretorch_config(args, resolved_vocab_size, config_file)
-            model = BareTorchForCausalLM.from_pretrained(
-                checkpoint_path, 
-                config=config, 
-                torch_dtype=dtype
-            )
-            
-    elif os.path.isfile(checkpoint_path):
-        ckpt_dir = os.path.dirname(checkpoint_path)
-        config_file = os.path.join(ckpt_dir, "config.json")
-        
-        config = build_baretorch_config(args, resolved_vocab_size, config_file)
-        model = BareTorchForCausalLM(config)
-        
-        logger.info(f"Loading state dict from file '{checkpoint_path}'...")
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        if "model" in state_dict:
-            state_dict = state_dict["model"]
-        elif "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
+    config_file = os.path.join(checkpoint_path, "config.json") if os.path.isdir(checkpoint_path) else os.path.join(os.path.dirname(checkpoint_path), "config.json")
+    config = build_baretorch_config(args, resolved_vocab_size, config_file)
+    
+    model = BareTorchForCausalLM(config)
 
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.warning(f"Missing keys during load: {missing[:5]}")
-        if unexpected:
-            logger.warning(f"Unexpected keys during load: {unexpected[:5]}")
+    # 1. Locate weight file
+    if os.path.isdir(checkpoint_path):
+        sf_file = os.path.join(checkpoint_path, "model.safetensors")
+        bin_file = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if os.path.exists(sf_file):
+            from safetensors.torch import load_file
+            state_dict = load_file(sf_file)
+        elif os.path.exists(bin_file):
+            state_dict = torch.load(bin_file, map_location="cpu")
+        else:
+            raise FileNotFoundError(f"❌ No 'model.safetensors' or 'pytorch_model.bin' found in '{checkpoint_path}'")
     else:
-        raise FileNotFoundError(f"Checkpoint path not found: '{checkpoint_path}'")
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+    if "model" in state_dict and isinstance(state_dict["model"], dict):
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+
+    # 2. Clean FSDP / DDP / torch.compile prefixes
+    cleaned_state_dict = {}
+    for k, v in state_dict.items():
+        new_k = k
+        for prefix in ["_fsdp_wrapped_module.", "module.", "_orig_mod."]:
+            if new_k.startswith(prefix):
+                new_k = new_k[len(prefix):]
+        cleaned_state_dict[new_k] = v
+
+    # 2b. Dynamic search & bind for missing lm_head.weight (Tied Word Embeddings)
+    if "lm_head.weight" not in cleaned_state_dict:
+        candidate_key = None
+        
+        # Primary search: 2D weight tensors containing embedding/token/wte/word keywords
+        for k, v in cleaned_state_dict.items():
+            if isinstance(v, torch.Tensor) and v.ndim == 2:
+                if any(term in k.lower() for term in ["embed", "tok", "wte", "word", "emb"]):
+                    candidate_key = k
+                    break
+
+        # Fallback search: any 2D tensor whose 1st dimension matches target vocab size
+        if not candidate_key:
+            for k, v in cleaned_state_dict.items():
+                if isinstance(v, torch.Tensor) and v.ndim == 2:
+                    if v.shape[0] == resolved_vocab_size or v.shape[0] == config.vocab_size:
+                        candidate_key = k
+                        break
+
+        if candidate_key:
+            cleaned_state_dict["lm_head.weight"] = cleaned_state_dict[candidate_key]
+            logger.info(f"🔗 Dynamic Tie Success: Mapped 'lm_head.weight' -> '{candidate_key}' (Shape: {list(cleaned_state_dict[candidate_key].shape)})")
+        else:
+            logger.warning("⚠️ Could not automatically detect token embedding key in checkpoint state_dict.")
+
+    # 3. Load state dict and verify key alignment
+    missing_keys, unexpected_keys = model.load_state_dict(cleaned_state_dict, strict=False)
+
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+
+    logger.info("=" * 70)
+    logger.info("📦 CHECKPOINT WEIGHT LOADING REPORT:")
+    logger.info(f"  ├─ Total keys in file : {len(cleaned_state_dict)}")
+    logger.info(f"  ├─ Missing keys        : {len(missing_keys)}")
+    logger.info(f"  └─ Unexpected keys     : {len(unexpected_keys)}")
+    logger.info("=" * 70)
+
+    # STRICT GUARD: Crash immediately if any parameters fail to map
+    if len(missing_keys) > 0:
+        raise RuntimeError(
+            f"❌ CRITICAL WEIGHT LOADING ERROR: {len(missing_keys)} parameter tensor(s) failed to load!\n"
+            f"The checkpoint is missing weights for key architectural components.\n"
+            f"Execution halted to prevent running on uninitialized random weights.\n"
+            f"Sample missing keys: {missing_keys[:5]}"
+        )
+
+    if len(unexpected_keys) > 0:
+        logger.warning(f"⚠️ Unexpected keys in checkpoint file (ignored): {unexpected_keys[:5]}")
 
     model = model.to(dtype=dtype).to(device).eval()
     return model
@@ -187,7 +264,7 @@ def main():
     
     # 1. Tokenizer Setup
     tokenizer_path = args.checkpoint_path if os.path.isdir(args.checkpoint_path) else args.tokenizer_name
-    logger.info(f"Loading tokenizer from: '{tokenizer_path}'")
+    logger.info(f"Loading tokenizer...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     except Exception as e:
@@ -196,6 +273,9 @@ def main():
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Enforce right-padding so Token 0 always sits at Index 0 of Chunk 0
+    tokenizer.padding_side = "right"
 
     # 2. Resolve Final Vocab Size
     resolved_vocab_size = args.vocab_size if args.vocab_size is not None else len(tokenizer)
@@ -210,6 +290,7 @@ def main():
         pretrained=model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
+        padding_side="right",
     )
     
     # 5. Execute Evaluation
