@@ -31,8 +31,8 @@ torchrun --nproc_per_node=2 ../train_distill_ddp.py \
     --tie_embeddings \
     --compile \
     --logging_steps 200 \
-    --save_steps 2500 \
-    --eval_steps 2500 \
+    --save_steps 5000 \
+    --eval_steps 5000 \
     --r2_sync \
     --r2_prefix "checkpoints_local_600M" \
     --output_dir "./checkpoints_600M_10B"

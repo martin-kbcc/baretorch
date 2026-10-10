@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
+# Increase system open file descriptor limit for multi-worker memmaps
+ulimit -n 65536
+
 # CUDA Memory Management & Distributed NCCL Tuning
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=4

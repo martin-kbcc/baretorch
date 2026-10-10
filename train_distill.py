@@ -6,6 +6,9 @@ import random
 import subprocess
 import numpy as np
 import torch
+import torch.multiprocessing as mp
+# Prevent 'Too many open files' error when reading hundreds of memmap shards across workers
+mp.set_sharing_strategy('file_system')
 # Enable TF32 for Tensor Core acceleration
 torch.set_float32_matmul_precision("high")
 # Bypass the buggy cuDNN attention backend during Evaluation
