@@ -934,6 +934,7 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         bf16=True,
+        max_grad_norm=0.5,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         eval_strategy="steps",
