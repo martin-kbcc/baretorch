@@ -53,7 +53,8 @@ torch.load = _patched_torch_load
 
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoTokenizer,
     Trainer,
@@ -148,7 +149,7 @@ def get_wsd_schedule(
     return LambdaLR(optimizer, lr_lambda)
 
 
-class DistributedCurriculumSampler(Sampler):
+class DistributedCurriculumSampler(DistributedSampler):
 
     def __init__(
         self,
@@ -171,6 +172,14 @@ class DistributedCurriculumSampler(Sampler):
                 if torch.distributed.is_initialized()
                 else 0
             )
+
+        super().__init__(
+            dataset=dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=False,
+            seed=seed,
+        )
 
         self.dataset = dataset
         self.trainer = trainer
@@ -499,7 +508,7 @@ class DistillTrainer(Trainer):
         self._eval_loss_kl = 0.0
         self._eval_loss_steps = 0
 
-    def _get_train_sampler(self, dataset=None) -> Sampler:
+    def _get_train_sampler(self, dataset=None) -> DistributedSampler:
         target_dataset = (
             dataset if dataset is not None else self.train_dataset
         )
