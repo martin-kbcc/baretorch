@@ -28,29 +28,33 @@ RANK=16
 
 # Optimization & Batching for 80GB H100 VRAM + FSDP (ZeRO-2)
 # Global Batch = 8 GPUs * 4 per-device batch * 8 grad accum = 256 sequences/step
-# Token Throughput = 256 * 2048 = 524,288 tokens/step (~0.52M tokens/step)
+# Token Throughput = 256 * 2048 = 524,288 tokens/step (~0.524M tokens/step)
 PER_GPU_BATCH_SIZE=4
 GRAD_ACCUM=8
 LEARNING_RATE=5e-4
 SCHEDULER="wsd"
 WARMUP_STEPS=1000
 
-# 50 Billion Tokens Target Calculation:
-# Total Steps = 50,000,000,000 / 524,288 ≈ 95,368 steps
-MAX_STEPS=95368
-# 15% High-Density WSD Annealing Phase (~7.5 Billion Tokens)
-DECAY_STEPS=14305     
+# ==============================================================================
+# 75 Billion Tokens Target Calculation:
+# Total Steps = 75,000,000,000 / 524,288 = 143,052 steps
+# 10% WSD Annealing Phase = 7.5 Billion Tokens / 524,288 = 14,305 steps
+# Stable Phase ends at Step: 143,052 - 14,305 = 128,747 steps
+# ==============================================================================
+MAX_STEPS=143052
+DECAY_STEPS=14305
 WEIGHT_DECAY=0.1
 
-# Distillation Hyperparameters
+# Distillation Hyperparameters (50/50 Multi-Task Objective)
 ALPHA_CE=0.5
 ALPHA_KL=0.5
 TEMPERATURE=1.0
 
 # Output Paths & Cloud Persistence
+# Retaining the same directory ensures seamless resumption from checkpoint-80000
 OUTPUT_DIR="${ROOT_DIR}/checkpoints_distill_2.5B_50BT"
 DATA_CACHE_DIR="${ROOT_DIR}/teacher_predictions"
-R2_PREFIX="checkpoints_2.5B_50BT"
+R2_PREFIX="checkpoints_2.5B_75BT"
 
 LOGGING_STEPS=250
 SAVE_STEPS=2000      # Checkpoint and sync to Cloudflare R2 every ~1.04B tokens
@@ -60,16 +64,18 @@ mkdir -p "$OUTPUT_DIR"
 
 GLOBAL_BATCH_SEQS=$((NUM_GPUS * PER_GPU_BATCH_SIZE * GRAD_ACCUM))
 TOKENS_PER_STEP=$((GLOBAL_BATCH_SEQS * SEQ_LEN))
+STABLE_END_STEP=$((MAX_STEPS - DECAY_STEPS))
 
 echo "======================================================================"
-echo "🚀 Launching Production BareTorch Distillation Engine (8x H100 SXM5 80GB)"
+echo "🚀 Launching Production BareTorch Flagship Engine (8x H100 SXM5 80GB)"
 echo "  ├─ Hardware Config   : ${NUM_GPUS}x NVIDIA H100 SXM5 (80GB)"
 echo "  ├─ Model Dimension   : d_model=${D_MODEL}, layers=${NUM_LAYERS}, heads=${NUM_HEADS} (~2.53B Untied)"
 echo "  ├─ Batch Setup       : ${NUM_GPUS} GPUs x ${PER_GPU_BATCH_SIZE} batch x ${GRAD_ACCUM} accum = ${GLOBAL_BATCH_SEQS} seqs/step"
 echo "  ├─ Step Throughput   : ${TOKENS_PER_STEP} tokens/step (~524k tokens/step)"
-echo "  ├─ Target Dataset    : 50 Billion Tokens"
+echo "  ├─ Target Dataset    : 75 Billion Tokens"
 echo "  ├─ Total Steps       : ${MAX_STEPS} steps"
-echo "  ├─ WSD Annealing     : Warmup=${WARMUP_STEPS} steps | Decay=${DECAY_STEPS} steps"
+echo "  ├─ Stable Phase Ends : Step ${STABLE_END_STEP} (~67.5B tokens)"
+echo "  ├─ WSD Annealing     : Warmup=${WARMUP_STEPS} steps | Decay=${DECAY_STEPS} steps (Last 10% / 7.5BT)"
 echo "  └─ Cloud Sync        : Active -> Cloudflare R2 (${R2_PREFIX})"
 echo "======================================================================"
 

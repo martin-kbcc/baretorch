@@ -6,7 +6,14 @@ import random
 import subprocess
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import torch.serialization
+
+# Enforce shared memory files over file descriptors to avoid "Too many open files" errors
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 # Enable TF32 for Tensor Core acceleration
 torch.set_float32_matmul_precision("high")
@@ -217,8 +224,14 @@ class DistributedCurriculumSampler(Sampler):
             )
 
             if use_annealing:
-                yield ann_rank[ann_ptr % len(ann_rank)]
-                ann_ptr += 1
+                # 60% Math / Reasoning / CoT (Stage 2) & 40% General Data Anchor (Stage 1)
+                p_val = torch.rand(1, generator=g).item()
+                if p_val < 0.60 or len(gen_rank) == 0:
+                    yield ann_rank[ann_ptr % len(ann_rank)]
+                    ann_ptr += 1
+                else:
+                    yield gen_rank[gen_ptr % len(gen_rank)]
+                    gen_ptr += 1
             else:
                 if len(gen_rank) > 0:
                     yield gen_rank[gen_ptr % len(gen_rank)]
@@ -839,11 +852,11 @@ def main():
     if local_rank == 0:
         logger.info("=" * 70)
         logger.info(f"🤖 Model Architecture Initialized: {args.model_type}")
-        logger.info(f"   ├─ Precision            : BF16 Parameters & Gradients")
-        logger.info(f"   ├─ Optimizer            : bitsandbytes 8-Bit AdamW")
+        logger.info(f"   ├─ Precision             : BF16 Parameters & Gradients")
+        logger.info(f"   ├─ Optimizer             : bitsandbytes 8-Bit AdamW")
         logger.info(f"   ├─ Distributed Strategy : PyTorch DDP")
         logger.info(f"   ├─ Tied Embeddings      : {args.tie_embeddings}")
-        logger.info(f"   ├─ QK Normalization     : {args.use_qk_norm}")
+        logger.info(f"   ├─ QK Normalization      : {args.use_qk_norm}")
         logger.info(
             f"   ├─ Total Parameters     : {total_params / 1e9:.3f} Billion ({total_params:,})"
         )

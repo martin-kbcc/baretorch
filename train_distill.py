@@ -7,17 +7,26 @@ import subprocess
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-# Prevent 'Too many open files' error when reading hundreds of memmap shards across workers
-mp.set_sharing_strategy('file_system')
+import torch.serialization
+
+# Enforce shared memory files over file descriptors to avoid "Too many open files" errors across workers
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
+
 # Enable TF32 for Tensor Core acceleration
 torch.set_float32_matmul_precision("high")
-# Bypass the buggy cuDNN attention backend during Evaluation
+# Bypass the cuDNN attention backend during Evaluation
 torch.backends.cuda.enable_cudnn_sdp(False)
-import torch.serialization
 
 # 1. Comprehensive allowlist for NumPy types in PyTorch 2.6+
 safe_numpy_types = [np.dtype, np.ndarray]
-for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
+for mod_path in [
+    "numpy._core.multiarray",
+    "numpy.core.multiarray",
+    "numpy._core.numerictypes",
+]:
     try:
         mod = __import__(mod_path, fromlist=["scalar", "_reconstruct"])
         if hasattr(mod, "scalar"):
@@ -33,9 +42,13 @@ except Exception:
 
 # 2. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
 _orig_torch_load = torch.load
+
+
 def _patched_torch_load(*args, **kwargs):
     kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
+
+
 torch.load = _patched_torch_load
 
 import torch.nn.functional as F
@@ -66,7 +79,9 @@ from baretorch import (
 )
 
 # Logging Setup
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s"
+)
 logger = logging.getLogger(__name__)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -94,7 +109,7 @@ ANNEALING_DATASETS = {"openr1_math", "finemath_4plus", "cosmopedia_v2"}
 GENERAL_RATIOS = {
     "fineweb_edu_100bt": 0.40,  # ~40% of general track
     "stack_dedup": 0.30,        # ~30% of general track
-    "dclm_100bt": 0.20,          # ~20% of general track
+    "dclm_100bt": 0.20,         # ~20% of general track
     "finepdfs_100bt": 0.10,     # ~10% of general track
 }
 
@@ -105,8 +120,16 @@ REASONING_RATIOS = {
 }
 
 
-def get_wsd_schedule(optimizer, num_warmup_steps, num_decay_steps, num_training_steps, min_lr_ratio=0.0):
-    num_stable_steps = max(0, num_training_steps - num_warmup_steps - num_decay_steps)
+def get_wsd_schedule(
+    optimizer,
+    num_warmup_steps,
+    num_decay_steps,
+    num_training_steps,
+    min_lr_ratio=0.0,
+):
+    num_stable_steps = max(
+        0, num_training_steps - num_warmup_steps - num_decay_steps
+    )
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
@@ -118,12 +141,15 @@ def get_wsd_schedule(optimizer, num_warmup_steps, num_decay_steps, num_training_
             if decay_step >= num_decay_steps:
                 return min_lr_ratio
             progress = float(decay_step) / float(max(1, num_decay_steps))
-            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + np.cos(np.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+                1.0 + np.cos(np.pi * progress)
+            )
 
     return LambdaLR(optimizer, lr_lambda)
 
 
 class DistributedCurriculumSampler(Sampler):
+
     def __init__(
         self,
         dataset,
@@ -134,9 +160,17 @@ class DistributedCurriculumSampler(Sampler):
         seed=42,
     ):
         if num_replicas is None:
-            num_replicas = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            num_replicas = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            )
         if rank is None:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
 
         self.dataset = dataset
         self.trainer = trainer
@@ -190,8 +224,14 @@ class DistributedCurriculumSampler(Sampler):
             )
 
             if use_annealing:
-                yield ann_rank[ann_ptr % len(ann_rank)]
-                ann_ptr += 1
+                # 60% Math / Reasoning / CoT (Stage 2) & 40% General Data Anchor (Stage 1)
+                p_val = torch.rand(1, generator=g).item()
+                if p_val < 0.60 or len(gen_rank) == 0:
+                    yield ann_rank[ann_ptr % len(ann_rank)]
+                    ann_ptr += 1
+                else:
+                    yield gen_rank[gen_ptr % len(gen_rank)]
+                    gen_ptr += 1
             else:
                 if len(gen_rank) > 0:
                     yield gen_rank[gen_ptr % len(gen_rank)]
@@ -208,10 +248,6 @@ class DistributedCurriculumSampler(Sampler):
 
 
 class R2CheckpointCallback(TrainerCallback):
-    """
-    Hugging Face Trainer Callback that automatically syncs newly saved checkpoints
-    to Cloudflare R2 asynchronously using rclone without blocking active GPU execution.
-    """
     def __init__(
         self,
         bucket_name: str = "baretorch-data",
@@ -228,7 +264,9 @@ class R2CheckpointCallback(TrainerCallback):
             local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
 
             if os.path.exists(local_ckpt_path):
-                rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+                rel_output_dir = os.path.basename(
+                    os.path.normpath(args.output_dir)
+                )
                 target_r2_path = (
                     f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
                 )
@@ -253,33 +291,38 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 class DistillMemmapDataset(Dataset):
-    def __init__(self, data_dir: str, seq_len: int = 2048, dataset_filter: str = "all", max_samples: int = None):
+
+    def __init__(
+        self,
+        data_dir: str,
+        seq_len: int = 2048,
+        dataset_filter: str = "all",
+        max_samples: int = None,
+    ):
         self.data_dir = data_dir
         self.seq_len = seq_len
         self.dataset_filter = dataset_filter
         self.max_samples = max_samples
         self.samples = []
         self.split_idx = 0
-        self._mmap_cache = {}
         self.reload_shards()
 
-    def _get_mmap(self, path, dtype, shape):
-        if path not in self._mmap_cache:
-            m = np.memmap(path, dtype=dtype, mode="r")
-            self._mmap_cache[path] = m.reshape(shape)
-        return self._mmap_cache[path]
-
     def reload_shards(self):
-        token_files = sorted(glob.glob(os.path.join(self.data_dir, "**/*_packed_tokens.bin"), recursive=True))
+        token_files = sorted(
+            glob.glob(
+                os.path.join(self.data_dir, "**/*_packed_tokens.bin"),
+                recursive=True,
+            )
+        )
+        token_files = [f for f in token_files if not f.endswith(".corrupt")]
+
         if not token_files:
             raise FileNotFoundError(
-                f"❌ No '*_packed_tokens.bin' files found in '{self.data_dir}'."
-                " Run teacher_inference.py first!"
+                f"❌ No valid '*_packed_tokens.bin' files found in '{self.data_dir}'."
             )
 
         general_samples = []
         annealing_samples = []
-        total_tokens = 0
 
         for t_path in token_files:
             prefix = t_path.replace("_packed_tokens.bin", "")
@@ -300,12 +343,11 @@ class DistillMemmapDataset(Dataset):
             num_seqs = num_tokens // self.seq_len
 
             if num_seqs > 0:
-                target_list = annealing_samples if is_annealing else general_samples
-
+                target_list = (
+                    annealing_samples if is_annealing else general_samples
+                )
                 for s_i in range(num_seqs):
                     target_list.append((t_path, idx_path, val_path, s_i))
-
-                total_tokens += num_seqs * self.seq_len
 
         self.split_idx = len(general_samples)
         self.samples = general_samples + annealing_samples
@@ -314,26 +356,58 @@ class DistillMemmapDataset(Dataset):
             self.samples = self.samples[: self.max_samples]
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if local_rank == 0:
-            logger.info(f"Loaded dataset track '{self.dataset_filter}' ({len(self.samples):,} sequences) from '{self.data_dir}'")
+        if local_rank == 0 and "logger" in globals():
+            logger.info(
+                f"Loaded dataset track '{self.dataset_filter}' ({len(self.samples):,} sequences) from '{self.data_dir}'"
+            )
+
+    def _get_worker_mmap(self, path, dtype, shape):
+        current_pid = os.getpid()
+
+        if (
+            not hasattr(self, "_worker_mmap_cache")
+            or getattr(self, "_worker_pid", None) != current_pid
+        ):
+            self._worker_mmap_cache = {}
+            self._worker_pid = current_pid
+
+        if path not in self._worker_mmap_cache:
+            m = np.memmap(path, dtype=dtype, mode="r")
+            m.flags.writeable = False
+            self._worker_mmap_cache[path] = m.reshape(shape)
+
+        return self._worker_mmap_cache[path]
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         if len(self.samples) == 0:
-            raise RuntimeError(f"Dataset for filter '{self.dataset_filter}' is empty.")
+            raise RuntimeError(
+                f"Dataset for filter '{self.dataset_filter}' is empty."
+            )
 
         s_idx = idx % len(self.samples)
         t_path, idx_path, val_path, s_i = self.samples[s_idx]
 
-        tok_mmap = self._get_mmap(t_path, np.uint32, (-1, self.seq_len))
-        idx_mmap = self._get_mmap(idx_path, np.uint32, (-1, self.seq_len, 4))
-        val_mmap = self._get_mmap(val_path, np.float16, (-1, self.seq_len, 4))
+        tok_mmap = self._get_worker_mmap(t_path, np.uint32, (-1, self.seq_len))
+        idx_mmap = self._get_worker_mmap(
+            idx_path, np.uint32, (-1, self.seq_len, 4)
+        )
+        val_mmap = self._get_worker_mmap(
+            val_path, np.float16, (-1, self.seq_len, 4)
+        )
 
         tokens = torch.from_numpy(tok_mmap[s_i].astype(np.int64))
         teacher_indices = torch.from_numpy(idx_mmap[s_i].astype(np.int64))
         teacher_values = torch.from_numpy(val_mmap[s_i].astype(np.float32))
+
+        tokens = torch.clamp(tokens, 0, 248076)
+        teacher_indices = torch.clamp(teacher_indices, 0, 248076)
+
+        teacher_values = torch.nan_to_num(
+            teacher_values, nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         return {
             "input_ids": tokens,
@@ -356,7 +430,11 @@ def build_proportional_val_dataset(
 
     for ds_name, ratio in ratios.items():
         ds_dir = os.path.join(data_dir, ds_name)
-        token_files = sorted(glob.glob(os.path.join(ds_dir, "**/*_packed_tokens.bin"), recursive=True))
+        token_files = sorted(
+            glob.glob(
+                os.path.join(ds_dir, "**/*_packed_tokens.bin"), recursive=True
+            )
+        )
 
         ds_samples = []
         for t_path in token_files:
@@ -376,11 +454,11 @@ def build_proportional_val_dataset(
 
         if ds_samples:
             rng.shuffle(ds_samples)
-            
+
             total_avail = len(ds_samples)
             target_from_fraction = max(1, int(total_avail * val_fraction))
             target_from_cap = max(1, int(max_total_seqs * ratio))
-            
+
             final_sample_count = min(target_from_fraction, target_from_cap)
             collected_samples.extend(ds_samples[:final_sample_count])
 
@@ -395,15 +473,36 @@ def build_proportional_val_dataset(
 
 
 class DistillTrainer(Trainer):
-    def __init__(self, *args, alpha_ce=0.5, alpha_kl=0.5, temperature=1.0, decay_steps=None, **kwargs):
+
+    def __init__(
+        self,
+        *args,
+        alpha_ce=0.5,
+        alpha_kl=0.5,
+        temperature=1.0,
+        decay_steps=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.alpha_ce = alpha_ce
         self.alpha_kl = alpha_kl
         self.temperature = temperature
         self.decay_steps = decay_steps
 
+        # Buffers for decoupled training metrics
+        self._tr_loss_ce = 0.0
+        self._tr_loss_kl = 0.0
+        self._tr_loss_steps = 0
+
+        # Buffers for decoupled evaluation metrics
+        self._eval_loss_ce = 0.0
+        self._eval_loss_kl = 0.0
+        self._eval_loss_steps = 0
+
     def _get_train_sampler(self, dataset=None) -> Sampler:
-        target_dataset = dataset if dataset is not None else self.train_dataset
+        target_dataset = (
+            dataset if dataset is not None else self.train_dataset
+        )
         if target_dataset is not None:
             decay_steps = (
                 self.decay_steps
@@ -422,10 +521,16 @@ class DistillTrainer(Trainer):
         except TypeError:
             return super()._get_train_sampler()
 
-    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+    def create_scheduler(
+        self,
+        num_training_steps: int,
+        optimizer: torch.optim.Optimizer = None,
+    ):
         if self.args.lr_scheduler_type in ["wsd", "warmup_stable_decay"]:
             if self.lr_scheduler is None:
-                optimizer = self.optimizer if optimizer is None else optimizer
+                optimizer = (
+                    self.optimizer if optimizer is None else optimizer
+                )
                 decay_steps = (
                     self.decay_steps
                     if self.decay_steps is not None and self.decay_steps > 0
@@ -440,7 +545,9 @@ class DistillTrainer(Trainer):
             return self.lr_scheduler
         return super().create_scheduler(num_training_steps, optimizer)
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         import torch.utils.checkpoint as cp
 
         input_ids = inputs["input_ids"]
@@ -461,27 +568,39 @@ class DistillTrainer(Trainer):
         shift_teacher_indices = teacher_indices[:, :-1, :]
         shift_teacher_values = teacher_values[:, :-1, :]
 
-        p_teacher_full = F.softmax(shift_teacher_values / self.temperature, dim=-1)
+        p_teacher_full = F.softmax(
+            shift_teacher_values / self.temperature, dim=-1
+        )
 
         B, L_shift, _ = shift_hidden.shape
         num_tokens = B * L_shift
-        chunk_size = 512  # Original safe chunk size
+        chunk_size = 512
 
         total_loss_ce = 0.0
         total_loss_kl = 0.0
 
-        # Exact original workstation loss computation
         def compute_chunk(c_hid, c_lbl, c_t_idx, c_t_p):
-            c_log = lm_head(c_hid)
+            target_dtype = (
+                lm_head.weight.dtype
+                if hasattr(lm_head, "weight")
+                else torch.bfloat16
+            )
+            c_hid_input = (
+                c_hid.to(target_dtype)
+                if c_hid.dtype != target_dtype
+                else c_hid
+            )
+
+            c_log = lm_head(c_hid_input)
             ce = F.cross_entropy(
                 c_log.reshape(-1, c_log.size(-1)),
                 c_lbl.reshape(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
-            lps = F.log_softmax(c_log / self.temperature, dim=-1)
+            lps = F.log_softmax(c_log.float() / self.temperature, dim=-1)
             st_top4 = torch.gather(lps, dim=-1, index=c_t_idx)
-            kl = F.kl_div(st_top4, c_t_p, reduction="sum")
+            kl = F.kl_div(st_top4, c_t_p.float(), reduction="sum")
             return ce, kl
 
         for c_start in range(0, L_shift, chunk_size):
@@ -510,10 +629,65 @@ class DistillTrainer(Trainer):
             total_loss_kl += c_loss_kl
 
         loss_ce = total_loss_ce / num_tokens
-        loss_kl = (total_loss_kl / num_tokens) * (self.temperature ** 2)
+        loss_kl = (total_loss_kl / num_tokens) * (self.temperature**2)
         total_loss = (self.alpha_ce * loss_ce) + (self.alpha_kl * loss_kl)
 
+        # Decoupled Loss Metrics Buffer
+        if model.training:
+            self._tr_loss_ce += loss_ce.detach().item()
+            self._tr_loss_kl += loss_kl.detach().item()
+            self._tr_loss_steps += 1
+        else:
+            self._eval_loss_ce += loss_ce.detach().item()
+            self._eval_loss_kl += loss_kl.detach().item()
+            self._eval_loss_steps += 1
+
         return (total_loss, outputs) if return_outputs else total_loss
+
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        # Inject decoupled CE and KL values into standard training logs
+        if "loss" in logs and self._tr_loss_steps > 0:
+            logs["loss_ce"] = round(self._tr_loss_ce / self._tr_loss_steps, 4)
+            logs["loss_kl"] = round(self._tr_loss_kl / self._tr_loss_steps, 4)
+            self._tr_loss_ce = 0.0
+            self._tr_loss_kl = 0.0
+            self._tr_loss_steps = 0
+        super().log(logs, *args, **kwargs)
+
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        # Reset per-dataset evaluation accumulators
+        self._eval_loss_ce = 0.0
+        self._eval_loss_kl = 0.0
+        self._eval_loss_steps = 0
+
+        output = super().evaluation_loop(
+            dataloader,
+            description,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        # Inject decoupled validation metrics per track (general & reasoning)
+        if self._eval_loss_steps > 0 and output.metrics is not None:
+            output.metrics[f"{metric_key_prefix}_loss_ce"] = round(
+                self._eval_loss_ce / self._eval_loss_steps, 4
+            )
+            output.metrics[f"{metric_key_prefix}_loss_kl"] = round(
+                self._eval_loss_kl / self._eval_loss_steps, 4
+            )
+            self._eval_loss_ce = 0.0
+            self._eval_loss_kl = 0.0
+            self._eval_loss_steps = 0
+
+        return output
 
 
 def prepare_dataset(args):
@@ -524,15 +698,24 @@ def prepare_dataset(args):
         train_dir = args.data_cache_dir
         val_dir = args.data_cache_dir
 
-    train_dataset = DistillMemmapDataset(data_dir=train_dir, seq_len=args.seq_len, dataset_filter="all")
-
-    # Target 10M tokens total (~4,882 sequences)
-    val_general_dataset = build_proportional_val_dataset(
-        val_dir, GENERAL_RATIOS, seq_len=args.seq_len, val_fraction=0.05, max_total_seqs=3255
+    train_dataset = DistillMemmapDataset(
+        data_dir=train_dir, seq_len=args.seq_len, dataset_filter="all"
     )
-    
+
+    val_general_dataset = build_proportional_val_dataset(
+        val_dir,
+        GENERAL_RATIOS,
+        seq_len=args.seq_len,
+        val_fraction=0.05,
+        max_total_seqs=3255,
+    )
+
     val_reasoning_dataset = build_proportional_val_dataset(
-        val_dir, REASONING_RATIOS, seq_len=args.seq_len, val_fraction=0.05, max_total_seqs=1627
+        val_dir,
+        REASONING_RATIOS,
+        seq_len=args.seq_len,
+        val_fraction=0.05,
+        max_total_seqs=1627,
     )
 
     eval_datasets = {
@@ -550,16 +733,43 @@ def main():
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
 
-    parser = argparse.ArgumentParser(description="BareTorch Knowledge Distillation Engine")
+    parser = argparse.ArgumentParser(
+        description="BareTorch Knowledge Distillation Engine (FSDP / Cluster)"
+    )
 
     # Architecture & Data
-    parser.add_argument("--model_type", type=str, default="baretorch", choices=list(MODEL_MAP.keys()))
-    parser.add_argument("--layer_sequence", type=str, default="cs_lrad,cs_lrad,cs_lrad,transformer")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_distill_2.5B")
-    parser.add_argument("--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--data_cache_dir", type=str, default="./teacher_predictions")
-    parser.add_argument("--tie_embeddings", action="store_true", default=False, help="Tie input & output embedding weights.")
-    parser.add_argument("--use_qk_norm", action="store_true", default=True, help="Enable per-head QK-Normalization in attention layers.")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="baretorch",
+        choices=list(MODEL_MAP.keys()),
+    )
+    parser.add_argument(
+        "--layer_sequence",
+        type=str,
+        default="cs_lrad,cs_lrad,cs_lrad,transformer",
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default="./checkpoints_distill_2.5B"
+    )
+    parser.add_argument(
+        "--tokenizer_name", type=str, default="Qwen/Qwen3.5-9B"
+    )
+    parser.add_argument(
+        "--data_cache_dir", type=str, default="./teacher_predictions"
+    )
+    parser.add_argument(
+        "--tie_embeddings",
+        action="store_true",
+        default=False,
+        help="Tie input & output embedding weights.",
+    )
+    parser.add_argument(
+        "--use_qk_norm",
+        action="store_true",
+        default=True,
+        help="Enable per-head QK-Normalization in attention layers.",
+    )
     parser.add_argument("--chunk_size", type=int, default=32)
     parser.add_argument("--rank", type=int, default=16)
 
@@ -571,9 +781,19 @@ def main():
     # Optimization
     parser.add_argument("--max_steps", type=int, default=1258850)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--scheduler", type=str, default="wsd", help="Scheduler type: 'cosine', 'linear', or 'wsd'")
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="wsd",
+        help="Scheduler type: 'cosine', 'linear', or 'wsd'",
+    )
     parser.add_argument("--warmup_steps", type=int, default=10000)
-    parser.add_argument("--decay_steps", type=int, default=None, help="Decay steps for WSD schedule (default: 10% of max_steps)")
+    parser.add_argument(
+        "--decay_steps",
+        type=int,
+        default=None,
+        help="Decay steps for WSD schedule (default: 10% of max_steps)",
+    )
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum", type=int, default=1)
@@ -585,9 +805,23 @@ def main():
     parser.add_argument("--seq_len", type=int, default=2048)
 
     # Cloud Sync & Engine
-    parser.add_argument("--r2_sync", action="store_true", help="Enable background checkpoint syncing to Cloudflare R2 via rclone.")
-    parser.add_argument("--r2_bucket", type=str, default="baretorch-data", help="Cloudflare R2 bucket name.")
-    parser.add_argument("--r2_prefix", type=str, default="checkpoints", help="Prefix path inside R2 bucket.")
+    parser.add_argument(
+        "--r2_sync",
+        action="store_true",
+        help="Enable background checkpoint syncing to Cloudflare R2 via rclone.",
+    )
+    parser.add_argument(
+        "--r2_bucket",
+        type=str,
+        default="baretorch-data",
+        help="Cloudflare R2 bucket name.",
+    )
+    parser.add_argument(
+        "--r2_prefix",
+        type=str,
+        default="checkpoints",
+        help="Prefix path inside R2 bucket.",
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--grad_checkpointing", action="store_true")
     parser.add_argument("--logging_steps", type=int, default=100)
@@ -597,7 +831,9 @@ def main():
     args = parser.parse_args()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_name, trust_remote_code=True
+    )
     vocab_size = len(tokenizer)
 
     config_cls, model_cls = MODEL_MAP[args.model_type]
@@ -616,8 +852,14 @@ def main():
     }
 
     if args.model_type == "baretorch":
-        raw_sequence = [s.strip().lower() for s in args.layer_sequence.split(",") if s.strip()]
-        config_args["layer_types"] = [raw_sequence[i % len(raw_sequence)] for i in range(args.num_layers)]
+        raw_sequence = [
+            s.strip().lower()
+            for s in args.layer_sequence.split(",")
+            if s.strip()
+        ]
+        config_args["layer_types"] = [
+            raw_sequence[i % len(raw_sequence)] for i in range(args.num_layers)
+        ]
 
     config = config_cls(**config_args)
     model = model_cls(config)
@@ -628,10 +870,11 @@ def main():
         elif hasattr(model, "lm_head") and hasattr(model, "embed_tokens"):
             model.lm_head.weight = model.embed_tokens.weight
 
-    # Targeted Sub-Module Compilation specifically for CS-LRAD recurrent layers
     if args.compile:
         if local_rank == 0:
-            logger.info("⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules...")
+            logger.info(
+                "⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules..."
+            )
         compiled_blocks = 0
         for name, module in model.named_modules():
             cls_name = module.__class__.__name__.lower()
@@ -639,20 +882,30 @@ def main():
                 module.forward = torch.compile(module.forward)
                 compiled_blocks += 1
         if local_rank == 0:
-            logger.info(f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s).")
+            logger.info(
+                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s)."
+            )
 
     unique_params_dict = {p.data_ptr(): p for p in model.parameters()}
     total_params = sum(p.numel() for p in unique_params_dict.values())
-    trainable_params = sum(p.numel() for p in unique_params_dict.values() if p.requires_grad)
+    trainable_params = sum(
+        p.numel() for p in unique_params_dict.values() if p.requires_grad
+    )
 
     if local_rank == 0:
         logger.info("=" * 70)
         logger.info(f"🤖 Model Architecture Initialized: {args.model_type}")
-        logger.info(f"   ├─ Tied Embeddings     : {args.tie_embeddings}")
-        logger.info(f"   ├─ QK Normalization    : {args.use_qk_norm}")
-        logger.info(f"   ├─ Total Parameters     : {total_params / 1e9:.3f} Billion ({total_params:,})")
-        logger.info(f"   ├─ Trainable Parameters : {trainable_params / 1e9:.3f} Billion ({trainable_params:,})")
-        logger.info(f"   └─ LR Schedule          : {args.scheduler.upper()} (Warmup={args.warmup_steps} steps)")
+        logger.info(f"   ├─ Tied Embeddings      : {args.tie_embeddings}")
+        logger.info(f"   ├─ QK Normalization     : {args.use_qk_norm}")
+        logger.info(
+            f"   ├─ Total Parameters     : {total_params / 1e9:.3f} Billion ({total_params:,})"
+        )
+        logger.info(
+            f"   ├─ Trainable Parameters : {trainable_params / 1e9:.3f} Billion ({trainable_params:,})"
+        )
+        logger.info(
+            f"   └─ LR Schedule          : {args.scheduler.upper()} (Warmup={args.warmup_steps} steps)"
+        )
         logger.info("=" * 70)
 
     train_dataset, eval_datasets = prepare_dataset(args)
@@ -679,26 +932,33 @@ def main():
         save_total_limit=3,
         torch_compile=False,
         gradient_checkpointing=args.grad_checkpointing,
-        fsdp="shard_grad_op",  # Standard ZeRO-2 Optimizer State Sharding natively supported for untied models
+        fsdp="shard_grad_op",
         ddp_find_unused_parameters=False,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         remove_unused_columns=False,
     )
 
-    # Detect R2 sync activation via argument or environment variables
-    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    enable_r2_sync = args.r2_sync or os.environ.get(
+        "R2_SYNC", "0"
+    ).lower() in ("1", "true", "yes")
     r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
     r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
 
     callbacks = []
     if enable_r2_sync:
         if local_rank == 0:
-            logger.info(f"Cloudflare R2 Sync ACTIVATED. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'")
-        callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
+            logger.info(
+                f"Cloudflare R2 Sync ACTIVATED. Target Bucket: '{r2_bucket}' | Prefix: '{r2_prefix}'"
+            )
+        callbacks.append(
+            R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix)
+        )
     else:
         if local_rank == 0:
-            logger.info("Cloudflare R2 Sync DISABLED. Running in local mode (disk checkpoints only).")
+            logger.info(
+                "Cloudflare R2 Sync DISABLED. Running in local mode (disk checkpoints only)."
+            )
 
     trainer = DistillTrainer(
         model=model,
@@ -706,17 +966,18 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_datasets,
         callbacks=callbacks,
-        alpha_ce=alpha_ce_val if 'alpha_ce_val' in locals() else args.alpha_ce,
-        alpha_kl=alpha_kl_val if 'alpha_kl_val' in locals() else args.alpha_kl,
+        alpha_ce=args.alpha_ce,
+        alpha_kl=args.alpha_kl,
         temperature=args.temperature,
         decay_steps=args.decay_steps,
     )
 
-    # Automatic Checkpoint Resumption Logic
     checkpoint_to_resume = None
     if os.path.exists(training_args.output_dir):
         existing_checkpoints = [
-            d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")
+            d
+            for d in os.listdir(training_args.output_dir)
+            if d.startswith("checkpoint-")
         ]
         if existing_checkpoints:
             checkpoint_to_resume = True
