@@ -2,25 +2,31 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, AutoModel, AutoModelForCausalLM, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
+from transformers import (
+    AutoModel,
+    AutoModelForCausalLM,
+    GenerationMixin,
+    PreTrainedModel,
+)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 from baretorch.integration.configuration_baretorch import (
     BareTorchConfig,
     CSLRADConfig,
     TransformerConfig,
-    CSTTTConfig,
-    CSLRADTransformerConfig,
-    CSTTTTransformerConfig,
-    CSLRADCSTTTTransformerConfig,
 )
-from baretorch.modeling.transformer import TransformerDecoderBlock, RMSNorm
-from baretorch.modeling.cs_lrad import LRADDecoderBlock, CSLRADForCausalLM
-from baretorch.modeling.cs_ttt import TTTDecoderBlock, CSTTTForCausalLM
-from baretorch.modeling.transformer import TransformerForCausalLM
-from baretorch.modeling.cs_lrad_transformer import CSLRADTransformerForCausalLM
-from baretorch.modeling.cs_ttt_transformer import CSTTTTransformerForCausalLM
-from baretorch.modeling.cs_lrad_cs_ttt_transformer import CSLRADCSTTTTransformerForCausalLM
+from baretorch.modeling.cs_lrad import (
+    CSLRADForCausalLM,
+    LRADDecoderBlock,
+)
+from baretorch.modeling.transformer import (
+    RMSNorm,
+    TransformerDecoderBlock,
+    TransformerForCausalLM,
+)
 
 
 class BareTorchPreTrainedModel(PreTrainedModel):
@@ -39,7 +45,6 @@ class BareTorchPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # Modern Hugging Face Gradient Checkpointing Signature (uses 'enable' instead of 'value')
     def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
         if isinstance(self, (BareTorchModel, BareTorchForCausalLM)):
             self.gradient_checkpointing = enable
@@ -78,15 +83,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
                 )
             elif layer_type == "cs_lrad":
                 block = LRADDecoderBlock(
-                    d_model=config.d_model,
-                    num_heads=config.num_heads,
-                    chunk_size=config.chunk_size,
-                    rank=config.rank,
-                    dropout=config.dropout,
-                    use_grad_checkpointing=config.use_grad_checkpointing
-                )
-            elif layer_type == "cs_ttt":
-                block = TTTDecoderBlock(
                     d_model=config.d_model,
                     num_heads=config.num_heads,
                     chunk_size=config.chunk_size,
@@ -138,9 +134,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.token_embedding(input_ids)
 
-        # CRITICAL FIX FOR GRPO ROLLOUTS:
-        # If past_key_values is present and seq_length > 1 (e.g. inputs_embeds passed during generation),
-        # slice inputs_embeds to the last token [:, -1:, :] so we only process the new token step.
         if past_key_values is not None and inputs_embeds.size(1) > 1:
             inputs_embeds = inputs_embeds[:, -1:, :]
             batch_size, seq_length, _ = inputs_embeds.shape
@@ -148,7 +141,6 @@ class BareTorchModel(BareTorchPreTrainedModel):
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
         
-        # Calculate robust position_ids for hybrid CS-LRAD + Transformer batching
         if position_ids is None:
             past_length = 0
             if past_key_values is not None:
@@ -178,11 +170,8 @@ class BareTorchModel(BareTorchPreTrainedModel):
             past_state = past_key_values[i] if past_key_values is not None else None
             
             if isinstance(layer, TransformerDecoderBlock):
-                # Now passing attention_mask down to the Transformer block
                 h, next_state = layer(h, past_kv=past_state, position_ids=position_ids, attention_mask=attention_mask)
             elif isinstance(layer, LRADDecoderBlock):
-                h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
-            elif isinstance(layer, TTTDecoderBlock):
                 h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
                 
             if use_cache:
@@ -269,11 +258,9 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
 
         logits = self.lm_head(hidden_states)
 
-        # Fail-safe against non-finite values during sampling rollouts
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         
-        # Soft-clamp logits to ensure sampling probabilities remain strictly finite
         logits = torch.clamp(logits, min=-50.0, max=50.0)
 
         loss = None
@@ -338,7 +325,3 @@ AutoModel.register(BareTorchConfig, BareTorchModel)
 AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM)
 AutoModelForCausalLM.register(CSLRADConfig, CSLRADForCausalLM)
 AutoModelForCausalLM.register(TransformerConfig, TransformerForCausalLM)
-AutoModelForCausalLM.register(CSTTTConfig, CSTTTForCausalLM)
-AutoModelForCausalLM.register(CSLRADTransformerConfig, CSLRADTransformerForCausalLM)
-AutoModelForCausalLM.register(CSTTTTransformerConfig, CSTTTTransformerForCausalLM)
-AutoModelForCausalLM.register(CSLRADCSTTTTransformerConfig, CSLRADCSTTTTransformerForCausalLM)

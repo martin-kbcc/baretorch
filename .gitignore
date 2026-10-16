@@ -15,6 +15,7 @@ pte_models_apple/*
 .cache/
 huggingface/
 data/
+deck/
 raw_dclm_parquet/
 tokenized_bin/
 tokenized_bin_sample/

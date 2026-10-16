@@ -1,12 +1,8 @@
 from transformers import PretrainedConfig, AutoConfig
 
-# Direct absolute imports of our modular layer-specific configurations
+# Direct absolute imports of our core modular configurations
 from baretorch.modeling.cs_lrad import CSLRADConfig
 from baretorch.modeling.transformer import TransformerConfig
-from baretorch.modeling.cs_ttt import CSTTTConfig
-from baretorch.modeling.cs_lrad_transformer import CSLRADTransformerConfig
-from baretorch.modeling.cs_ttt_transformer import CSTTTTransformerConfig
-from baretorch.modeling.cs_lrad_cs_ttt_transformer import CSLRADCSTTTTransformerConfig
 
 
 # ==========================================
@@ -60,7 +56,7 @@ class BareTorchConfig(PretrainedConfig):
         self.use_grad_checkpointing = use_grad_checkpointing
         self.use_qk_norm = use_qk_norm
         self.use_cache = kwargs.get("use_cache", True)
-        
+
         # Explicit auto_map attribute for Hugging Face integration compatibility
         self.auto_map = auto_map if auto_map is not None else {
             "AutoConfig": "baretorch.BareTorchConfig",
@@ -70,13 +66,11 @@ class BareTorchConfig(PretrainedConfig):
         if layer_types is None:
             self.layer_types = []
             for i in range(num_layers):
-                mod = i % 3
-                if mod == 0:
+                # Default 3:1 ratio (3 CS-LRAD layers for every 1 Transformer layer)
+                if (i + 1) % 4 == 0:
                     self.layer_types.append("transformer")
-                elif mod == 1:
-                    self.layer_types.append("cs_lrad")
                 else:
-                    self.layer_types.append("cs_ttt")
+                    self.layer_types.append("cs_lrad")
         else:
             self.layer_types = layer_types
 
@@ -88,7 +82,3 @@ class BareTorchConfig(PretrainedConfig):
 AutoConfig.register("baretorch", BareTorchConfig)
 AutoConfig.register("cs_lrad", CSLRADConfig)
 AutoConfig.register("transformer", TransformerConfig)
-AutoConfig.register("cs_ttt", CSTTTConfig)
-AutoConfig.register("cs_lrad_transformer", CSLRADTransformerConfig)
-AutoConfig.register("cs_ttt_transformer", CSTTTTransformerConfig)
-AutoConfig.register("cs_lrad_cs_ttt_transformer", CSLRADCSTTTTransformerConfig)
