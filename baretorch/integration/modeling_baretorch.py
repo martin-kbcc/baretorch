@@ -304,21 +304,19 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        if past_key_values is None:
-            return None
+      if past_key_values is None:
+        return None
 
-        reordered_past = ()
-        for layer_past in past_key_values:
-            if layer_past is None:
-                reordered_past += (None,)
-            elif isinstance(layer_past, tuple):
-                k, v = layer_past
-                reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
-            elif isinstance(layer_past, torch.Tensor):
-                reordered_past += (layer_past.index_select(0, beam_idx),)
-            else:
-                reordered_past += (layer_past,)
-        return reordered_past
+      def _reorder_item(item):
+        if isinstance(item, torch.Tensor):
+          return item.index_select(0, beam_idx)
+        elif isinstance(item, (tuple, list)):
+          return tuple(_reorder_item(x) for x in item)
+        return item
+
+      return tuple(
+          _reorder_item(layer_past) for layer_past in past_key_values
+      )
 
 
 AutoModel.register(BareTorchConfig, BareTorchModel)

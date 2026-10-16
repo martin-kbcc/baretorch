@@ -1,24 +1,36 @@
 import argparse
+import glob
 import logging
 import os
 import subprocess
+from datetime import timedelta
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import torch.serialization
-from datetime import timedelta
 
 # Disable Hugging Face Rust parallelism warnings/deadlocks in torchrun
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# 1. Enable TF32 for Tensor Core acceleration
+# Shared memory & Tensor Precision Setup
+try:
+    mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
+
+# Enable TF32 for Tensor Core acceleration
 torch.set_float32_matmul_precision("high")
 
-# 2. Bypass buggy cuDNN attention backend during Evaluation / no_grad
+# Bypass the cuDNN attention backend during Evaluation / no_grad
 torch.backends.cuda.enable_cudnn_sdp(False)
 
-# 3. Comprehensive allowlist for NumPy types in PyTorch 2.6+
+# Comprehensive allowlist for NumPy types in PyTorch 2.6+
 safe_numpy_types = [np.dtype, np.ndarray]
-for mod_path in ["numpy._core.multiarray", "numpy.core.multiarray", "numpy._core.numerictypes"]:
+for mod_path in [
+    "numpy._core.multiarray",
+    "numpy.core.multiarray",
+    "numpy._core.numerictypes",
+]:
     try:
         mod = __import__(mod_path, fromlist=["scalar", "_reconstruct"])
         if hasattr(mod, "scalar"):
@@ -32,14 +44,18 @@ try:
 except Exception:
     pass
 
-# 4. Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
+# Universal Fail-Safe: Force trusted local checkpoints to bypass strict weights_only check
 _orig_torch_load = torch.load
+
+
 def _patched_torch_load(*args, **kwargs):
     kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
+
+
 torch.load = _patched_torch_load
 
-from datasets import Dataset, load_dataset, interleave_datasets
+from datasets import Dataset, interleave_datasets, load_dataset
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
@@ -50,6 +66,7 @@ from transformers import (
 )
 
 from baretorch import BareTorchConfig, BareTorchForCausalLM
+from baretorch.modeling.transformer import RotaryEmbedding
 
 # ==============================================================================
 #                                Logging Configuration
@@ -62,6 +79,8 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
+logging.getLogger("fsspec").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 # ==============================================================================
@@ -77,7 +96,7 @@ class R2CheckpointCallback(TrainerCallback):
         self,
         bucket_name: str = "baretorch-data",
         remote_name: str = "r2",
-        prefix: str = "checkpoints",
+        prefix: str = "checkpoints_sft",
     ):
         self.bucket_name = bucket_name
         self.remote_name = remote_name
@@ -89,9 +108,12 @@ class R2CheckpointCallback(TrainerCallback):
             local_ckpt_path = os.path.join(args.output_dir, checkpoint_dir)
 
             if os.path.exists(local_ckpt_path):
-                rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))
+                rel_output_dir = os.path.basename(
+                    os.path.normpath(args.output_dir)
+                )
                 target_r2_path = (
-                    f"{self.remote_name}:{self.bucket_name}/{self.prefix}/{rel_output_dir}/{checkpoint_dir}"
+                    f"{self.remote_name}:{self.bucket_name}/{self.prefix}/"
+                    f"{rel_output_dir}/{checkpoint_dir}"
                 )
 
                 logger.info(
@@ -113,16 +135,51 @@ class R2CheckpointCallback(TrainerCallback):
                 )
 
 
-def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
-    """Packs multi-turn ChatML conversations using Whole-Sample Packing.
+def adapt_model_for_long_context(
+    model, config, target_seq_len=32768, target_rope_theta=1000000.0
+):
+    """Explicitly scales RotaryEmbedding base theta and forces cache regeneration
+    across all Transformer blocks for SFT.
+    """
+    config.max_seq_len = target_seq_len
+    config.rope_theta = target_rope_theta
+    if hasattr(config, "max_position_embeddings"):
+        config.max_position_embeddings = target_seq_len
 
+    adapted_layers = 0
+    for name, module in model.named_modules():
+        if isinstance(module, RotaryEmbedding) or module.__class__.__name__ in [
+            "RotaryEmbedding",
+            "RoPE",
+        ]:
+            module.base = float(target_rope_theta)
+            module.max_position_embeddings = target_seq_len
+
+            device = module.inv_freq.device
+            dim = module.dim
+            new_inv_freq = 1.0 / (
+                target_rope_theta
+                ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            )
+            module.register_buffer("inv_freq", new_inv_freq, persistent=False)
+            module._set_cos_sin_cache(
+                seq_len=target_seq_len, device=device, dtype=torch.float32
+            )
+            adapted_layers += 1
+
+    return adapted_layers
+
+
+def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=32768, local_rank=0):
+    """Packs multi-turn ChatML conversations using Whole-Sample Packing.
     Guarantees no conversation is cut in half across sequence boundaries.
     Applies completion-only loss masking (-100 for prompts/headers).
     Uses compact NumPy memory buffers to eliminate CPU RAM OOMs.
     """
     if local_rank == 0:
         logger.info(
-            "📦 Packing ChatML conversations (Whole-Sample Packing, High Memory Efficiency)..."
+            f"📦 Packing ChatML conversations into {max_seq_len}-token sequences "
+            "(Whole-Sample Packing)..."
         )
 
     vocab_size = len(tokenizer)
@@ -219,7 +276,8 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=2048, local_rank=0):
 
     if local_rank == 0:
         logger.info(
-            f"✅ Packing complete: Created {len(packed_samples):,} whole-sample packed {max_seq_len}-token sequences."
+            f"✅ Packing complete: Created {len(packed_samples):,} whole-sample packed "
+            f"{max_seq_len}-token sequences."
         )
 
     return Dataset.from_list(packed_samples)
@@ -230,20 +288,22 @@ def main():
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend="nccl",
-                timeout=timedelta(minutes=60)  # Extends timeout to 1 hour
+                timeout=timedelta(minutes=60),
             )
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
+    else:
+        local_rank = 0
 
     parser = argparse.ArgumentParser(
-        description="BareTorch Stage 1: Supervised Fine-Tuning (SFT) Engine"
+        description="BareTorch Stage 3: Supervised Fine-Tuning (SFT) Engine (FSDP / Cluster)"
     )
 
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
-        default="./checkpoints_distill_2.5B_50BT_baretorch",
-        help="Path to pre-trained BareTorch checkpoint folder.",
+        default="./checkpoints_lca_2.5B_32k",
+        help="Path to pre-trained/adapted BareTorch checkpoint folder.",
     )
     parser.add_argument(
         "--output_dir",
@@ -251,7 +311,6 @@ def main():
         default="./checkpoints_2.5B_sft",
         help="Directory to save fine-tuned SFT weights.",
     )
-
     parser.add_argument(
         "--tokenizer_name",
         type=str,
@@ -265,30 +324,45 @@ def main():
         help="Sub-sample N rows for fast iteration. Set to 0 for full dataset.",
     )
 
+    # Optimization & Schedule
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument(
-        "--batch_size", type=int, default=8, help="Per-GPU batch size."
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Per-device batch size (default 1 for 32k context).",
     )
     parser.add_argument(
-        "--grad_accum", type=int, default=2, help="Gradient accumulation steps."
+        "--grad_accum",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps (8 GPUs * 1 * 4 * 32k = 1.05M tokens/step).",
     )
     parser.add_argument(
         "--learning_rate", type=float, default=2e-5, help="SFT learning rate."
     )
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--seq_len", type=int, default=2048)
     parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="Enable targeted torch.compile for CS-LRAD sub-modules.",
+        "--seq_len",
+        type=int,
+        default=32768,
+        help="Sequence context length (default 32k).",
+    )
+    parser.add_argument(
+        "--rope_theta",
+        type=float,
+        default=1000000.0,
+        help="Rotary Position Embedding base frequency.",
     )
     parser.add_argument(
         "--grad_checkpointing",
         action="store_true",
+        default=True,
         help="Enable gradient checkpointing.",
     )
 
+    # Cloud Sync
     parser.add_argument(
         "--r2_sync",
         action="store_true",
@@ -303,12 +377,14 @@ def main():
     parser.add_argument(
         "--r2_prefix",
         type=str,
-        default="checkpoints",
+        default="checkpoints_sft",
         help="Prefix path inside R2 bucket.",
     )
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--eval_steps", type=int, default=100)
 
     args = parser.parse_args()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if local_rank == 0:
         logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
@@ -320,33 +396,37 @@ def main():
 
     if local_rank == 0:
         logger.info(
-            f"Loading pre-trained model weights from: {args.pretrained_model_path}"
+            f"Loading model weights into FP32 master copy from: {args.pretrained_model_path}"
         )
 
+    # Load master weights in FP32; FSDP handles sharding & BF16 mixed-precision autocast
     model = BareTorchForCausalLM.from_pretrained(
-        args.pretrained_model_path, 
-        torch_dtype=torch.bfloat16,
+        args.pretrained_model_path,
+        torch_dtype=torch.float32,
     )
 
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.use_cache = False
     model.config.use_grad_checkpointing = args.grad_checkpointing
 
-    if args.compile:
-        if local_rank == 0:
-            logger.info(
-                "⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules..."
-            )
-        compiled_blocks = 0
-        for name, module in model.named_modules():
-            cls_name = module.__class__.__name__.lower()
-            if "lrad" in cls_name or "lrad" in name.lower():
-                module.forward = torch.compile(module.forward)
-                compiled_blocks += 1
-        if local_rank == 0:
-            logger.info(
-                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s)."
-            )
+    # Enforce RoPE theta and ensure the sinusoidal cache covers the full context span
+    adapted_count = adapt_model_for_long_context(
+        model, model.config, target_seq_len=args.seq_len, target_rope_theta=args.rope_theta
+    )
+
+    if local_rank == 0:
+        logger.info("=" * 70)
+        logger.info("🎯 BareTorch Supervised Fine-Tuning Engine (FSDP / FP32 Master)")
+        logger.info(f"   ├─ Base Checkpoint       : {args.pretrained_model_path}")
+        logger.info(f"   ├─ Sequence Length       : {args.seq_len:,} tokens")
+        logger.info(f"   ├─ RoPE Theta Base       : {args.rope_theta:,.0f}")
+        logger.info(f"   ├─ Adapted RoPE Blocks   : {adapted_count}")
+        logger.info(f"   ├─ Learning Rate         : {args.learning_rate}")
+        logger.info(
+            f"   └─ Batch per Step        : "
+            f"{8 * args.batch_size * args.grad_accum * args.seq_len:,} tokens"
+        )
+        logger.info("=" * 70)
 
     # --------------------------------------------------------------------------
     # Distributed Rank-0 Dataset Preparation and Disk Caching
@@ -374,6 +454,7 @@ def main():
 
             # 3. 15% Math (NuminaMath-CoT with <think> tag injection)
             ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train")
+
             def format_math_with_think(x):
                 problem = x["problem"]
                 solution = x["solution"]
@@ -392,10 +473,12 @@ def main():
                         {"role": "assistant", "content": formatted_content},
                     ]
                 }
+
             ds_math = ds_math.map(format_math_with_think, remove_columns=ds_math.column_names)
 
             # 4. 15% DeepSeek-R1 Distilled Reasoning (Bespoke-Stratos-17k)
             ds_reasoning = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train")
+
             def format_stratos_reasoning(x):
                 if "messages" in x and x["messages"]:
                     messages = x["messages"]
@@ -416,6 +499,7 @@ def main():
                         {"role": "assistant", "content": assistant_content},
                     ]
                 return {"messages": messages}
+
             ds_reasoning = ds_reasoning.map(format_stratos_reasoning, remove_columns=ds_reasoning.column_names)
 
             # Interleave into single dataset with 50/20/15/15 ratio
@@ -440,13 +524,11 @@ def main():
         else:
             logger.info(f"⚡ Found pre-packed dataset at '{cache_dir}'. Fast-loading from disk...")
 
-    # Wait for Rank 0 to finish dataset preparation and disk write
+    # Synchronize all distributed workers before loading
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    # Load dataset from disk fast on all ranks
     processed_dataset = Dataset.load_from_disk(cache_dir)
-
     dataset_split = processed_dataset.train_test_split(test_size=0.05, seed=42)
     train_data = dataset_split["train"]
     val_data = dataset_split["test"]
@@ -457,7 +539,7 @@ def main():
             f"{len(val_data):,} validation samples."
         )
 
-    # Standard PyTorch DistributedDataParallel (DDP) configuration
+    # PyTorch FSDP Configuration (ZeRO-2 Sharding with FP32 Master Weights)
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -469,17 +551,21 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         bf16=True,
-        logging_steps=100,
+        max_grad_norm=0.5,
+        optim="adamw_torch",  # Enforces FP32 AdamW optimizer
+        logging_steps=args.logging_steps,
         eval_strategy="steps",
-        eval_steps=250,
+        eval_steps=args.eval_steps,
         save_strategy="steps",
-        save_steps=250,
+        save_steps=args.save_steps,
         save_total_limit=2,
         torch_compile=False,
         gradient_checkpointing=args.grad_checkpointing,
+        fsdp="shard_grad_op",
         ddp_find_unused_parameters=False,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
         dataloader_pin_memory=True,
+        remove_unused_columns=False,
     )
 
     enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
@@ -495,9 +581,6 @@ def main():
         callbacks.append(
             R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix)
         )
-    else:
-        if local_rank == 0:
-            logger.info("R2 sync disabled. Running in local mode (disk checkpoints only).")
 
     trainer = Trainer(
         model=model,
@@ -522,15 +605,18 @@ def main():
                 )
 
     if local_rank == 0:
-        logger.info("🔥 Starting Stage 1: Supervised Fine-Tuning (SFT) in DDP Mode...")
+        logger.info("🔥 Starting Stage 3: Supervised Fine-Tuning (SFT) in FSDP Mode...")
 
     trainer.train(resume_from_checkpoint=checkpoint_to_resume)
 
+    # All ranks participate in save_model so FSDP gathers sharded states cleanly
     if local_rank == 0:
-        logger.info(f"Saving final SFT checkpoint to '{args.output_dir}'...")
-        trainer.save_model(args.output_dir)
+        logger.info(f"Gathering sharded FSDP weights and saving to '{args.output_dir}'...")
+    trainer.save_model(args.output_dir)
+
+    if local_rank == 0:
         tokenizer.save_pretrained(args.output_dir)
-        logger.info("✅ Stage 1: Supervised Fine-Tuning completed successfully!")
+        logger.info("✅ Stage 3: Supervised Fine-Tuning completed successfully!")
 
         if enable_r2_sync:
             rel_output_dir = os.path.basename(os.path.normpath(args.output_dir))

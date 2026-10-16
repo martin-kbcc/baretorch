@@ -1,6 +1,6 @@
 # ==============================================================================
-#                               BareTorch Ecosystem
-#  Kernel-Free, Pure GEMM-Compliant Next-Gen Sequence Mixing Architectures
+#                                BareTorch Ecosystem
+#   Kernel-Free, Pure GEMM-Compliant Next-Gen Sequence Mixing Architectures
 # ==============================================================================
 
 __version__ = "0.1.0"
@@ -10,89 +10,52 @@ from baretorch.integration.configuration_baretorch import (
     BareTorchConfig,
     CSLRADConfig,
     TransformerConfig,
-    CSTTTConfig,
-    CSLRADTransformerConfig,
-    CSTTTTransformerConfig,
-    CSLRADCSTTTTransformerConfig,
 )
 
-# --- 2. Expose Core Native Modeling Blocks (Pure PyTorch)[cite: 1] ---
+# --- 2. Expose Core Native Modeling Blocks (Pure PyTorch) ---
 from baretorch.modeling.transformer import (
-    RotaryEmbedding,
     CausalSelfAttention,
+    RotaryEmbedding,
     TransformerDecoderBlock,
-    TransformerModel,
     TransformerForCausalLM,
+    TransformerModel,
 )
 
 from baretorch.modeling.cs_lrad import (
-    RMSNorm,
+    CSLRADForCausalLM,
+    CSLRADModel,
     GatedMLP,
     LowRankAssociativeDeltaEngine,
     LRADDecoderBlock,
-    CSLRADModel,
-    CSLRADForCausalLM,
+    RMSNorm,
 )
 
-from baretorch.modeling.cs_ttt import (
-    ChunkwiseTestTimeTrainingEngine,
-    TTTDecoderBlock,
-    CSTTTModel,
-    CSTTTForCausalLM,
-)
-
-# --- 3. Expose Hybrid Architectures ---
-from baretorch.modeling.cs_lrad_transformer import (
-    CSLRADTransformerModel,
-    CSLRADTransformerForCausalLM,
-)
-
-from baretorch.modeling.cs_ttt_transformer import (
-    CSTTTTransformerModel,
-    CSTTTTransformerForCausalLM,
-)
-
-from baretorch.modeling.cs_lrad_cs_ttt_transformer import (
-    CSLRADCSTTTTransformerModel,
-    CSLRADCSTTTTransformerForCausalLM,
-)
-
-# --- 4. Expose Master Unified Models ---
+# --- 3. Expose Master Unified Models ---
 from baretorch.integration.modeling_baretorch import (
-    BareTorchModel,
     BareTorchForCausalLM,
+    BareTorchModel,
 )
 
 # Defined exports for wildcard imports
 __all__ = [
+    # Configurations
     "BareTorchConfig",
     "CSLRADConfig",
     "TransformerConfig",
-    "CSTTTConfig",
-    "CSLRADTransformerConfig",
-    "CSTTTTransformerConfig",
-    "CSLRADCSTTTTransformerConfig",
+    # Transformer Blocks & Model
     "RotaryEmbedding",
     "CausalSelfAttention",
     "TransformerDecoderBlock",
     "TransformerModel",
     "TransformerForCausalLM",
+    # CS-LRAD Blocks & Model
     "RMSNorm",
     "GatedMLP",
     "LowRankAssociativeDeltaEngine",
     "LRADDecoderBlock",
     "CSLRADModel",
     "CSLRADForCausalLM",
-    "ChunkwiseTestTimeTrainingEngine",
-    "TTTDecoderBlock",
-    "CSTTTModel",
-    "CSTTTForCausalLM",
-    "CSLRADTransformerModel",
-    "CSLRADTransformerForCausalLM",
-    "CSTTTTransformerModel",
-    "CSTTTTransformerForCausalLM",
-    "CSLRADCSTTTTransformerModel",
-    "CSLRADCSTTTTransformerForCausalLM",
+    # Master Unified BareTorch Architecture
     "BareTorchModel",
     "BareTorchForCausalLM",
 ]

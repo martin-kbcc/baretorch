@@ -5,8 +5,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from transformers import PreTrainedModel, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
+from transformers import (
+    GenerationMixin,
+    PretrainedConfig,
+    PreTrainedModel,
+)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,23 +45,33 @@ class GatedMLP(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=8192, base=10000):
+    def __init__(self, dim, max_position_embeddings=8192, base=10000.0):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        self.base = float(base)
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        self._set_cos_sin_cache(seq_len=self.max_position_embeddings, device="cpu", dtype=torch.float32)
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings, device="cpu", dtype=torch.float32
+        )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        
-        if getattr(self.inv_freq, "is_meta", False) or self.inv_freq.device.type == "meta":
+
+        if (
+            getattr(self.inv_freq, "is_meta", False)
+            or self.inv_freq.device.type == "meta"
+        ):
             inv_freq = 1.0 / (
-                self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+                self.base
+                ** (
+                    torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+                    / self.dim
+                )
             )
         else:
             inv_freq = self.inv_freq.to(device)
@@ -67,8 +84,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def _rotate_half(self, x):
-        x1 = x[..., :self.dim // 2]
-        x2 = x[..., self.dim // 2:]
+        x1 = x[..., : self.dim // 2]
+        x2 = x[..., self.dim // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(self, x, seq_len=None):
@@ -77,23 +94,28 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
     def apply_rope(self, q, k, position_ids):
-        # Prevent RoPE tensor broadcasting mismatch during single-token decoding steps
         if position_ids is not None and position_ids.shape[-1] != q.shape[-2]:
             if q.shape[-2] == 1:
                 position_ids = position_ids[:, -1:]
             else:
-                position_ids = position_ids[:, -q.shape[-2]:]
+                position_ids = position_ids[:, -q.shape[-2] :]
 
-        max_pos = int(position_ids.max().item()) + 1 if position_ids is not None else q.shape[-2]
-        
+        max_pos = (
+            int(position_ids.max().item()) + 1
+            if position_ids is not None
+            else q.shape[-2]
+        )
+
         if (
-            self.cos_cached is None 
-            or max_pos > self.cos_cached.size(0) 
+            self.cos_cached is None
+            or max_pos > self.cos_cached.size(0)
             or self.cos_cached.device != q.device
             or self.cos_cached.dtype != q.dtype
         ):
             new_len = max(max_pos + 1024, self.max_position_embeddings)
-            self._set_cos_sin_cache(seq_len=new_len, device=q.device, dtype=q.dtype)
+            self._set_cos_sin_cache(
+                seq_len=new_len, device=q.device, dtype=q.dtype
+            )
 
         position_ids = position_ids.to(q.device)
         cos = self.cos_cached[position_ids].unsqueeze(1).to(dtype=q.dtype)
@@ -109,48 +131,69 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(
+        batch, num_key_value_heads * n_rep, slen, head_dim
+    )
 
 
 def unwrap_kv_pair(past_kv):
     """Strictly extracts matching (key_tensor, value_tensor) pair without history cross-contamination."""
     if past_kv is None:
         return None, None
-        
+
     p_item = past_kv
-    while isinstance(p_item, (tuple, list)) and len(p_item) > 0 and not isinstance(p_item[0], torch.Tensor):
+    while (
+        isinstance(p_item, (tuple, list))
+        and len(p_item) > 0
+        and not isinstance(p_item[0], torch.Tensor)
+    ):
         p_item = p_item[0]
-        
+
     if isinstance(p_item, (tuple, list)) and len(p_item) >= 2:
         pk, pv = p_item[0], p_item[1]
         if isinstance(pk, torch.Tensor) and isinstance(pv, torch.Tensor):
             return pk, pv
-            
+
     return None, None
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads=16, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_qk_norm=False):
+    def __init__(
+        self,
+        d_model,
+        num_heads=16,
+        num_kv_heads=4,
+        dropout=0.1,
+        max_seq_len=4096,
+        use_qk_norm=False,
+        rope_theta=10000.0,
+    ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
         self.use_qk_norm = use_qk_norm
-        
-        assert num_heads % num_kv_heads == 0, "Query heads must be perfectly divisible by KV heads."
+
+        assert (
+            num_heads % num_kv_heads == 0
+        ), "Query heads must be perfectly divisible by KV heads."
         self.num_queries_per_kv = num_heads // num_kv_heads
-        
+
         self.W_q = nn.Linear(d_model, num_heads * self.head_dim, bias=False)
         self.W_k = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
         self.W_v = nn.Linear(d_model, num_kv_heads * self.head_dim, bias=False)
-        
+
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
-        
-        self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len)
+
+        self.rope = RotaryEmbedding(
+            self.head_dim, max_position_embeddings=max_seq_len, base=rope_theta
+        )
         self.dropout_p = dropout
         self.W_out = nn.Linear(d_model, d_model, bias=False)
         self.resid_drop = nn.Dropout(dropout)
@@ -158,38 +201,39 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, past_kv=None, position_ids=None, attention_mask=None):
         B, L, D = x.shape
         H_q, H_kv, d_h = self.num_heads, self.num_kv_heads, self.head_dim
-        
+
         pk_past, pv_past = unwrap_kv_pair(past_kv)
 
         if position_ids is None:
             past_len = pk_past.size(-2) if pk_past is not None else 0
-            position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
-            
+            position_ids = torch.arange(
+                past_len, past_len + L, dtype=torch.long, device=x.device
+            ).unsqueeze(0)
+
         q = self.W_q(x).view(B, L, H_q, d_h)
         k = self.W_k(x).view(B, L, H_kv, d_h)
         v = self.W_v(x).view(B, L, H_kv, d_h).transpose(1, 2)
-        
+
         if self.use_qk_norm:
             q = self.q_norm(q).transpose(1, 2)
             k = self.k_norm(k).transpose(1, 2)
         else:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
-        
+
         q, k = self.rope.apply_rope(q, k, position_ids)
-        
-        # Safely concatenate KV past states
+
         if pk_past is not None and pv_past is not None:
             if pk_past.shape[-2] != pv_past.shape[-2]:
                 min_len = min(pk_past.shape[-2], pv_past.shape[-2])
                 pk_past = pk_past[..., :min_len, :]
                 pv_past = pv_past[..., :min_len, :]
-            
+
             k = torch.cat([pk_past, k], dim=-2)
             v = torch.cat([pv_past, v], dim=-2)
-            
+
         current_kv = (k, v)
-        
+
         if H_kv != H_q:
             k = repeat_kv(k, self.num_queries_per_kv)
             v = repeat_kv(v, self.num_queries_per_kv)
@@ -207,40 +251,91 @@ class CausalSelfAttention(nn.Module):
         k = k.to(dtype=x.dtype)
         v = v.to(dtype=x.dtype)
 
+        # Build comprehensive SDPA mask for both Prefill and Autoregressive Decoding
         sdpa_mask = None
-        if attention_mask is not None and is_causal_mask:
-            causal_bool = torch.ones((L, L), dtype=torch.bool, device=q.device).tril()
-            causal_bool = causal_bool.view(1, 1, L, L).expand(B, 1, L, L)
-            pad_bool = attention_mask.bool().view(B, 1, 1, L)
-            sdpa_mask = causal_bool & pad_bool
-            is_causal_mask = False
+        if attention_mask is not None:
+            if is_causal_mask:
+                causal_bool = (
+                    torch.ones((L, L), dtype=torch.bool, device=q.device)
+                    .tril()
+                    .view(1, 1, L, L)
+                    .expand(B, 1, L, L)
+                )
+                pad_bool = attention_mask.bool().view(B, 1, 1, L)
+                sdpa_mask = causal_bool & pad_bool
+                is_causal_mask = False
+            else:
+                total_k_len = k.shape[-2]
+                if attention_mask.dim() == 2:
+                    sdpa_mask = (
+                        attention_mask[:, -total_k_len:]
+                        .bool()
+                        .view(B, 1, 1, total_k_len)
+                    )
+                elif attention_mask.dim() == 4:
+                    sdpa_mask = attention_mask[:, :, -L:, -total_k_len:].bool()
 
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=sdpa_mask, dropout_p=dropout_p, is_causal=is_causal_mask
+            q,
+            k,
+            v,
+            attn_mask=sdpa_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal_mask,
         )
-        
+
         out_flat = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.resid_drop(self.W_out(out_flat)), current_kv
 
 
 class TransformerDecoderBlock(nn.Module):
-    def __init__(self, d_model, num_heads, num_kv_heads=4, dropout=0.1, max_seq_len=4096, use_grad_checkpointing=False, use_qk_norm=False):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        num_kv_heads=4,
+        dropout=0.1,
+        max_seq_len=4096,
+        use_grad_checkpointing=False,
+        use_qk_norm=False,
+        rope_theta=10000.0,
+    ):
         super().__init__()
         self.use_grad_checkpointing = use_grad_checkpointing
         self.ln1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, num_heads, num_kv_heads, dropout, max_seq_len, use_qk_norm)
+        self.attn = CausalSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_qk_norm=use_qk_norm,
+            rope_theta=rope_theta,
+        )
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5), dropout=dropout)
 
     def forward(self, x, past_kv=None, position_ids=None, attention_mask=None):
         def _block_forward(x_in, p_kv, pos_ids, attn_mask):
-            attn_out, current_kv = self.attn(self.ln1(x_in), past_kv=p_kv, position_ids=pos_ids, attention_mask=attn_mask)
+            attn_out, current_kv = self.attn(
+                self.ln1(x_in),
+                past_kv=p_kv,
+                position_ids=pos_ids,
+                attention_mask=attn_mask,
+            )
             x_out = x_in + attn_out
             x_out = x_out + self.mlp(self.ln2(x_out))
             return x_out, current_kv
-        
+
         if self.use_grad_checkpointing and self.training:
-            return checkpoint.checkpoint(_block_forward, x, past_kv, position_ids, attention_mask, use_reentrant=False)
+            return checkpoint.checkpoint(
+                _block_forward,
+                x,
+                past_kv,
+                position_ids,
+                attention_mask,
+                use_reentrant=False,
+            )
         else:
             return _block_forward(x, past_kv, position_ids, attention_mask)
 
@@ -258,7 +353,9 @@ class TransformerConfig(PretrainedConfig):
         num_layers=8,
         dropout=0.1,
         max_seq_len=4096,
+        rope_theta=10000.0,
         use_grad_checkpointing=False,
+        use_qk_norm=False,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
@@ -277,7 +374,9 @@ class TransformerConfig(PretrainedConfig):
         self.num_layers = num_layers
         self.dropout = dropout
         self.max_seq_len = max_seq_len
+        self.rope_theta = rope_theta
         self.use_grad_checkpointing = use_grad_checkpointing
+        self.use_qk_norm = use_qk_norm
 
 
 class TransformerPreTrainedModel(PreTrainedModel):
@@ -307,7 +406,9 @@ class TransformerModel(TransformerPreTrainedModel):
                 num_kv_heads=config.num_kv_heads,
                 dropout=config.dropout,
                 max_seq_len=config.max_seq_len,
-                use_grad_checkpointing=config.use_grad_checkpointing
+                use_grad_checkpointing=config.use_grad_checkpointing,
+                use_qk_norm=getattr(config, "use_qk_norm", False),
+                rope_theta=getattr(config, "rope_theta", 10000.0),
             )
             for _ in range(config.num_layers)
         ])
@@ -332,56 +433,88 @@ class TransformerModel(TransformerPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
-            raise ValueError("You must specify either input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify either input_ids or inputs_embeds"
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.token_embedding(input_ids)
 
+        if past_key_values is not None and inputs_embeds.size(1) > 1:
+            inputs_embeds = inputs_embeds[:, -1:, :]
+            batch_size, seq_length, _ = inputs_embeds.shape
+
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
-        
+
         if position_ids is None:
             past_length = 0
             if past_key_values is not None:
                 for layer_past in past_key_values:
-                    if isinstance(layer_past, tuple) and layer_past is not None and len(layer_past) > 0:
+                    if (
+                        isinstance(layer_past, tuple)
+                        and layer_past is not None
+                        and len(layer_past) > 0
+                    ):
                         p_item = layer_past[0]
                         while isinstance(p_item, (tuple, list)) and len(p_item) > 0:
                             p_item = p_item[0]
                         if isinstance(p_item, torch.Tensor):
                             past_length = p_item.size(-2)
                             break
-            
-            if attention_mask is not None and past_length == 0:
-                position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
+
+            if attention_mask is not None:
+                position_ids = (
+                    torch.cumsum(attention_mask, dim=-1) - 1
+                ).clamp(min=0)
+                if past_length > 0:
+                    position_ids = position_ids[:, -seq_length:]
             else:
                 position_ids = torch.arange(
-                    past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
+                    past_length,
+                    past_length + seq_length,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
                 ).unsqueeze(0)
 
         all_hidden_states = () if output_hidden_states else None
-        
+
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (h,)
-                
+
             past_kv = past_key_values[i] if past_key_values is not None else None
-            h, current_kv = layer(h, past_kv=past_kv, position_ids=position_ids, attention_mask=attention_mask)
-                
+            h, current_kv = layer(
+                h,
+                past_kv=past_kv,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+            )
+
             if use_cache:
                 next_decoder_cache.append(current_kv)
 
@@ -391,7 +524,11 @@ class TransformerModel(TransformerPreTrainedModel):
             all_hidden_states = all_hidden_states + (h,)
 
         if not return_dict:
-            return tuple(v for v in [h, next_decoder_cache, all_hidden_states] if v is not None)
+            return tuple(
+                v
+                for v in [h, next_decoder_cache, all_hidden_states]
+                if v is not None
+            )
 
         return BaseModelOutputWithPast(
             last_hidden_state=h,
@@ -400,7 +537,7 @@ class TransformerModel(TransformerPreTrainedModel):
         )
 
 
-class TransformerForCausalLM(TransformerPreTrainedModel):
+class TransformerForCausalLM(TransformerPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.token_embedding.weight"}
 
     def __init__(self, config):
@@ -439,8 +576,11 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        num_logits_to_keep: int = 0,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -455,16 +595,22 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
         )
 
         hidden_states = outputs[0]
+
+        if num_logits_to_keep > 0 and hidden_states.size(1) > num_logits_to_keep:
+            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+
         logits = self.lm_head(hidden_states)
-        
         logits = 30.0 * torch.tanh(logits / 30.0)
 
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1),
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -478,24 +624,47 @@ class TransformerForCausalLM(TransformerPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        position_ids=None,
+        **kwargs,
+    ):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
+
+        cache_position = kwargs.get("cache_position", None)
+        if cache_position is not None and past_key_values is not None:
+            position_ids = (
+                cache_position[-1:].unsqueeze(0)
+                if cache_position.dim() == 1
+                else cache_position
+            )
+
+        if position_ids is not None:
+            position_ids = position_ids.to(input_ids.device)
+
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "attention_mask": attention_mask,
-            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "use_cache": kwargs.get("use_cache", True),
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            if layer_past is None:
-                reordered_past += (None,)
-            elif isinstance(layer_past, tuple):
-                k, v = layer_past
-                reordered_past += ((k.index_select(0, beam_idx), v.index_select(0, beam_idx)),)
-            else:
-                reordered_past += (layer_past.index_select(0, beam_idx),)
-        return reordered_past
+        if past_key_values is None:
+            return None
+
+        def _reorder_item(item):
+            if isinstance(item, torch.Tensor):
+                return item.index_select(0, beam_idx)
+            elif isinstance(item, (tuple, list)):
+                return tuple(_reorder_item(x) for x in item)
+            return item
+
+        return tuple(
+            _reorder_item(layer_past) for layer_past in past_key_values
+        )
