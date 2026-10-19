@@ -19,14 +19,22 @@ logger = logging.getLogger("benchmark_mlx")
 def clear_mlx_memory():
   """Forces garbage collection and clears Apple Silicon unified memory allocator cache."""
   gc.collect()
-  if mx.metal.is_available():
+  if hasattr(mx, "clear_cache"):
+    mx.clear_cache()
+  elif hasattr(mx.metal, "clear_cache"):
     mx.metal.clear_cache()
+
+  if hasattr(mx, "reset_peak_memory"):
+    mx.reset_peak_memory()
+  elif hasattr(mx.metal, "reset_peak_memory"):
     mx.metal.reset_peak_memory()
 
 
 def get_peak_memory_gb() -> float:
   """Returns peak memory allocated on Apple Silicon in Gigabytes."""
-  if mx.metal.is_available():
+  if hasattr(mx, "get_peak_memory"):
+    return mx.get_peak_memory() / (1024**3)
+  elif hasattr(mx.metal, "get_peak_memory"):
     return mx.metal.get_peak_memory() / (1024**3)
   return 0.0
 
@@ -37,6 +45,7 @@ def benchmark_mlx_at_context(
     gen_tokens: int = 64,
     warmup: int = 1,
     trials: int = 3,
+    compile_decode: bool = False,
 ):
   """Measures TTFT (Prefill Latency), Prefill Velocity, Autoregressive Decode
 
@@ -44,18 +53,24 @@ def benchmark_mlx_at_context(
   """
   seq_len = synth_input.shape[1]
 
-  # 1. Per-Context Warmup (Materializes Metal execution pipelines for exact context shape)
+  # Pure single-token decode step
+  def decode_step(tok, past_kv):
+    logits, next_kv = model(tok, past_key_values=past_kv, use_cache=True)
+    next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+    return next_tok, next_kv
+
+  step_fn = mx.compile(decode_step) if compile_decode else decode_step
+
+  # 1. Per-Context Warmup
   for _ in range(warmup):
-    out = model(synth_input, use_cache=True, num_logits_to_keep=1)
-    past_kv = out.past_key_values
-    tok = mx.argmax(out.logits[:, -1:, :], axis=-1)
+    logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
+    tok = mx.argmax(logits[:, -1:, :], axis=-1)
+    mx.eval(tok)
+
     for _ in range(min(4, gen_tokens)):
-      step_out = model(tok, past_key_values=past_kv, use_cache=True)
-      past_kv = step_out.past_key_values
-      tok = mx.argmax(step_out.logits[:, -1:, :], axis=-1)
+      tok, past_kv = step_fn(tok, past_kv)
       mx.eval(tok)
-    mx.eval(past_kv)
-    del out, past_kv, step_out, tok
+    del logits, past_kv, tok
   clear_mlx_memory()
 
   prefill_latencies = []
@@ -70,25 +85,21 @@ def benchmark_mlx_at_context(
     mx.synchronize()
     t0 = time.perf_counter()
 
-    out = model(synth_input, use_cache=True, num_logits_to_keep=1)
-    mx.eval(out.logits, out.past_key_values)
+    logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
+    next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+    mx.eval(next_tok)
     mx.synchronize()
 
     ttft_ms = (time.perf_counter() - t0) * 1000.0
     prefill_latencies.append(ttft_ms)
-
-    past_kv = out.past_key_values
-    next_tok = mx.argmax(out.logits[:, -1:, :], axis=-1)
-    del out
+    del logits
 
     # --- B. Measure Autoregressive Decoding Phase ---
     mx.synchronize()
     t_start_dec = time.perf_counter()
 
     for _ in range(gen_tokens):
-      step_out = model(next_tok, past_key_values=past_kv, use_cache=True)
-      past_kv = step_out.past_key_values
-      next_tok = mx.argmax(step_out.logits[:, -1:, :], axis=-1)
+      next_tok, past_kv = step_fn(next_tok, past_kv)
       mx.eval(next_tok)
 
     mx.synchronize()
@@ -98,7 +109,7 @@ def benchmark_mlx_at_context(
     peak_mem_gb = get_peak_memory_gb()
     peak_memories.append(peak_mem_gb)
 
-    del past_kv, step_out, next_tok
+    del past_kv, next_tok
     clear_mlx_memory()
 
   avg_ttft_ms = float(np.mean(prefill_latencies))
@@ -253,16 +264,10 @@ def main():
       help="Measurement trials per context length",
   )
   parser.add_argument(
-      "--compile",
+      "--compile_decode",
       action="store_true",
-      default=True,
-      help="Enable mx.compile optimization graph",
-  )
-  parser.add_argument(
-      "--no_compile",
-      action="store_false",
-      dest="compile",
-      help="Disable mx.compile graph fusion",
+      default=False,
+      help="Compile single-token autoregressive decoding step",
   )
   parser.add_argument(
       "--benchmark_qwen",
@@ -281,12 +286,12 @@ def main():
   soc_name = platform.processor() or "Apple Silicon"
   print("=" * 85)
   print(f"🍏 BARETORCH MLX APPLE SILICON BENCHMARK ({soc_name.upper()})")
-  print(f"Framework     : MLX (Native Metal Unified Memory)")
+  print("Framework     : MLX (Native Metal Unified Memory)")
   print(f"Checkpoint    : {args.baretorch_path}")
   print(f"Contexts      : {args.context_lengths}")
   print(f"Decode Steps  : {args.gen_tokens} tokens")
   print(f"Trials        : {args.trials} per context length")
-  print(f"mx.compile    : {args.compile}")
+  print(f"Compiled Step : {args.compile_decode}")
   print(f"CSV Output    : {args.csv_path}")
   print("=" * 85)
 
@@ -294,15 +299,9 @@ def main():
   baretorch_results = {}
   qwen_results = {}
 
-  bt_label = (
-      "BareTorch 2.5B (MLX Compiled)"
-      if args.compile
-      else "BareTorch 2.5B (MLX Eager)"
-  )
+  bt_label = "BareTorch 2.5B (MLX Native)"
 
-  # --------------------------------------------------------------------------
   # 1. Benchmark BareTorch MLX
-  # --------------------------------------------------------------------------
   if os.path.exists(args.baretorch_path):
     logger.info(
         f"Loading BareTorch MLX from '{args.baretorch_path}' in FP16..."
@@ -310,12 +309,6 @@ def main():
     model = BareTorchForCausalLMMLX.from_pretrained(
         args.baretorch_path, dtype=mx.float16
     )
-
-    if args.compile:
-      logger.info(
-          "⚡ Applying @mx.compile across model forward step transformations..."
-      )
-      model = mx.compile(model)
 
     logger.info("Starting BareTorch MLX context evaluation loop...")
     for ctx in args.context_lengths:
@@ -330,6 +323,7 @@ def main():
             gen_tokens=args.gen_tokens,
             warmup=1,
             trials=args.trials,
+            compile_decode=args.compile_decode,
         )
         baretorch_results[ctx] = metrics
         csv_rows.append({
@@ -367,9 +361,7 @@ def main():
         " Skipping."
     )
 
-  # --------------------------------------------------------------------------
-  # 2. Benchmark Qwen Baseline (Optional MPS Comparison)
-  # --------------------------------------------------------------------------
+  # 2. Benchmark Qwen Baseline
   if args.benchmark_qwen:
     logger.info("Initiating Qwen baseline evaluation...")
     qwen_results = benchmark_qwen_mps_fallback(
@@ -402,9 +394,7 @@ def main():
             "status": res["error"],
         })
 
-  # --------------------------------------------------------------------------
   # 3. Export CSV
-  # --------------------------------------------------------------------------
   fieldnames = [
       "model",
       "backend",
@@ -422,9 +412,7 @@ def main():
       writer.writerow(row)
   logger.info(f"✅ Benchmark metrics saved to '{args.csv_path}'")
 
-  # --------------------------------------------------------------------------
   # 4. Formatted Markdown Summary Table
-  # --------------------------------------------------------------------------
   print("\n" + "=" * 95)
   print(f"📊 APPLE SILICON COMPARATIVE BENCHMARK REPORT ({soc_name})")
   print("=" * 95)
@@ -440,9 +428,7 @@ def main():
     if ctx in baretorch_results:
       bt = baretorch_results[ctx]
       if "error" in bt:
-        print(
-            f"| {ctx:,} | **{bt_label}** | 💥 {bt['error']} | — | — | — |"
-        )
+        print(f"| {ctx:,} | **{bt_label}** | 💥 {bt['error']} | — | — | — |")
       else:
         print(
             f"| {ctx:,} | **{bt_label}** | {bt['ttft_ms']:.1f} ms |"
@@ -453,7 +439,10 @@ def main():
     if ctx in qwen_results:
       qw = qwen_results[ctx]
       if "error" in qw:
-        print(f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | 💥 {qw['error']} | — | — | — |")
+        print(
+            f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | 💥 {qw['error']} | — | — |"
+            " — |"
+        )
       else:
         print(
             f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {qw['ttft_ms']:.1f} ms |"

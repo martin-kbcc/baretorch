@@ -115,7 +115,7 @@ class BareTorchForCausalLMMLX(nn.Module):
         position_ids: mx.array | None = None,
         use_cache: bool = True,
         num_logits_to_keep: int = 0,
-    ) -> CausalLMOutput:
+    ) -> tuple[mx.array, list | None]:
         hidden_states, next_cache = self.model(
             input_ids=input_ids,
             past_key_values=past_key_values,
@@ -125,12 +125,16 @@ class BareTorchForCausalLMMLX(nn.Module):
         )
 
         if num_logits_to_keep > 0 and hidden_states.shape[1] > num_logits_to_keep:
-            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+        hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
         logits = mx.clip(logits, -50.0, 50.0)
 
-        return CausalLMOutput(logits=logits, past_key_values=next_cache)
+        # Return pure tuple so MLX compile and eval can track all arrays
+        return logits, next_cache
+
+
+
 
     @classmethod
     def from_pretrained(cls, checkpoint_dir: str, dtype=mx.float16):
