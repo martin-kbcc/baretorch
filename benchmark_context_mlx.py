@@ -39,6 +39,36 @@ def get_peak_memory_gb() -> float:
   return 0.0
 
 
+def enable_last_logit_only_torch(model):
+  """Ensures PyTorch model's lm_head only projects the final token's hidden state
+
+  into vocabulary logits during prefill, preventing multi-gigabyte logits allocations
+  at long context windows on Apple Silicon MPS.
+  """
+  import torch
+
+  head = (
+      model.get_output_embeddings()
+      if hasattr(model, "get_output_embeddings")
+      else getattr(model, "lm_head", None)
+  )
+
+  if (
+      head is not None
+      and isinstance(head, torch.nn.Linear)
+      and not getattr(head, "_is_efficient_patched", False)
+  ):
+    orig_forward = head.forward
+
+    def efficient_head_forward(hidden_states, *args, **kwargs):
+      if hidden_states.dim() == 3 and hidden_states.size(1) > 1:
+        hidden_states = hidden_states[:, -1:, :]
+      return orig_forward(hidden_states, *args, **kwargs)
+
+    head.forward = efficient_head_forward
+    head._is_efficient_patched = True
+
+
 def benchmark_mlx_at_context(
     model: nn.Module,
     synth_input: mx.array,
@@ -53,7 +83,7 @@ def benchmark_mlx_at_context(
   """
   seq_len = synth_input.shape[1]
 
-  # Pure single-token decode step
+  # Pure single-token decode step function
   def decode_step(tok, past_kv):
     logits, next_kv = model(tok, past_key_values=past_kv, use_cache=True)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -155,6 +185,11 @@ def benchmark_qwen_mps_fallback(
         device_map="mps",
         trust_remote_code=True,
     ).eval()
+
+    # Apply the last-logit-only memory patch
+    enable_last_logit_only_torch(qwen)
+    logger.info("Applied last-logit-only prefill patch to Qwen on MPS.")
+
   except Exception as e:
     logger.error(
         f"Qwen baseline cannot load on Apple Silicon MPS (missing native"
@@ -292,6 +327,7 @@ def main():
   print(f"Decode Steps  : {args.gen_tokens} tokens")
   print(f"Trials        : {args.trials} per context length")
   print(f"Compiled Step : {args.compile_decode}")
+  print(f"Benchmark Qwen: {args.benchmark_qwen}")
   print(f"CSV Output    : {args.csv_path}")
   print("=" * 85)
 
