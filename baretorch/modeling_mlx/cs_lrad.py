@@ -177,9 +177,9 @@ class LowRankAssociativeDeltaEngine(nn.Module):
 
         Q = mx.transpose(mx.reshape(nn.silu(self.W_q(x)), (B, L, H, d_h)), (0, 2, 1, 3))
         K = mx.transpose(mx.reshape(nn.silu(self.W_k(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        V = mx.transpose(mx.reshape(self.W_v(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        U = mx.transpose(mx.reshape(self.W_u(x)), (B, L, H, r)), (0, 2, 1, 3))
-        R = mx.transpose(mx.reshape(self.W_r(x)), (B, L, H, r)), (0, 2, 1, 3))
+        V = mx.transpose(mx.reshape(self.W_v(x), (B, L, H, d_h)), (0, 2, 1, 3))
+        U = mx.transpose(mx.reshape(self.W_u(x), (B, L, H, r)), (0, 2, 1, 3))
+        R = mx.transpose(mx.reshape(self.W_r(x), (B, L, H, r)), (0, 2, 1, 3))
 
         gate = mx.expand_dims(
             mx.transpose(
