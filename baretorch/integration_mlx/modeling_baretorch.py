@@ -68,15 +68,17 @@ class BareTorchModelMLX(nn.Module):
         position_ids: mx.array | None = None,
         use_cache: bool = True,
     ):
-        # Defensive slicing matching PyTorch forward when past_key_values is present
         if past_key_values is not None and input_ids.shape[1] > 1:
             input_ids = input_ids[:, -1:]
 
+        is_prefill = input_ids.shape[1] > 1
         h = self.token_embedding(input_ids)
         next_cache = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
-            past_state = past_key_values[i] if past_key_values is not None else None
+            past_state = (
+                past_key_values[i] if past_key_values is not None else None
+            )
 
             if isinstance(layer, TransformerDecoderBlock):
                 h, next_state = layer(
@@ -95,6 +97,10 @@ class BareTorchModelMLX(nn.Module):
 
             if use_cache:
                 next_cache.append(next_state)
+
+            # Free previous layer's intermediate prefill activations immediately
+            if is_prefill:
+                mx.eval(h, next_state)
 
         h = self.final_norm(h)
         return h, next_cache

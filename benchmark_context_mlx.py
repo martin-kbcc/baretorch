@@ -14,8 +14,6 @@ import mlx.nn as nn
 import numpy as np
 
 from baretorch.integration_mlx.modeling_baretorch import BareTorchForCausalLMMLX
-from baretorch.modeling_mlx.cs_lrad import LRADDecoderBlock
-from baretorch.modeling_mlx.transformer import TransformerDecoderBlock
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("benchmark_mlx")
@@ -33,58 +31,6 @@ def get_peak_memory_gb() -> float:
   if hasattr(mx, "get_peak_memory"):
     return mx.get_peak_memory() / (1024**3)
   return 0.0
-
-
-def profile_single_decode_step(model, next_tok, past_kv):
-  """Measures exact per-module latency for 1 decode step to isolate bottlenecks."""
-  mx.synchronize()
-
-  # 1. Embedding
-  t0 = time.perf_counter()
-  h = model.model.token_embedding(next_tok)
-  mx.eval(h)
-  mx.synchronize()
-  t_emb = (time.perf_counter() - t0) * 1000.0
-
-  t_transformer_total = 0.0
-  t_lrad_total = 0.0
-  transformer_count = 0
-  lrad_count = 0
-
-  # 2. Per-layer dispatch
-  for i, layer in enumerate(model.model.layers):
-    p_state = past_kv[i]
-    t_layer_start = time.perf_counter()
-
-    if isinstance(layer, TransformerDecoderBlock):
-      h, _ = layer(h, past_kv=p_state)
-      mx.eval(h)
-      mx.synchronize()
-      t_transformer_total += (time.perf_counter() - t_layer_start) * 1000.0
-      transformer_count += 1
-    else:
-      h, _ = layer(h, past_state=p_state, use_cache=True)
-      mx.eval(h)
-      mx.synchronize()
-      t_lrad_total += (time.perf_counter() - t_layer_start) * 1000.0
-      lrad_count += 1
-
-  # 3. Head
-  t0 = time.perf_counter()
-  h_norm = model.model.final_norm(h)
-  logits = model.lm_head(h_norm)
-  tok = mx.argmax(logits[:, -1:, :], axis=-1)
-  mx.eval(tok)
-  mx.synchronize()
-  t_head = (time.perf_counter() - t0) * 1000.0
-
-  print(
-      f"      [Breakdown] Embed: {t_emb:.2f}ms | {lrad_count} LRAD Layers:"
-      f" {t_lrad_total:.2f}ms ({t_lrad_total/lrad_count:.2f}ms/ea) |"
-      f" {transformer_count} Trans Layers: {t_transformer_total:.2f}ms"
-      f" ({t_transformer_total/transformer_count:.2f}ms/ea) | Head:"
-      f" {t_head:.2f}ms"
-  )
 
 
 def benchmark_mlx_at_context(
@@ -114,10 +60,10 @@ def benchmark_mlx_at_context(
   peak_memories = []
 
   # 2. Timing Trials
-  for trial_idx in range(trials):
+  for _ in range(trials):
     clear_mlx_memory()
 
-    # --- A. Prefill ---
+    # --- A. Prefill (TTFT) ---
     mx.synchronize()
     t0 = time.perf_counter()
 
@@ -130,16 +76,17 @@ def benchmark_mlx_at_context(
     prefill_latencies.append(ttft_ms)
     del logits
 
-    # Print component profile during trial 1
-    if trial_idx == 0:
-      profile_single_decode_step(model, next_tok, past_kv)
+    # Flush prefill working memory pool so decode runs with low RAM pressure
+    clear_mlx_memory()
 
     # --- B. Autoregressive Decode ---
     mx.synchronize()
     t_start_dec = time.perf_counter()
 
     for _ in range(gen_tokens):
-      logits, past_kv = model(next_tok, past_key_values=past_kv, use_cache=True)
+      logits, past_kv = model(
+          next_tok, past_key_values=past_kv, use_cache=True
+      )
       next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
       mx.eval(next_tok, past_kv)
 
@@ -174,7 +121,7 @@ def benchmark_mlx_at_context(
 
 def main():
   parser = argparse.ArgumentParser(
-      description="BareTorch MLX Diagnostic Benchmark"
+      description="BareTorch MLX Apple Silicon Benchmark"
   )
   parser.add_argument(
       "--baretorch_path",
@@ -186,7 +133,7 @@ def main():
       "--context_lengths",
       type=int,
       nargs="+",
-      default=[512, 2048, 8192, 16384, 32768],
+      default=[512, 1024, 2048, 4096, 8192, 16384, 32768],
       help="Context lengths to benchmark",
   )
   parser.add_argument(
@@ -198,24 +145,25 @@ def main():
   parser.add_argument(
       "--trials",
       type=int,
-      default=2,
+      default=3,
       help="Measurement trials per context length",
   )
   parser.add_argument(
       "--csv_path",
       type=str,
-      default="benchmark_apple_silicon_diagnostic.csv",
+      default="benchmark_apple_silicon.csv",
       help="Output CSV path",
   )
   args = parser.parse_args()
 
   soc_name = platform.processor() or "Apple Silicon"
   print("=" * 85)
-  print(f"🍏 BARETORCH MLX DIAGNOSTIC BENCHMARK ({soc_name.upper()})")
+  print(f"🍏 BARETORCH MLX BENCHMARK ({soc_name.upper()})")
   print(f"Checkpoint    : {args.baretorch_path}")
   print(f"Contexts      : {args.context_lengths}")
   print(f"Decode Steps  : {args.gen_tokens} tokens")
   print(f"Trials        : {args.trials} per context length")
+  print(f"CSV Output    : {args.csv_path}")
   print("=" * 85)
 
   csv_rows = []
@@ -229,7 +177,7 @@ def main():
     )
 
     for ctx in args.context_lengths:
-      print(f"\n  --> Benchmarking {bt_label} @ {ctx:,} tokens...")
+      print(f"  --> Benchmarking {bt_label} @ {ctx:,} tokens...")
       synth_input = mx.random.randint(100, 10000, shape=(1, ctx))
       mx.eval(synth_input)
 
@@ -255,12 +203,30 @@ def main():
       except Exception as e:
         print(f"  ❌ Failed @ {ctx:,} tokens: {e}")
         baretorch_results[ctx] = {"error": str(e)}
+        clear_mlx_memory()
       del synth_input
 
     del model
     clear_mlx_memory()
   else:
     logger.warning(f"Path '{args.baretorch_path}' not found.")
+
+  fieldnames = [
+      "model",
+      "backend",
+      "context_len",
+      "ttft_ms",
+      "prefill_tok_s",
+      "decode_tok_s",
+      "peak_ram_gb",
+      "status",
+  ]
+  with open(args.csv_path, mode="w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in csv_rows:
+      writer.writerow(row)
+  logger.info(f"✅ Benchmark metrics saved to '{args.csv_path}'")
 
   print("\n" + "=" * 95)
   print(f"📊 SUMMARY REPORT ({soc_name})")
@@ -282,6 +248,7 @@ def main():
             f" {bt['prefill_tok_s']:,.1f} tok/s | {bt['decode_tok_s']:.2f}"
             f" tok/s | {bt['peak_ram_gb']:.2f} GB |"
         )
+    print("| --- | --- | --- | --- | --- | --- |")
   print("=" * 95)
 
 
