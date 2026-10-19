@@ -151,14 +151,19 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(d_h)
         total_k_len = k.shape[-2]
 
-        # 1. Base Causal Mask
+        # 1. Zero-allocation fused causal mask for prefill
         mask = None
         if L > 1:
-            q_idx = mx.arange(past_len, past_len + L)
-            k_idx = mx.arange(total_k_len)
-            mask = mx.where(q_idx[:, None] >= k_idx[None, :], 0.0, -1e4).astype(q.dtype)
+            if attention_mask is None and past_len == 0:
+                mask = "causal"  # Uses Metal kernel internal logic; 0 bytes allocated
+            else:
+                q_idx = mx.arange(past_len, past_len + L)
+                k_idx = mx.arange(total_k_len)
+                mask = mx.where(
+                    q_idx[:, None] >= k_idx[None, :], 0.0, -1e4
+                ).astype(q.dtype)
 
-        # 2. Additive Padding Mask Blending
+        # 2. Additive Padding Mask Blending (if explicitly supplied)
         if attention_mask is not None:
             if attention_mask.ndim == 2:
                 pad_mask = mx.where(
@@ -172,9 +177,11 @@ class CausalSelfAttention(nn.Module):
                 pad_mask = None
 
             if pad_mask is not None:
-                mask = mask + pad_mask if mask is not None else pad_mask
+                mask = mask + pad_mask if isinstance(mask, mx.array) else pad_mask
 
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=mask
+        )
         out_flat = mx.reshape(mx.transpose(out, (0, 2, 1, 3)), (B, L, D))
         return self.W_out(out_flat), current_kv
 

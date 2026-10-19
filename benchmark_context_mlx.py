@@ -6,6 +6,10 @@ import logging
 import os
 import platform
 import time
+
+# Prevent macOS MPS multi-threaded loading segmentation fault
+os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -42,8 +46,8 @@ def get_peak_memory_gb() -> float:
 def enable_last_logit_only_torch(model):
   """Ensures PyTorch model's lm_head only projects the final token's hidden state
 
-  into vocabulary logits during prefill, preventing multi-gigabyte logits allocations
-  at long context windows on Apple Silicon MPS.
+  into vocabulary logits during prefill, preventing multi-gigabyte allocations at
+  long context windows on Apple Silicon MPS.
   """
   import torch
 
@@ -83,7 +87,6 @@ def benchmark_mlx_at_context(
   """
   seq_len = synth_input.shape[1]
 
-  # Pure single-token decode step function
   def decode_step(tok, past_kv):
     logits, next_kv = model(tok, past_key_values=past_kv, use_cache=True)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -95,11 +98,11 @@ def benchmark_mlx_at_context(
   for _ in range(warmup):
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     tok = mx.argmax(logits[:, -1:, :], axis=-1)
-    mx.eval(tok)
+    mx.eval(tok, past_kv)
 
     for _ in range(min(4, gen_tokens)):
       tok, past_kv = step_fn(tok, past_kv)
-      mx.eval(tok)
+      mx.eval(tok, past_kv)
     del logits, past_kv, tok
   clear_mlx_memory()
 
@@ -117,7 +120,8 @@ def benchmark_mlx_at_context(
 
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-    mx.eval(next_tok)
+    # Realize both token and states to complete prefill execution
+    mx.eval(next_tok, past_kv)
     mx.synchronize()
 
     ttft_ms = (time.perf_counter() - t0) * 1000.0
@@ -130,7 +134,8 @@ def benchmark_mlx_at_context(
 
     for _ in range(gen_tokens):
       next_tok, past_kv = step_fn(next_tok, past_kv)
-      mx.eval(next_tok)
+      # Realize state on every step to free previous buffers immediately
+      mx.eval(next_tok, past_kv)
 
     mx.synchronize()
     dec_time_ms = (time.perf_counter() - t_start_dec) * 1000.0
@@ -179,22 +184,20 @@ def benchmark_qwen_mps_fallback(
 
   results = {}
   try:
+    # Load on CPU first to prevent MPS async materializer segfaults, then move to MPS
     qwen = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
-        device_map="mps",
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
-    ).eval()
+    ).to(device)
+    qwen.eval()
 
-    # Apply the last-logit-only memory patch
     enable_last_logit_only_torch(qwen)
-    logger.info("Applied last-logit-only prefill patch to Qwen on MPS.")
+    logger.info("Loaded Qwen on MPS with last-logit-only patch applied.")
 
   except Exception as e:
-    logger.error(
-        f"Qwen baseline cannot load on Apple Silicon MPS (missing native"
-        f" kernel): {e}"
-    )
+    logger.error(f"Qwen baseline cannot load on Apple Silicon MPS: {e}")
     return {ctx: {"error": "FAILED_INIT"} for ctx in context_lengths}
 
   for ctx in context_lengths:
@@ -251,7 +254,7 @@ def benchmark_qwen_mps_fallback(
       }
     except Exception as e:
       logger.warning(f"Qwen failed @ {ctx:,} tokens on MPS: {e}")
-      results[ctx] = {"error": "MPS_FALLBACK_FAIL"}
+      results[ctx] = {"error": "MPS_OOM_OR_FAIL"}
     del inp
 
   del qwen
