@@ -128,12 +128,20 @@ class CausalSelfAttention(nn.Module):
             position_ids = mx.arange(past_len, past_len + L, dtype=mx.int32)[None, :]
 
         q = mx.transpose(mx.reshape(self.W_q(x), (B, L, H_q, d_h)), (0, 2, 1, 3))
-        k = mx.transpose(mx.reshape(self.W_k(x), (B, L, H_kv, d_h)), (0, 2, 1, 3))
-        v = mx.transpose(mx.reshape(self.W_v(x), (B, L, H_kv, d_h)), (0, 2, 1, 3))
+        k = mx.transpose(
+            mx.reshape(self.W_k(x), (B, L, H_kv, d_h)), (0, 2, 1, 3)
+        )
+        v = mx.transpose(
+            mx.reshape(self.W_v(x), (B, L, H_kv, d_h)), (0, 2, 1, 3)
+        )
 
         if self.use_qk_norm:
-            q = mx.transpose(self.q_norm(mx.transpose(q, (0, 2, 1, 3))), (0, 2, 1, 3))
-            k = mx.transpose(self.k_norm(mx.transpose(k, (0, 2, 1, 3))), (0, 2, 1, 3))
+            q = mx.transpose(
+                self.q_norm(mx.transpose(q, (0, 2, 1, 3))), (0, 2, 1, 3)
+            )
+            k = mx.transpose(
+                self.k_norm(mx.transpose(k, (0, 2, 1, 3))), (0, 2, 1, 3)
+            )
 
         q, k = self.rope.apply_rope(q, k, position_ids)
 
@@ -141,29 +149,27 @@ class CausalSelfAttention(nn.Module):
             k = mx.concatenate([pk_past, k], axis=-2)
             v = mx.concatenate([pv_past, v], axis=-2)
 
-        # Store cache prior to repeat_kv to preserve compact KV memory footprint
         current_kv = (k, v)
 
-        if H_kv != H_q:
-            k = repeat_kv(k, self.num_queries_per_kv)
-            v = repeat_kv(v, self.num_queries_per_kv)
+        # NOTE: Do NOT call repeat_kv here. MLX scaled_dot_product_attention natively
+        # handles GQA (H_q != H_kv) inside its Metal kernel without expanding memory.
 
         scale = 1.0 / math.sqrt(d_h)
         total_k_len = k.shape[-2]
 
-        # 1. Zero-allocation fused causal mask for prefill
+        # 1. Zero-allocation causal mask
         mask = None
         if L > 1:
             if attention_mask is None and past_len == 0:
-                mask = "causal"  # Uses Metal kernel internal logic; 0 bytes allocated
+                mask = 'causal'
             else:
                 q_idx = mx.arange(past_len, past_len + L)
                 k_idx = mx.arange(total_k_len)
-                mask = mx.where(
-                    q_idx[:, None] >= k_idx[None, :], 0.0, -1e4
-                ).astype(q.dtype)
+                mask = mx.where(q_idx[:, None] >= k_idx[None, :], 0.0, -1e4).astype(
+                    q.dtype
+                )
 
-        # 2. Additive Padding Mask Blending (if explicitly supplied)
+        # 2. Additive Padding Mask Blending
         if attention_mask is not None:
             if attention_mask.ndim == 2:
                 pad_mask = mx.where(
