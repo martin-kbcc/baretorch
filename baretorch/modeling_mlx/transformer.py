@@ -1,52 +1,7 @@
-# baretorch/modeling_mlx/transformer.py
+# /home/martinkb/Desktop/BareTorch_F/baretorch/modeling_mlx/transformer.py
 import math
 import mlx.core as mx
 import mlx.nn as nn
-
-
-class KVCache:
-  """Pre-allocated chunked KV-Cache matching official mlx-lm design.
-
-  Eliminates mx.concatenate memory reallocation bottlenecks at long context.
-  """
-
-  def __init__(self, step: int = 256):
-    self.keys = None
-    self.values = None
-    self.offset = 0
-    self.step = step
-
-  def update_and_fetch(
-      self, keys: mx.array, values: mx.array
-  ) -> tuple[mx.array, mx.array]:
-    B, H, L, D = keys.shape
-    prev = self.offset
-
-    if self.keys is None or (prev + L) > self.keys.shape[2]:
-      # Expand buffer capacity in chunks
-      new_capacity = (
-          max(self.step, L)
-          if self.keys is None
-          else self.keys.shape[2] + max(self.step, L)
-      )
-      new_k = mx.zeros((B, H, new_capacity, D), dtype=keys.dtype)
-      new_v = mx.zeros((B, H, new_capacity, D), dtype=values.dtype)
-
-      if self.keys is not None:
-        new_k[:, :, :prev, :] = self.keys[:, :, :prev, :]
-        new_v[:, :, :prev, :] = self.values[:, :, :prev, :]
-
-      self.keys = new_k
-      self.values = new_v
-
-    # In-place write into pre-allocated slice
-    self.keys[:, :, prev : prev + L, :] = keys
-    self.values[:, :, prev : prev + L, :] = values
-    self.offset += L
-
-    return self.keys[:, :, : self.offset, :], self.values[
-        :, :, : self.offset, :
-    ]
 
 
 class RMSNorm(nn.Module):
@@ -115,6 +70,24 @@ class RotaryEmbedding(nn.Module):
     return q_embed.astype(q.dtype), k_embed.astype(k.dtype)
 
 
+def unwrap_kv_pair(past_kv):
+  """Safely unpacks (key, value) tuple without nested contamination."""
+  if past_kv is None:
+    return None, None
+  p_item = past_kv
+  while (
+      isinstance(p_item, (tuple, list))
+      and len(p_item) > 0
+      and not isinstance(p_item[0], mx.array)
+  ):
+    p_item = p_item[0]
+  if isinstance(p_item, (tuple, list)) and len(p_item) >= 2:
+    pk, pv = p_item[0], p_item[1]
+    if isinstance(pk, mx.array) and isinstance(pv, mx.array):
+      return pk, pv
+  return None, None
+
+
 class CausalSelfAttention(nn.Module):
 
   def __init__(
@@ -156,24 +129,15 @@ class CausalSelfAttention(nn.Module):
   def __call__(
       self,
       x: mx.array,
-      past_kv: KVCache | tuple | None = None,
+      past_kv: tuple | None = None,
       position_ids: mx.array | None = None,
       attention_mask: mx.array | None = None,
   ):
     B, L, D = x.shape
     H_q, H_kv, d_h = self.num_heads, self.num_kv_heads, self.head_dim
 
-    # Resolve past length and active cache representation
-    if isinstance(past_kv, KVCache):
-      cache_obj = past_kv
-      past_len = cache_obj.offset
-    else:
-      cache_obj = KVCache() if past_kv is not None else None
-      if isinstance(past_kv, (tuple, list)) and len(past_kv) >= 2:
-        pk, pv = past_kv[0], past_kv[1]
-        if pk is not None:
-          cache_obj.update_and_fetch(pk, pv)
-      past_len = cache_obj.offset if cache_obj is not None else 0
+    pk_past, pv_past = unwrap_kv_pair(past_kv)
+    past_len = pk_past.shape[-2] if pk_past is not None else 0
 
     if position_ids is None:
       position_ids = mx.arange(past_len, past_len + L, dtype=mx.int32)[None, :]
@@ -188,17 +152,16 @@ class CausalSelfAttention(nn.Module):
 
     q, k = self.rope.apply_rope(q, k, position_ids)
 
-    # In-place cache update (0 bytes reallocated)
-    if cache_obj is not None:
-      k, v = cache_obj.update_and_fetch(k, v)
-      current_kv = cache_obj
-    else:
-      current_kv = (k, v)
+    if pk_past is not None and pv_past is not None:
+      k = mx.concatenate([pk_past, k], axis=-2)
+      v = mx.concatenate([pv_past, v], axis=-2)
+
+    current_kv = (k, v)
 
     scale = 1.0 / math.sqrt(d_h)
     total_k_len = k.shape[-2]
 
-    # Zero-allocation fused causal mask
+    # Zero-allocation causal mask
     mask = None
     if L > 1:
       if attention_mask is None and past_len == 0:
@@ -257,7 +220,7 @@ class TransformerDecoderBlock(nn.Module):
   def __call__(
       self,
       x: mx.array,
-      past_kv: KVCache | tuple | None = None,
+      past_kv: tuple | None = None,
       position_ids: mx.array | None = None,
       attention_mask: mx.array | None = None,
   ):

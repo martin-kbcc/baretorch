@@ -7,7 +7,6 @@ import os
 import platform
 import time
 
-# Prevent macOS MPS multi-threaded loading segmentation fault
 os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
 
 import mlx.core as mx
@@ -21,77 +20,17 @@ logger = logging.getLogger("benchmark_mlx")
 
 
 def clear_mlx_memory():
-  """Forces garbage collection and clears Apple Silicon unified memory allocator cache."""
   gc.collect()
   if hasattr(mx, "clear_cache"):
     mx.clear_cache()
-  elif hasattr(mx.metal, "clear_cache"):
-    mx.metal.clear_cache()
-
   if hasattr(mx, "reset_peak_memory"):
     mx.reset_peak_memory()
-  elif hasattr(mx.metal, "reset_peak_memory"):
-    mx.metal.reset_peak_memory()
 
 
 def get_peak_memory_gb() -> float:
-  """Returns peak memory allocated on Apple Silicon in Gigabytes."""
   if hasattr(mx, "get_peak_memory"):
     return mx.get_peak_memory() / (1024**3)
-  elif hasattr(mx.metal, "get_peak_memory"):
-    return mx.metal.get_peak_memory() / (1024**3)
   return 0.0
-
-
-def eval_cache(past_kv):
-  """Flattens and evaluates both CS-LRAD recurrent tuples and Transformer KVCache objects."""
-  if past_kv is None:
-    return
-  to_eval = []
-  for item in past_kv:
-    if isinstance(item, (tuple, list)):
-      for sub in item:
-        if isinstance(sub, mx.array):
-          to_eval.append(sub)
-    elif hasattr(item, "keys") and hasattr(item, "values"):
-      if isinstance(item.keys, mx.array):
-        to_eval.append(item.keys)
-      if isinstance(item.values, mx.array):
-        to_eval.append(item.values)
-    elif isinstance(item, mx.array):
-      to_eval.append(item)
-  if to_eval:
-    mx.eval(*to_eval)
-
-
-def enable_last_logit_only_torch(model):
-  """Ensures PyTorch model's lm_head only projects the final token's hidden state
-
-  into vocabulary logits during prefill, preventing multi-gigabyte allocations at
-  long context windows on Apple Silicon MPS.
-  """
-  import torch
-
-  head = (
-      model.get_output_embeddings()
-      if hasattr(model, "get_output_embeddings")
-      else getattr(model, "lm_head", None)
-  )
-
-  if (
-      head is not None
-      and isinstance(head, torch.nn.Linear)
-      and not getattr(head, "_is_efficient_patched", False)
-  ):
-    orig_forward = head.forward
-
-    def efficient_head_forward(hidden_states, *args, **kwargs):
-      if hidden_states.dim() == 3 and hidden_states.size(1) > 1:
-        hidden_states = hidden_states[:, -1:, :]
-      return orig_forward(hidden_states, *args, **kwargs)
-
-    head.forward = efficient_head_forward
-    head._is_efficient_patched = True
 
 
 def benchmark_mlx_at_context(
@@ -100,30 +39,32 @@ def benchmark_mlx_at_context(
     gen_tokens: int = 64,
     warmup: int = 1,
     trials: int = 3,
-    compile_decode: bool = False,
+    compile_decode: bool = True,
 ):
-  """Measures TTFT (Prefill Latency), Prefill Velocity, Autoregressive Decode
-
-  Velocity, and Peak RAM on Apple Silicon using strict synchronization.
-  """
   seq_len = synth_input.shape[1]
 
+  # Pure functional decode step returning (next_token, next_cache_tree)
   def decode_step(tok, past_kv):
     logits, next_kv = model(tok, past_key_values=past_kv, use_cache=True)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
     return next_tok, next_kv
 
-  step_fn = mx.compile(decode_step) if compile_decode else decode_step
+  # shapeless=True accommodates the KV sequence dimension increasing by 1 each step
+  step_fn = (
+      mx.compile(decode_step, shapeless=True)
+      if compile_decode
+      else decode_step
+  )
 
-  # 1. Per-Context Warmup
+  # 1. Warmup
   for _ in range(warmup):
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     tok = mx.argmax(logits[:, -1:, :], axis=-1)
-    mx.eval(tok); eval_cache(past_kv)
+    mx.eval(tok, past_kv)
 
     for _ in range(min(4, gen_tokens)):
       tok, past_kv = step_fn(tok, past_kv)
-      mx.eval(tok); eval_cache(past_kv)
+      mx.eval(tok, past_kv)
     del logits, past_kv, tok
   clear_mlx_memory()
 
@@ -135,28 +76,26 @@ def benchmark_mlx_at_context(
   for _ in range(trials):
     clear_mlx_memory()
 
-    # --- A. Measure Prefill Phase (Time to First Token) ---
+    # --- A. Prefill (TTFT) ---
     mx.synchronize()
     t0 = time.perf_counter()
 
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-    # Realize both token and states to complete prefill execution
-    mx.eval(next_tok); eval_cache(past_kv)
+    mx.eval(next_tok, past_kv)
     mx.synchronize()
 
     ttft_ms = (time.perf_counter() - t0) * 1000.0
     prefill_latencies.append(ttft_ms)
     del logits
 
-    # --- B. Measure Autoregressive Decoding Phase ---
+    # --- B. Autoregressive Decode ---
     mx.synchronize()
     t_start_dec = time.perf_counter()
 
     for _ in range(gen_tokens):
       next_tok, past_kv = step_fn(next_tok, past_kv)
-      # Realize state on every step to free previous buffers immediately
-      mx.eval(next_tok); eval_cache(past_kv)
+      mx.eval(next_tok, past_kv)
 
     mx.synchronize()
     dec_time_ms = (time.perf_counter() - t_start_dec) * 1000.0
@@ -187,121 +126,15 @@ def benchmark_mlx_at_context(
   }
 
 
-def benchmark_qwen_mps_fallback(
-    model_id: str,
-    context_lengths: list[int],
-    gen_tokens: int = 64,
-    trials: int = 3,
-):
-  """Evaluates Qwen baseline on Apple Silicon via PyTorch MPS to benchmark
-
-  kernel-dependent architectures against BareTorch's kernel-free pure GEMMs.
-  """
-  import torch
-  from transformers import AutoModelForCausalLM
-
-  device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-  logger.info(f"Loading Qwen baseline on {device.type.upper()}...")
-
-  results = {}
-  try:
-    # Load on CPU first to prevent MPS async materializer segfaults, then move to MPS
-    qwen = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device)
-    qwen.eval()
-
-    enable_last_logit_only_torch(qwen)
-    logger.info("Loaded Qwen on MPS with last-logit-only patch applied.")
-
-  except Exception as e:
-    logger.error(f"Qwen baseline cannot load on Apple Silicon MPS: {e}")
-    return {ctx: {"error": "FAILED_INIT"} for ctx in context_lengths}
-
-  for ctx in context_lengths:
-    print(f"  --> Benchmarking Qwen MPS Baseline @ {ctx:,} tokens...")
-    inp = torch.randint(100, 10000, (1, ctx), device=device)
-    prefill_latencies = []
-    decode_latencies = []
-
-    try:
-      for _ in range(trials):
-        gc.collect()
-        torch.mps.empty_cache()
-        torch.mps.synchronize()
-
-        # Prefill
-        t0 = time.perf_counter()
-        with torch.no_grad():
-          out = qwen(inp, use_cache=True)
-          past_kv = out.past_key_values
-          tok = out.logits[:, -1:].argmax(dim=-1)
-        torch.mps.synchronize()
-        prefill_latencies.append((time.perf_counter() - t0) * 1000.0)
-
-        # Decode
-        t_dec = time.perf_counter()
-        with torch.no_grad():
-          for _ in range(gen_tokens):
-            step = qwen(tok, past_key_values=past_kv, use_cache=True)
-            past_kv = step.past_key_values
-            tok = step.logits[:, -1:].argmax(dim=-1)
-        torch.mps.synchronize()
-        decode_latencies.append((time.perf_counter() - t_dec) * 1000.0)
-
-        del out, past_kv, tok, step
-        gc.collect()
-        torch.mps.empty_cache()
-
-      avg_ttft = float(np.mean(prefill_latencies))
-      avg_dec = float(np.mean(decode_latencies))
-      results[ctx] = {
-          "context_len": ctx,
-          "ttft_ms": avg_ttft,
-          "prefill_tok_s": (
-              (ctx / (avg_ttft / 1000.0)) if avg_ttft > 0 else 0.0
-          ),
-          "decode_tok_s": (
-              (gen_tokens / (avg_dec / 1000.0)) if avg_dec > 0 else 0.0
-          ),
-          "peak_ram_gb": (
-              torch.mps.current_allocated_memory() / (1024**3)
-              if hasattr(torch.mps, "current_allocated_memory")
-              else 0.0
-          ),
-      }
-    except Exception as e:
-      logger.warning(f"Qwen failed @ {ctx:,} tokens on MPS: {e}")
-      results[ctx] = {"error": "MPS_OOM_OR_FAIL"}
-    del inp
-
-  del qwen
-  gc.collect()
-  torch.mps.empty_cache()
-  return results
-
-
 def main():
   parser = argparse.ArgumentParser(
-      description=(
-          "BareTorch MLX vs. Qwen Apple Silicon Benchmark (M-Series Unified"
-          " Memory)"
-      )
+      description="BareTorch MLX Apple Silicon Benchmark"
   )
   parser.add_argument(
       "--baretorch_path",
       type=str,
       default="./checkpoint-132000",
       help="Local path to BareTorch checkpoint directory",
-  )
-  parser.add_argument(
-      "--qwen_model_id",
-      type=str,
-      default="Qwen/Qwen3.5-2B",
-      help="Hugging Face ID for Qwen baseline comparison",
   )
   parser.add_argument(
       "--context_lengths",
@@ -325,14 +158,14 @@ def main():
   parser.add_argument(
       "--compile_decode",
       action="store_true",
-      default=False,
-      help="Compile single-token autoregressive decoding step",
+      default=True,
+      help="Compile single-token autoregressive decoding step (default: True)",
   )
   parser.add_argument(
-      "--benchmark_qwen",
-      action="store_true",
-      default=False,
-      help="Benchmark Qwen via PyTorch MPS fallback for direct comparison",
+      "--no_compile",
+      action="store_false",
+      dest="compile_decode",
+      help="Disable compilation",
   )
   parser.add_argument(
       "--csv_path",
@@ -351,17 +184,17 @@ def main():
   print(f"Decode Steps  : {args.gen_tokens} tokens")
   print(f"Trials        : {args.trials} per context length")
   print(f"Compiled Step : {args.compile_decode}")
-  print(f"Benchmark Qwen: {args.benchmark_qwen}")
   print(f"CSV Output    : {args.csv_path}")
   print("=" * 85)
 
   csv_rows = []
   baretorch_results = {}
-  qwen_results = {}
+  bt_label = (
+      "BareTorch 2.5B (MLX Compiled)"
+      if args.compile_decode
+      else "BareTorch 2.5B (MLX Eager)"
+  )
 
-  bt_label = "BareTorch 2.5B (MLX Native)"
-
-  # 1. Benchmark BareTorch MLX
   if os.path.exists(args.baretorch_path):
     logger.info(
         f"Loading BareTorch MLX from '{args.baretorch_path}' in FP16..."
@@ -418,43 +251,8 @@ def main():
   else:
     logger.warning(
         f"BareTorch checkpoint path '{args.baretorch_path}' not found."
-        " Skipping."
     )
 
-  # 2. Benchmark Qwen Baseline
-  if args.benchmark_qwen:
-    logger.info("Initiating Qwen baseline evaluation...")
-    qwen_results = benchmark_qwen_mps_fallback(
-        model_id=args.qwen_model_id,
-        context_lengths=args.context_lengths,
-        gen_tokens=args.gen_tokens,
-        trials=args.trials,
-    )
-    for ctx, res in qwen_results.items():
-      if "error" not in res:
-        csv_rows.append({
-            "model": "Qwen3.5-2B",
-            "backend": "PyTorch MPS",
-            "context_len": ctx,
-            "ttft_ms": round(res["ttft_ms"], 2),
-            "prefill_tok_s": round(res["prefill_tok_s"], 2),
-            "decode_tok_s": round(res["decode_tok_s"], 2),
-            "peak_ram_gb": round(res["peak_ram_gb"], 2),
-            "status": "SUCCESS",
-        })
-      else:
-        csv_rows.append({
-            "model": "Qwen3.5-2B",
-            "backend": "PyTorch MPS",
-            "context_len": ctx,
-            "ttft_ms": None,
-            "prefill_tok_s": None,
-            "decode_tok_s": None,
-            "peak_ram_gb": None,
-            "status": res["error"],
-        })
-
-  # 3. Export CSV
   fieldnames = [
       "model",
       "backend",
@@ -472,17 +270,14 @@ def main():
       writer.writerow(row)
   logger.info(f"✅ Benchmark metrics saved to '{args.csv_path}'")
 
-  # 4. Formatted Markdown Summary Table
   print("\n" + "=" * 95)
   print(f"📊 APPLE SILICON COMPARATIVE BENCHMARK REPORT ({soc_name})")
   print("=" * 95)
-  header = (
+  print(
       "| Context | Model (Backend) | TTFT (ms) | Prefill (tok/s) | Decode"
       " (tok/s) | Peak RAM (GB) |"
   )
-  sep = "| :---: | :--- | :---: | :---: | :---: | :---: |"
-  print(header)
-  print(sep)
+  print("| :---: | :--- | :---: | :---: | :---: | :---: |")
 
   for ctx in args.context_lengths:
     if ctx in baretorch_results:
@@ -495,22 +290,7 @@ def main():
             f" {bt['prefill_tok_s']:,.1f} tok/s | {bt['decode_tok_s']:.2f}"
             f" tok/s | {bt['peak_ram_gb']:.2f} GB |"
         )
-
-    if ctx in qwen_results:
-      qw = qwen_results[ctx]
-      if "error" in qw:
-        print(
-            f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | 💥 {qw['error']} | — | — |"
-            " — |"
-        )
-      else:
-        print(
-            f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {qw['ttft_ms']:.1f} ms |"
-            f" {qw['prefill_tok_s']:,.1f} tok/s | {qw['decode_tok_s']:.2f}"
-            f" tok/s | {qw['peak_ram_gb']:.2f} GB |"
-        )
     print("| --- | --- | --- | --- | --- | --- |")
-
   print("=" * 95)
 
 
