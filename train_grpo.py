@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import subprocess
-import warnings
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, TrainerCallback
@@ -62,7 +61,7 @@ class R2CheckpointCallback(TrainerCallback):
                     local_ckpt_path,
                     target_r2_path,
                     "--transfers",
-                    "4",
+                    "8",
                     "--s3-chunk-size",
                     "64M",
                 ]
@@ -79,24 +78,23 @@ def format_reward_func(completions, **kwargs):
     Rewards the completion for closing the reasoning block with </think> 
     and providing a boxed final answer \\boxed{...}.
     
-    Note: Since <think> is prefixed in the prompt header, completions start 
+    Since <think> is pre-filled in the prompt header, completions start 
     directly inside the reasoning trace.
     """
     rewards = []
     for completion in completions:
         text = completion[0]["content"] if isinstance(completion, list) else completion
-        
+
         has_think_end = "</think>" in text
         has_boxed = "\\boxed{" in text
 
         if has_think_end and has_boxed:
-            # Check if </think> occurs BEFORE \boxed{
             think_end_idx = text.find("</think>")
-            boxed_idx = text.find("\\boxed{")
+            boxed_idx = text.rfind("\\boxed{")
             if think_end_idx < boxed_idx:
                 rewards.append(1.0)
             else:
-                rewards.append(0.5)  # Both present, but wrong structural order
+                rewards.append(0.5)
         elif has_think_end:
             rewards.append(0.5)
         elif has_boxed:
@@ -116,9 +114,9 @@ def extract_boxed_answer(text):
     chars = []
     while i < len(text) and num_open_braces > 0:
         c = text[i]
-        if c == '{':
+        if c == "{":
             num_open_braces += 1
-        elif c == '}':
+        elif c == "}":
             num_open_braces -= 1
         if num_open_braces > 0:
             chars.append(c)
@@ -128,19 +126,36 @@ def extract_boxed_answer(text):
     return None
 
 
+def clean_numerical_value(val_str):
+    """Strips currency symbols, commas, and percentage signs for robust numerical comparison."""
+    if val_str is None:
+        return ""
+    cleaned = val_str.strip().replace(",", "").replace("$", "").replace("%", "")
+    try:
+        f_val = float(cleaned)
+        if f_val.is_integer():
+            return str(int(f_val))
+        return str(f_val)
+    except ValueError:
+        return cleaned.lower()
+
+
 def accuracy_reward_func(completions, answer, **kwargs):
-    """Rewards the model (+2.0) if the boxed final answer matches ground truth."""
+    """Rewards the model (+2.0) if the extracted boxed final answer matches ground truth."""
     rewards = []
     for completion, target in zip(completions, answer):
         text = completion[0]["content"] if isinstance(completion, list) else completion
         pred = extract_boxed_answer(text)
-        
+
         if "####" in target:
             clean_target = target.split("####")[-1].strip()
         else:
             clean_target = target.strip()
 
-        if pred is not None and pred.lower() == clean_target.lower():
+        norm_pred = clean_numerical_value(pred)
+        norm_target = clean_numerical_value(clean_target)
+
+        if norm_pred and norm_pred == norm_target:
             rewards.append(2.0)
         else:
             rewards.append(0.0)
@@ -151,12 +166,6 @@ def accuracy_reward_func(completions, answer, **kwargs):
 #                                  Main Engine
 # ==============================================================================
 def main():
-    if "LOCAL_RANK" in os.environ:
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-
     parser = argparse.ArgumentParser(
         description="BareTorch Stage 2: Group Relative Policy Optimization (GRPO) Engine"
     )
@@ -165,13 +174,13 @@ def main():
     parser.add_argument(
         "--sft_model_path",
         type=str,
-        default="./checkpoints_300m_sft",
+        default="./checkpoint-90000",
         help="Path to SFT-aligned BareTorch checkpoint folder.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./checkpoints_300m_grpo",
+        default="./checkpoints_2.5b_grpo",
         help="Directory to save RL-trained weights.",
     )
 
@@ -180,6 +189,12 @@ def main():
         "--tie_word_embeddings",
         action="store_true",
         help="Explicitly tie lm_head.weight to token_embedding.weight.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=True,
+        help="Compile CS-LRAD recurrent layers via torch.compile for fast rollout generation.",
     )
 
     # Tokenizer & Dataset
@@ -203,10 +218,17 @@ def main():
     )
 
     # RL Hyperparameters
-    parser.add_argument("--num_generations", type=int, default=4, help="Group size (G) rollouts per prompt.")
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=8,
+        help="Group size (G) rollouts per prompt.",
+    )
     parser.add_argument("--max_prompt_length", type=int, default=512)
     parser.add_argument("--max_completion_length", type=int, default=1024)
-    parser.add_argument("--learning_rate", type=float, default=5e-6, help="GRPO learning rate.")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Rollout sampling temperature.")
+    parser.add_argument("--top_p", type=float, default=0.95, help="Rollout top-p nucleus sampling.")
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="GRPO policy learning rate.")
     parser.add_argument("--beta", type=float, default=0.04, help="KL penalty factor relative to reference policy.")
     parser.add_argument("--batch_size", type=int, default=2, help="Per-GPU prompt batch size.")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps.")
@@ -232,22 +254,22 @@ def main():
     )
 
     args = parser.parse_args()
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main_process = int(os.environ.get("RANK", 0)) == 0
 
     # 1. Tokenizer Setup
-    if local_rank == 0:
+    if is_main_process:
         logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Enforce right-padding for CS-LRAD chunk alignment
-    tokenizer.padding_side = "right"
+    # CRITICAL: Left-padding is strictly required for batched autoregressive generation
+    tokenizer.padding_side = "left"
 
     # 2. Policy Model Loading
-    if local_rank == 0:
-        logger.info(f"Loading SFT Model from: {args.sft_model_path}")
+    if is_main_process:
+        logger.info(f"Loading Base/SFT Model from: {args.sft_model_path}")
 
     model = BareTorchForCausalLM.from_pretrained(
         args.sft_model_path,
@@ -265,7 +287,7 @@ def main():
     model.config.use_cache = True
 
     # 3. Load & Format Dataset
-    if local_rank == 0:
+    if is_main_process:
         logger.info(f"Loading RL Dataset '{args.dataset_name}'...")
 
     raw_dataset = load_dataset(args.dataset_name, args.dataset_config, split="train")
@@ -281,11 +303,6 @@ def main():
             f"<|im_start|>user\n{example['question']}<|im_end|>\n"
             f"<|im_start|>assistant\n<think>\n"
         )
-        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-        if len(prompt_tokens) > args.max_prompt_length:
-            prompt_tokens = prompt_tokens[-args.max_prompt_length:]
-            prompt_text = tokenizer.decode(prompt_tokens)
-
         return {"prompt": prompt_text, "answer": example["answer"]}
 
     train_dataset = raw_dataset.map(format_prompt, remove_columns=raw_dataset.column_names)
@@ -297,15 +314,25 @@ def main():
         "beta": args.beta,
         "num_generations": args.num_generations,
         "max_completion_length": args.max_completion_length,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
         "per_device_train_batch_size": args.batch_size,
         "gradient_accumulation_steps": args.grad_accum,
         "num_train_epochs": args.num_epochs,
-        "logging_steps": 10,
+        "fsdp": "shard_grad_op",
+        "logging_steps": 5,
         "save_strategy": "steps",
         "save_steps": 100,
-        "save_total_limit": 2,
+        "save_total_limit": 3,
         "bf16": True,
         "use_vllm": False,
+        "gradient_checkpointing": True,
+        "warmup_ratio": 0.05,
+        "weight_decay": 0.01,
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.95,
+        "adam_epsilon": 1e-8,
+        "max_grad_norm": 1.0,
     }
 
     sig = inspect.signature(GRPOConfig.__init__)
@@ -320,11 +347,11 @@ def main():
 
     callbacks = []
     if enable_r2_sync:
-        if local_rank == 0:
+        if is_main_process:
             logger.info(f"Cloudflare R2 Sync activated. Target Bucket: '{r2_bucket}'")
         callbacks.append(R2CheckpointCallback(bucket_name=r2_bucket, prefix=r2_prefix))
 
-    # 5. Initialize & Run GRPOTrainer
+    # 5. Initialize GRPOTrainer First (Ensures clean un-compiled deepcopy for ref_model)
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=[format_reward_func, accuracy_reward_func],
@@ -334,21 +361,30 @@ def main():
         callbacks=callbacks,
     )
 
-    if local_rank == 0:
-        logger.info("🧠 Starting Stage 2: Group Relative Policy Optimization (GRPO)...")
+    # 6. Compile Policy Model's CS-LRAD Recurrent Blocks
+    if args.compile:
+        if is_main_process:
+            logger.info("⚡ Compiling CS-LRAD recurrent layers with torch.compile on active policy...")
+        compiled_count = 0
+        for name, module in trainer.model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_count += 1
+        if is_main_process:
+            logger.info(f"Successfully compiled {compiled_count} CS-LRAD module(s).")
+
+    # 7. Execute GRPO Training
+    if is_main_process:
+        logger.info("🧠 Starting BareTorch GRPO Reinforcement Learning...")
 
     trainer.train()
 
-    if local_rank == 0:
+    if is_main_process:
         logger.info(f"Saving final GRPO checkpoint to '{args.output_dir}'...")
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-        logger.info("✅ Stage 2: GRPO RL completed successfully!")
-
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
-
-    os._exit(0)
+        logger.info("✅ Stage 2: GRPO RL training completed successfully!")
 
 
 if __name__ == "__main__":

@@ -59,3 +59,15 @@ __all__ = [
     "BareTorchModel",
     "BareTorchForCausalLM",
 ]
+
+# Safe dynamic export: loads MLX components when available on macOS
+try:
+  import mlx.core
+  from baretorch.integration_mlx import (
+      BareTorchForCausalLMMLX,
+      BareTorchModelMLX,
+  )
+
+  __all__.extend(["BareTorchModelMLX", "BareTorchForCausalLMMLX"])
+except ImportError:
+  pass
