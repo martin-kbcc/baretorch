@@ -125,7 +125,7 @@ class BareTorchForCausalLMMLX(nn.Module):
         )
 
         if num_logits_to_keep > 0 and hidden_states.shape[1] > num_logits_to_keep:
-        hidden_states = hidden_states[:, -num_logits_to_keep:, :]
+            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
         logits = mx.clip(logits, -50.0, 50.0)
