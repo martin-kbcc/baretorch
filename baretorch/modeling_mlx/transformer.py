@@ -71,7 +71,6 @@ class RotaryEmbedding(nn.Module):
 
 
 def unwrap_kv_pair(past_kv):
-  """Safely unpacks (key, value) tuple without nested contamination."""
   if past_kv is None:
     return None, None
   p_item = past_kv
@@ -120,9 +119,7 @@ class CausalSelfAttention(nn.Module):
       self.k_norm = RMSNorm(self.head_dim)
 
     self.rope = RotaryEmbedding(
-        self.head_dim,
-        max_position_embeddings=max_seq_len,
-        base=rope_theta,
+        self.head_dim, max_position_embeddings=max_seq_len, base=rope_theta
     )
     self.W_out = nn.Linear(d_model, d_model, bias=False)
 
