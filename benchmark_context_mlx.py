@@ -43,6 +43,27 @@ def get_peak_memory_gb() -> float:
   return 0.0
 
 
+def eval_cache(past_kv):
+  """Flattens and evaluates both CS-LRAD recurrent tuples and Transformer KVCache objects."""
+  if past_kv is None:
+    return
+  to_eval = []
+  for item in past_kv:
+    if isinstance(item, (tuple, list)):
+      for sub in item:
+        if isinstance(sub, mx.array):
+          to_eval.append(sub)
+    elif hasattr(item, "keys") and hasattr(item, "values"):
+      if isinstance(item.keys, mx.array):
+        to_eval.append(item.keys)
+      if isinstance(item.values, mx.array):
+        to_eval.append(item.values)
+    elif isinstance(item, mx.array):
+      to_eval.append(item)
+  if to_eval:
+    mx.eval(*to_eval)
+
+
 def enable_last_logit_only_torch(model):
   """Ensures PyTorch model's lm_head only projects the final token's hidden state
 
@@ -98,11 +119,11 @@ def benchmark_mlx_at_context(
   for _ in range(warmup):
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     tok = mx.argmax(logits[:, -1:, :], axis=-1)
-    mx.eval(tok, past_kv)
+    mx.eval(tok); eval_cache(past_kv)
 
     for _ in range(min(4, gen_tokens)):
       tok, past_kv = step_fn(tok, past_kv)
-      mx.eval(tok, past_kv)
+      mx.eval(tok); eval_cache(past_kv)
     del logits, past_kv, tok
   clear_mlx_memory()
 
@@ -121,7 +142,7 @@ def benchmark_mlx_at_context(
     logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
     next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
     # Realize both token and states to complete prefill execution
-    mx.eval(next_tok, past_kv)
+    mx.eval(next_tok); eval_cache(past_kv)
     mx.synchronize()
 
     ttft_ms = (time.perf_counter() - t0) * 1000.0
@@ -135,7 +156,7 @@ def benchmark_mlx_at_context(
     for _ in range(gen_tokens):
       next_tok, past_kv = step_fn(next_tok, past_kv)
       # Realize state on every step to free previous buffers immediately
-      mx.eval(next_tok, past_kv)
+      mx.eval(next_tok); eval_cache(past_kv)
 
     mx.synchronize()
     dec_time_ms = (time.perf_counter() - t_start_dec) * 1000.0
