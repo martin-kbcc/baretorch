@@ -523,10 +523,10 @@ def main():
                 logger.info(
                     f"✂️ Pre-slicing component datasets to target {args.max_samples:,} total rows..."
                 )
-                n_chat = min(len(ds_chat), int(args.max_samples * 0.55))
-                n_code = min(len(ds_code), int(args.max_samples * 0.22))
-                n_math = min(len(ds_math), int(args.max_samples * 0.18))
-                n_reas = min(len(ds_reasoning), int(args.max_samples * 0.18))
+                n_chat = min(len(ds_chat), int(args.max_samples * 0.50))
+                n_code = min(len(ds_code), int(args.max_samples * 0.20))
+                n_math = min(len(ds_math), int(args.max_samples * 0.15))
+                n_reas = min(len(ds_reasoning), int(args.max_samples * 0.15))
 
                 ds_chat = ds_chat.shuffle(seed=42).select(range(n_chat))
                 ds_code = ds_code.shuffle(seed=42).select(range(n_code))
@@ -603,14 +603,11 @@ def main():
                 num_proc=num_proc,
             )
 
-            stop_strategy = (
-                "all_exhausted" if args.max_samples == 0 else "first_exhausted"
-            )
             raw_dataset = interleave_datasets(
                 [ds_chat, ds_code, ds_math, ds_reasoning],
                 probabilities=[0.50, 0.20, 0.15, 0.15],
                 seed=42,
-                stopping_strategy=stop_strategy,
+                stopping_strategy="all_exhausted",
             )
 
             if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
