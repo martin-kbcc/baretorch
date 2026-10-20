@@ -79,7 +79,8 @@ class BareTorchModel(BareTorchPreTrainedModel):
                     dropout=config.dropout,
                     max_seq_len=config.max_seq_len,
                     use_grad_checkpointing=config.use_grad_checkpointing,
-                    use_qk_norm=getattr(config, "use_qk_norm", False)
+                    use_qk_norm=getattr(config, "use_qk_norm", False),
+                    rope_theta=getattr(config, "rope_theta", 10000.0)
                 )
             elif layer_type == "cs_lrad":
                 block = LRADDecoderBlock(

@@ -1,14 +1,15 @@
-# baretorch/integration_mlx/modeling_baretorch.py
+# /home/martinkb/Desktop/BareTorch_F/baretorch/integration_mlx/modeling_baretorch.py
 import glob
 import json
 import logging
 import os
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.modeling_mlx.cs_lrad import LRADDecoderBlock
-from baretorch.modeling_mlx.transformer import RMSNorm, TransformerDecoderBlock
+from baretorch.modeling_mlx.transformer import RMSNorm, TransformerDecoderBlock, unwrap_kv_pair
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,30 @@ class BareTorchModelMLX(nn.Module):
         if past_key_values is not None and input_ids.shape[1] > 1:
             input_ids = input_ids[:, -1:]
 
-        is_prefill = input_ids.shape[1] > 1
+        seq_length = input_ids.shape[1]
+        is_prefill = seq_length > 1
         h = self.token_embedding(input_ids)
         next_cache = [] if use_cache else None
+
+        # Exact position_ids alignment with PyTorch BareTorchModel.forward
+        if position_ids is None:
+            past_length = 0
+            if past_key_values is not None:
+                for idx, layer_past in enumerate(past_key_values):
+                    if isinstance(self.layers[idx], TransformerDecoderBlock):
+                        pk, _ = unwrap_kv_pair(layer_past)
+                        if pk is not None:
+                            past_length = pk.shape[-2]
+                            break
+
+            if attention_mask is not None and past_length == 0:
+                position_ids = mx.maximum(
+                    mx.cumsum(attention_mask.astype(mx.int32), axis=-1) - 1, 0
+                )
+            else:
+                position_ids = mx.arange(
+                    past_length, past_length + seq_length, dtype=mx.int32
+                )[None, :]
 
         for i, layer in enumerate(self.layers):
             past_state = (
@@ -136,18 +158,11 @@ class BareTorchForCausalLMMLX(nn.Module):
         logits = self.lm_head(hidden_states)
         logits = mx.clip(logits, -50.0, 50.0)
 
-        # Return pure tuple so MLX compile and eval can track all arrays
         return logits, next_cache
-
-
-
 
     @classmethod
     def from_pretrained(cls, checkpoint_dir: str, dtype=mx.float16):
-        """Loads BareTorch PyTorch checkpoint weights directly into MLX architecture.
-        
-        Handles single-file safetensors, sharded safetensors, and pytorch_model.bin.
-        """
+        """Loads BareTorch PyTorch checkpoint weights directly into MLX architecture."""
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Missing config.json in {checkpoint_dir}")
@@ -160,7 +175,6 @@ class BareTorchForCausalLMMLX(nn.Module):
 
         # 1. Gather all weight files (Safetensors or PyTorch Bin)
         raw_weights = {}
-        sf_index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
         sf_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
 
         if sf_files:
@@ -168,8 +182,7 @@ class BareTorchForCausalLMMLX(nn.Module):
                 logger.info(f"Loading MLX weights from safetensors: {os.path.basename(sf_f)}")
                 raw_weights.update(mx.load(sf_f))
         else:
-            bin_index_path = os.path.join(checkpoint_dir, "pytorch_model.bin.index.json")
-            bin_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.bin")))
+            bin_files = sorted(glob.glob(os.path.join(checkpoint_dir, "pytorch_model*.bin")))
             if bin_files:
                 import torch
                 for bin_f in bin_files:
@@ -178,7 +191,7 @@ class BareTorchForCausalLMMLX(nn.Module):
                     for k, v in pt_state.items():
                         raw_weights[k] = mx.array(v.numpy())
             else:
-                raise FileNotFoundError(f"No .safetensors or .bin weights found in {checkpoint_dir}")
+                raise FileNotFoundError(f"No .safetensors or pytorch_model*.bin weights found in {checkpoint_dir}")
 
         # 2. Normalize prefixes (FSDP, DDP, torch.compile)
         cleaned_weights = {}
@@ -188,7 +201,6 @@ class BareTorchForCausalLMMLX(nn.Module):
                 if clean_k.startswith(pfx):
                     clean_k = clean_k[len(pfx):]
 
-            # Ensure keys map cleanly to self.model if saved as base model
             if not clean_k.startswith("model.") and clean_k != "lm_head.weight":
                 clean_k = f"model.{clean_k}"
 
@@ -201,6 +213,17 @@ class BareTorchForCausalLMMLX(nn.Module):
                     cleaned_weights["lm_head.weight"] = cleaned_weights[cand]
                     break
 
-        # 4. Load weights into the MLX model structure
+        # 4. Verify all model parameters (excluding non-persistent RoPE inv_freq) are present
+        expected_keys = {
+            k for k, _ in tree_flatten(model.parameters()) if not k.endswith(".inv_freq")
+        }
+        missing_keys = expected_keys - set(cleaned_weights.keys())
+        if missing_keys:
+            raise RuntimeError(
+                f"❌ Missing {len(missing_keys)} weight keys when loading MLX model: {sorted(list(missing_keys))[:5]}"
+            )
+
+        # 5. Load weights into the MLX model structure
         model.load_weights(list(cleaned_weights.items()), strict=False)
+        mx.eval(model.parameters())
         return model

@@ -22,11 +22,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("benchmark_mlx")
 
 
-def clear_mlx_memory():
-    """Forces garbage collection and flushes Apple Silicon MLX buffer pool."""
+def flush_mlx_cache():
+    """Flushes unused buffers from the Metal cache WITHOUT resetting peak memory stats."""
     gc.collect()
     if hasattr(mx, "clear_cache"):
         mx.clear_cache()
+
+
+def reset_mlx_memory_stats():
+    """Flushes cache and resets MLX peak memory high-water mark at the start of a trial."""
+    flush_mlx_cache()
     if hasattr(mx, "reset_peak_memory"):
         mx.reset_peak_memory()
 
@@ -46,11 +51,16 @@ def clear_mps_memory():
         torch.mps.synchronize()
 
 
+def get_mps_allocated_gb() -> float:
+    """Returns current allocated memory on PyTorch MPS in Gigabytes."""
+    if torch.backends.mps.is_available() and hasattr(torch.mps, "current_allocated_memory"):
+        return torch.mps.current_allocated_memory() / (1024**3)
+    return 0.0
+
+
 def enable_last_logit_only_torch(model):
     """Ensures PyTorch model's lm_head only projects the final token's hidden state
-
-    into vocabulary logits during prefill, preventing multi-gigabyte allocations
-    at long context windows on Apple Silicon MPS.
+    into vocabulary logits during prefill, matching benchmark_context.py.
     """
     head = (
         model.get_output_embeddings()
@@ -81,10 +91,12 @@ def benchmark_mlx_at_context(
     warmup: int = 1,
     trials: int = 3,
 ):
-    """Measures TTFT, Prefill Throughput, Decode Velocity, and Peak RAM on MLX."""
+    """Measures TTFT, Prefill Throughput, Decode Velocity, and Peak RAM on MLX.
+    Aligned 1-to-1 with benchmark_model_at_context in benchmark_context.py.
+    """
     seq_len = synth_input.shape[1]
 
-    # 1. Warmup
+    # 1. Per-Context Untimed Warmup
     for _ in range(warmup):
         logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
         tok = mx.argmax(logits[:, -1:, :], axis=-1)
@@ -95,7 +107,7 @@ def benchmark_mlx_at_context(
             tok = mx.argmax(logits[:, -1:, :], axis=-1)
             mx.eval(tok, past_kv)
         del logits, past_kv, tok
-    clear_mlx_memory()
+    reset_mlx_memory_stats()
 
     prefill_latencies = []
     decode_latencies = []
@@ -103,25 +115,28 @@ def benchmark_mlx_at_context(
 
     # 2. Timing Trials
     for _ in range(trials):
-        clear_mlx_memory()
+        reset_mlx_memory_stats()
 
-        # --- A. Prefill (TTFT) ---
+        # --- A. Measure Prefill Phase (TTFT) ---
         mx.synchronize()
         t0 = time.perf_counter()
 
         logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
-        next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-        mx.eval(next_tok, past_kv)
+        mx.eval(logits, past_kv)
         mx.synchronize()
 
         ttft_ms = (time.perf_counter() - t0) * 1000.0
         prefill_latencies.append(ttft_ms)
+
+        next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
+        mx.eval(next_tok)
         del logits
 
-        # Release temporary prefill buffers so decode starts with minimal memory footprint
-        clear_mlx_memory()
+        # Record prefill high-water mark BEFORE flushing dead buffers for decode
+        prefill_peak_gb = get_mlx_peak_memory_gb()
+        flush_mlx_cache()
 
-        # --- B. Autoregressive Decode ---
+        # --- B. Measure Autoregressive Decoding Phase ---
         mx.synchronize()
         t_start_dec = time.perf_counter()
 
@@ -134,11 +149,11 @@ def benchmark_mlx_at_context(
         dec_time_ms = (time.perf_counter() - t_start_dec) * 1000.0
         decode_latencies.append(dec_time_ms)
 
-        peak_mem_gb = get_mlx_peak_memory_gb()
-        peak_memories.append(peak_mem_gb)
+        decode_peak_gb = get_mlx_peak_memory_gb()
+        peak_memories.append(max(prefill_peak_gb, decode_peak_gb))
 
-        del past_kv, next_tok
-        clear_mlx_memory()
+        del past_kv, next_tok, logits
+        reset_mlx_memory_stats()
 
     avg_ttft_ms = float(np.mean(prefill_latencies))
     avg_prefill_tok_s = (seq_len / (avg_ttft_ms / 1000.0)) if avg_ttft_ms > 0 else 0.0
@@ -168,7 +183,6 @@ def benchmark_qwen_mps(
 
     results = {}
     try:
-        # Load sequentially to CPU first to prevent MPS multithreaded allocation corruptions
         qwen = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float16,
@@ -192,7 +206,7 @@ def benchmark_qwen_mps(
         peak_memories = []
 
         try:
-            # Context-specific warmup
+            # 1. Context-specific warmup
             with torch.no_grad():
                 for _ in range(warmup):
                     out = qwen(inp, use_cache=True)
@@ -202,26 +216,31 @@ def benchmark_qwen_mps(
                         step = qwen(tok, past_key_values=p_kv, use_cache=True)
                         p_kv = step.past_key_values
                         tok = step.logits[:, -1:].argmax(dim=-1)
-                    del out, p_kv, tok
+                    del out, p_kv, tok, step
             clear_mps_memory()
 
+            # 2. Timing Trials
             for _ in range(trials):
                 clear_mps_memory()
 
-                # --- Prefill (TTFT) ---
+                # --- A. Measure Prefill Phase (TTFT) ---
+                torch.mps.synchronize()
                 t0 = time.perf_counter()
                 with torch.no_grad():
                     out = qwen(inp, use_cache=True)
-                    past_kv = out.past_key_values
-                    tok = out.logits[:, -1:].argmax(dim=-1)
                 torch.mps.synchronize()
                 ttft_ms = (time.perf_counter() - t0) * 1000.0
                 prefill_latencies.append(ttft_ms)
+
+                past_kv = out.past_key_values
+                tok = out.logits[:, -1:].argmax(dim=-1)
+                prefill_mem_gb = get_mps_allocated_gb()
                 del out
 
                 clear_mps_memory()
 
-                # --- Decode ---
+                # --- B. Measure Autoregressive Decoding Phase ---
+                torch.mps.synchronize()
                 t_dec = time.perf_counter()
                 with torch.no_grad():
                     for _ in range(gen_tokens):
@@ -232,12 +251,8 @@ def benchmark_qwen_mps(
                 dec_ms = (time.perf_counter() - t_dec) * 1000.0
                 decode_latencies.append(dec_ms)
 
-                peak_mem = (
-                    torch.mps.current_allocated_memory() / (1024**3)
-                    if hasattr(torch.mps, "current_allocated_memory")
-                    else 0.0
-                )
-                peak_memories.append(peak_mem)
+                decode_mem_gb = get_mps_allocated_gb()
+                peak_memories.append(max(prefill_mem_gb, decode_mem_gb))
 
                 del past_kv, tok, step
                 clear_mps_memory()
@@ -387,11 +402,11 @@ def main():
                     "peak_ram_gb": None,
                     "status": "FAIL",
                 })
-                clear_mlx_memory()
+                reset_mlx_memory_stats()
             del synth_input
 
         del model
-        clear_mlx_memory()
+        reset_mlx_memory_stats()
         logger.info("Unloaded BareTorch from unified memory.\n")
     else:
         logger.warning(f"BareTorch path '{args.baretorch_path}' not found. Skipping.")
