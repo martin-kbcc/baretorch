@@ -1,5 +1,5 @@
+# /home/martinkb/Desktop/BareTorch_F/train_sft.py
 import argparse
-import glob
 import logging
 import os
 import subprocess
@@ -84,7 +84,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 # ==============================================================================
-#                         Cloudflare R2 Background Sync Callback
+#                          Cloudflare R2 Background Sync Callback
 # ==============================================================================
 class R2CheckpointCallback(TrainerCallback):
     """Hugging Face Trainer Callback that automatically syncs newly saved
@@ -136,7 +136,7 @@ class R2CheckpointCallback(TrainerCallback):
 
 
 def adapt_model_for_long_context(
-    model, config, target_seq_len=32768, target_rope_theta=1000000.0
+    model, config, target_seq_len=4096, target_rope_theta=10000.0
 ):
     """Explicitly scales RotaryEmbedding base theta and forces cache regeneration
     across all Transformer blocks for SFT.
@@ -170,34 +170,26 @@ def adapt_model_for_long_context(
     return adapted_layers
 
 
-def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=32768, local_rank=0):
-    """Packs multi-turn ChatML conversations using Whole-Sample Packing.
+def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=4096, local_rank=0):
+    """Tokenizes in parallel across CPU cores and packs multi-turn ChatML
+    conversations using Whole-Sample Packing.
     Guarantees no conversation is cut in half across sequence boundaries.
     Applies completion-only loss masking (-100 for prompts/headers).
-    Uses compact NumPy memory buffers to eliminate CPU RAM OOMs.
+    Uses zero-copy contiguous NumPy buffers to prevent PyArrow 2GB overflow.
     """
+    vocab_size = len(tokenizer)
+    pad_id = tokenizer.pad_token_id
+    num_proc = max(1, min(16, (os.cpu_count() or 4) - 2))
+
     if local_rank == 0:
         logger.info(
-            f"📦 Packing ChatML conversations into {max_seq_len}-token sequences "
-            "(Whole-Sample Packing)..."
+            f"⚡ Tokenizing {len(raw_dataset):,} conversations across {num_proc} CPU workers..."
         )
 
-    vocab_size = len(tokenizer)
-    packed_samples = []
-    current_ids = []
-    current_labels = []
-
-    iterator = tqdm(
-        raw_dataset,
-        desc="Packing ChatML Data",
-        disable=(local_rank != 0),
-        dynamic_ncols=True,
-    )
-
-    for example in iterator:
+    def _tokenize_example(example):
         messages = example.get("messages", [])
         if not messages:
-            continue
+            return {"sample_ids": [], "sample_labels": [], "length": 0}
 
         sample_ids = []
         sample_labels = []
@@ -205,6 +197,8 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=32768, local_rank=0)
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
+            if not content:
+                continue
 
             if role == "assistant":
                 header_str = f"<|im_start|>{role}\n"
@@ -221,66 +215,103 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=32768, local_rank=0)
                 sample_ids.extend(tokens)
                 sample_labels.extend([-100] * len(tokens))
 
-        if len(sample_ids) > max_seq_len:
-            continue
+        if len(sample_ids) > max_seq_len or not any(l != -100 for l in sample_labels):
+            return {"sample_ids": [], "sample_labels": [], "length": 0}
 
-        if len(current_ids) + len(sample_ids) > max_seq_len:
-            pad_len = max_seq_len - len(current_ids)
-            chunk_ids = current_ids + [tokenizer.pad_token_id] * pad_len
-            chunk_labels = current_labels + [-100] * pad_len
-            chunk_mask = [1] * len(current_ids) + [0] * pad_len
+        return {
+            "sample_ids": sample_ids,
+            "sample_labels": sample_labels,
+            "length": len(sample_ids),
+        }
 
-            if any(lbl != -100 for lbl in chunk_labels):
-                clean_ids = [
-                    t if (0 <= t < vocab_size) else tokenizer.pad_token_id
-                    for t in chunk_ids
-                ]
-                clean_labels = [
-                    lbl if (0 <= lbl < vocab_size or lbl == -100) else -100
-                    for lbl in chunk_labels
-                ]
-
-                packed_samples.append({
-                    "input_ids": np.array(clean_ids, dtype=np.int32),
-                    "labels": np.array(clean_labels, dtype=np.int32),
-                    "attention_mask": np.array(chunk_mask, dtype=np.int8),
-                })
-
-            current_ids = []
-            current_labels = []
-
-        current_ids.extend(sample_ids)
-        current_labels.extend(sample_labels)
-
-    if current_ids:
-        pad_len = max_seq_len - len(current_ids)
-        chunk_ids = current_ids + [tokenizer.pad_token_id] * pad_len
-        chunk_labels = current_labels + [-100] * pad_len
-        chunk_mask = [1] * len(current_ids) + [0] * pad_len
-
-        if any(lbl != -100 for lbl in chunk_labels):
-            clean_ids = [
-                t if (0 <= t < vocab_size) else tokenizer.pad_token_id
-                for t in chunk_ids
-            ]
-            clean_labels = [
-                lbl if (0 <= lbl < vocab_size or lbl == -100) else -100
-                for lbl in chunk_labels
-            ]
-
-            packed_samples.append({
-                "input_ids": np.array(clean_ids, dtype=np.int32),
-                "labels": np.array(clean_labels, dtype=np.int32),
-                "attention_mask": np.array(chunk_mask, dtype=np.int8),
-            })
+    tokenized_ds = raw_dataset.map(
+        _tokenize_example,
+        remove_columns=raw_dataset.column_names,
+        num_proc=num_proc,
+        desc="Tokenizing ChatML",
+    )
+    tokenized_ds = tokenized_ds.filter(
+        lambda x: x["length"] > 0,
+        num_proc=num_proc,
+        desc="Filtering valid lengths",
+    )
 
     if local_rank == 0:
         logger.info(
-            f"✅ Packing complete: Created {len(packed_samples):,} whole-sample packed "
+            f"📦 Packing {len(tokenized_ds):,} valid conversations into "
+            f"{max_seq_len}-token sequences (Whole-Sample Packing)..."
+        )
+
+    packed_ids_list = []
+    packed_labels_list = []
+    packed_mask_list = []
+
+    current_ids = []
+    current_labels = []
+
+    def _flush_buffer(curr_i, curr_l):
+        valid_len = len(curr_i)
+        arr_ids = np.full(max_seq_len, pad_id, dtype=np.int32)
+        arr_labels = np.full(max_seq_len, -100, dtype=np.int32)
+        arr_mask = np.zeros(max_seq_len, dtype=np.int8)
+
+        arr_ids[:valid_len] = curr_i
+        arr_labels[:valid_len] = curr_l
+        arr_mask[:valid_len] = 1
+
+        # Sanitize out-of-bounds token IDs
+        invalid_id_mask = (arr_ids < 0) | (arr_ids >= vocab_size)
+        if np.any(invalid_id_mask):
+            arr_ids[invalid_id_mask] = pad_id
+
+        invalid_lbl_mask = ((arr_labels < 0) & (arr_labels != -100)) | (
+            arr_labels >= vocab_size
+        )
+        if np.any(invalid_lbl_mask):
+            arr_labels[invalid_lbl_mask] = -100
+
+        if np.any(arr_labels != -100):
+            packed_ids_list.append(arr_ids)
+            packed_labels_list.append(arr_labels)
+            packed_mask_list.append(arr_mask)
+
+    iterator = tqdm(
+        tokenized_ds,
+        desc="Packing Sequences",
+        disable=(local_rank != 0),
+        dynamic_ncols=True,
+    )
+
+    for item in iterator:
+        s_ids = item["sample_ids"]
+        s_lbls = item["sample_labels"]
+        s_len = item["length"]
+
+        if len(current_ids) + s_len > max_seq_len:
+            if current_ids:
+                _flush_buffer(current_ids, current_labels)
+            current_ids = list(s_ids)
+            current_labels = list(s_lbls)
+        else:
+            current_ids.extend(s_ids)
+            current_labels.extend(s_lbls)
+
+    if current_ids:
+        _flush_buffer(current_ids, current_labels)
+
+    if local_rank == 0:
+        logger.info(
+            f"✅ Packing complete: Created {len(packed_ids_list):,} whole-sample packed "
             f"{max_seq_len}-token sequences."
         )
 
-    return Dataset.from_list(packed_samples)
+    return Dataset.from_dict(
+        {
+            "input_ids": packed_ids_list,
+            "labels": packed_labels_list,
+            "attention_mask": packed_mask_list,
+        }
+    )
 
 
 def main():
@@ -302,7 +333,7 @@ def main():
     parser.add_argument(
         "--pretrained_model_path",
         type=str,
-        default="./checkpoints_lca_2.5B_32k",
+        default="./checkpoint-142000",
         help="Path to pre-trained/adapted BareTorch checkpoint folder.",
     )
     parser.add_argument(
@@ -320,8 +351,8 @@ def main():
     parser.add_argument(
         "--max_samples",
         type=int,
-        default=0,
-        help="Sub-sample N rows for fast iteration. Set to 0 for full dataset.",
+        default=600000,
+        help="Sub-sample N total rows for fast iteration. Set to 0 for full smoltalk epoch.",
     )
 
     # Optimization & Schedule
@@ -329,31 +360,37 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1,
-        help="Per-device batch size (default 1 for 32k context).",
+        default=4,
+        help="Per-device batch size (default 4 for 4096 context on H100).",
     )
     parser.add_argument(
         "--grad_accum",
         type=int,
         default=4,
-        help="Gradient accumulation steps (8 GPUs * 1 * 4 * 32k = 1.05M tokens/step).",
+        help="Gradient accumulation steps (8 GPUs * 4 * 4 * 4k = 524k tokens/step).",
     )
     parser.add_argument(
         "--learning_rate", type=float, default=2e-5, help="SFT learning rate."
     )
-    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=60)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument(
         "--seq_len",
         type=int,
-        default=32768,
-        help="Sequence context length (default 32k).",
+        default=4096,
+        help="Sequence context length (default 4096).",
     )
     parser.add_argument(
         "--rope_theta",
         type=float,
-        default=1000000.0,
+        default=10000.0,
         help="Rotary Position Embedding base frequency.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=False,
+        help="Apply targeted torch.compile to custom CS-LRAD recurrent sub-modules.",
     )
     parser.add_argument(
         "--grad_checkpointing",
@@ -381,15 +418,17 @@ def main():
         help="Prefix path inside R2 bucket.",
     )
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=100)
-    parser.add_argument("--eval_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=200)
+    parser.add_argument("--eval_steps", type=int, default=200)
 
     args = parser.parse_args()
 
     if local_rank == 0:
         logger.info(f"Initializing Tokenizer '{args.tokenizer_name}'...")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_name, trust_remote_code=True
+    )
     tokenizer.model_max_length = args.seq_len
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -411,9 +450,30 @@ def main():
 
     # Enforce RoPE theta and ensure the sinusoidal cache covers the full context span
     adapted_count = adapt_model_for_long_context(
-        model, model.config, target_seq_len=args.seq_len, target_rope_theta=args.rope_theta
+        model,
+        model.config,
+        target_seq_len=args.seq_len,
+        target_rope_theta=args.rope_theta,
     )
 
+    # Targeted torch.compile on custom CS-LRAD recurrent sub-modules (matching train_distill.py)
+    compiled_blocks = 0
+    if args.compile:
+        if local_rank == 0:
+            logger.info(
+                "⚡ Applying targeted torch.compile to custom CS-LRAD sub-modules..."
+            )
+        for name, module in model.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_blocks += 1
+        if local_rank == 0:
+            logger.info(
+                f"Successfully compiled {compiled_blocks} CS-LRAD recurrent sub-module(s)."
+            )
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     if local_rank == 0:
         logger.info("=" * 70)
         logger.info("🎯 BareTorch Supervised Fine-Tuning Engine (FSDP / FP32 Master)")
@@ -421,27 +481,60 @@ def main():
         logger.info(f"   ├─ Sequence Length       : {args.seq_len:,} tokens")
         logger.info(f"   ├─ RoPE Theta Base       : {args.rope_theta:,.0f}")
         logger.info(f"   ├─ Adapted RoPE Blocks   : {adapted_count}")
+        logger.info(f"   ├─ Compiled LRAD Modules : {compiled_blocks} (compile={args.compile})")
         logger.info(f"   ├─ Learning Rate         : {args.learning_rate}")
         logger.info(
             f"   └─ Batch per Step        : "
-            f"{8 * args.batch_size * args.grad_accum * args.seq_len:,} tokens"
+            f"{world_size * args.batch_size * args.grad_accum * args.seq_len:,} tokens"
         )
         logger.info("=" * 70)
 
     # --------------------------------------------------------------------------
     # Distributed Rank-0 Dataset Preparation and Disk Caching
     # --------------------------------------------------------------------------
-    cache_dir = os.path.join(args.output_dir, "packed_dataset")
+    cache_dir = os.path.join(
+        args.output_dir, f"packed_dataset_{args.seq_len}_{args.max_samples}"
+    )
 
     if local_rank == 0:
         if not os.path.exists(cache_dir):
-            logger.info("Loading SFT Datasets (50% Chat / 20% Code / 15% Math / 15% Reasoning)...")
+            logger.info(
+                "Loading SFT Datasets (50% Chat / 20% Code / 15% Math / 15% Reasoning)..."
+            )
 
             # 1. 50% Chat Anchor
             ds_chat = load_dataset("HuggingFaceTB/smoltalk", "all", split="train")
 
             # 2. 20% Code
-            ds_code = load_dataset("ise-uiuc/Magicoder-Evol-Instruct-110K", split="train")
+            ds_code = load_dataset(
+                "ise-uiuc/Magicoder-Evol-Instruct-110K", split="train"
+            )
+
+            # 3. 15% Math (NuminaMath-CoT with <think> tag injection)
+            ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train")
+
+            # 4. 15% DeepSeek-R1 Distilled Reasoning (Bespoke-Stratos-17k)
+            ds_reasoning = load_dataset(
+                "bespokelabs/Bespoke-Stratos-17k", split="train"
+            )
+
+            # Proportional Pre-Subsampling BEFORE expensive .map() if max_samples > 0
+            if args.max_samples > 0:
+                logger.info(
+                    f"✂️ Pre-slicing component datasets to target {args.max_samples:,} total rows..."
+                )
+                n_chat = min(len(ds_chat), int(args.max_samples * 0.55))
+                n_code = min(len(ds_code), int(args.max_samples * 0.22))
+                n_math = min(len(ds_math), int(args.max_samples * 0.18))
+                n_reas = min(len(ds_reasoning), int(args.max_samples * 0.18))
+
+                ds_chat = ds_chat.shuffle(seed=42).select(range(n_chat))
+                ds_code = ds_code.shuffle(seed=42).select(range(n_code))
+                ds_math = ds_math.shuffle(seed=42).select(range(n_math))
+                ds_reasoning = ds_reasoning.shuffle(seed=42).select(range(n_reas))
+
+            num_proc = max(1, min(16, (os.cpu_count() or 4) - 2))
+
             ds_code = ds_code.map(
                 lambda x: {
                     "messages": [
@@ -450,10 +543,8 @@ def main():
                     ]
                 },
                 remove_columns=ds_code.column_names,
+                num_proc=num_proc,
             )
-
-            # 3. 15% Math (NuminaMath-CoT with <think> tag injection)
-            ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train")
 
             def format_math_with_think(x):
                 problem = x["problem"]
@@ -474,10 +565,11 @@ def main():
                     ]
                 }
 
-            ds_math = ds_math.map(format_math_with_think, remove_columns=ds_math.column_names)
-
-            # 4. 15% DeepSeek-R1 Distilled Reasoning (Bespoke-Stratos-17k)
-            ds_reasoning = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train")
+            ds_math = ds_math.map(
+                format_math_with_think,
+                remove_columns=ds_math.column_names,
+                num_proc=num_proc,
+            )
 
             def format_stratos_reasoning(x):
                 if "messages" in x and x["messages"]:
@@ -488,9 +580,14 @@ def main():
                     reasoning = x.get("reasoning", "")
                     response = x.get("response", x.get("solution", ""))
 
-                    user_content = f"{system_msg}\n\n{user_q}".strip() if system_msg else user_q
+                    user_content = (
+                        f"{system_msg}\n\n{user_q}".strip() if system_msg else user_q
+                    )
                     if reasoning:
-                        assistant_content = f"<think>\n{reasoning.strip()}\n</think>\n\n{response.strip()}"
+                        assistant_content = (
+                            f"<think>\n{reasoning.strip()}\n</think>\n\n"
+                            f"{response.strip()}"
+                        )
                     else:
                         assistant_content = response.strip()
 
@@ -500,19 +597,25 @@ def main():
                     ]
                 return {"messages": messages}
 
-            ds_reasoning = ds_reasoning.map(format_stratos_reasoning, remove_columns=ds_reasoning.column_names)
+            ds_reasoning = ds_reasoning.map(
+                format_stratos_reasoning,
+                remove_columns=ds_reasoning.column_names,
+                num_proc=num_proc,
+            )
 
-            # Interleave into single dataset with 50/20/15/15 ratio
+            stop_strategy = (
+                "all_exhausted" if args.max_samples == 0 else "first_exhausted"
+            )
             raw_dataset = interleave_datasets(
                 [ds_chat, ds_code, ds_math, ds_reasoning],
                 probabilities=[0.50, 0.20, 0.15, 0.15],
                 seed=42,
-                stopping_strategy="all_exhausted",
+                stopping_strategy=stop_strategy,
             )
 
             if args.max_samples > 0 and len(raw_dataset) > args.max_samples:
                 logger.info(
-                    f"✂️ Sub-sampling dataset from {len(raw_dataset):,} rows to {args.max_samples:,} rows."
+                    f"✂️ Sub-sampling interleaved dataset from {len(raw_dataset):,} rows to {args.max_samples:,} rows."
                 )
                 raw_dataset = raw_dataset.select(range(args.max_samples))
 
@@ -522,7 +625,9 @@ def main():
             logger.info(f"💾 Caching packed dataset to '{cache_dir}'...")
             processed_dataset.save_to_disk(cache_dir)
         else:
-            logger.info(f"⚡ Found pre-packed dataset at '{cache_dir}'. Fast-loading from disk...")
+            logger.info(
+                f"⚡ Found pre-packed dataset at '{cache_dir}'. Fast-loading from disk..."
+            )
 
     # Synchronize all distributed workers before loading
     if torch.distributed.is_initialized():
@@ -568,7 +673,11 @@ def main():
         remove_unused_columns=False,
     )
 
-    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in ("1", "true", "yes")
+    enable_r2_sync = args.r2_sync or os.environ.get("R2_SYNC", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     r2_bucket = os.environ.get("R2_BUCKET", args.r2_bucket)
     r2_prefix = os.environ.get("R2_PREFIX", args.r2_prefix)
 
@@ -594,7 +703,9 @@ def main():
     checkpoint_to_resume = None
     if os.path.exists(training_args.output_dir):
         existing_checkpoints = [
-            d for d in os.listdir(training_args.output_dir) if d.startswith("checkpoint-")
+            d
+            for d in os.listdir(training_args.output_dir)
+            if d.startswith("checkpoint-")
         ]
         if existing_checkpoints:
             checkpoint_to_resume = True
@@ -611,7 +722,9 @@ def main():
 
     # All ranks participate in save_model so FSDP gathers sharded states cleanly
     if local_rank == 0:
-        logger.info(f"Gathering sharded FSDP weights and saving to '{args.output_dir}'...")
+        logger.info(
+            f"Gathering sharded FSDP weights and saving to '{args.output_dir}'..."
+        )
     trainer.save_model(args.output_dir)
 
     if local_rank == 0:
