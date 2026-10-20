@@ -9,7 +9,11 @@ from mlx.utils import tree_flatten
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.modeling_mlx.cs_lrad import LRADDecoderBlock
-from baretorch.modeling_mlx.transformer import RMSNorm, TransformerDecoderBlock, unwrap_kv_pair
+from baretorch.modeling_mlx.transformer import (
+    RMSNorm,
+    TransformerDecoderBlock,
+    unwrap_kv_pair,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,7 @@ class BareTorchModelMLX(nn.Module):
         super().__init__()
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.prefill_chunk_size = getattr(config, "prefill_chunk_size", 4096)
 
         layers = []
         for i in range(config.num_layers):
@@ -61,33 +66,31 @@ class BareTorchModelMLX(nn.Module):
         self.layers = layers
         self.final_norm = RMSNorm(config.d_model)
 
-    def __call__(
+    def _get_past_length(self, past_key_values: list | None) -> int:
+        if past_key_values is None:
+            return 0
+        for idx, layer_past in enumerate(past_key_values):
+            if isinstance(self.layers[idx], TransformerDecoderBlock):
+                pk, _ = unwrap_kv_pair(layer_past)
+                if pk is not None:
+                    return pk.shape[-2]
+        return 0
+
+    def _forward_chunk(
         self,
         input_ids: mx.array,
         past_key_values: list | None = None,
         attention_mask: mx.array | None = None,
         position_ids: mx.array | None = None,
         use_cache: bool = True,
-    ):
-        if past_key_values is not None and input_ids.shape[1] > 1:
-            input_ids = input_ids[:, -1:]
-
+    ) -> tuple[mx.array, list | None]:
         seq_length = input_ids.shape[1]
         is_prefill = seq_length > 1
         h = self.token_embedding(input_ids)
         next_cache = [] if use_cache else None
 
-        # Exact position_ids alignment with PyTorch BareTorchModel.forward
         if position_ids is None:
-            past_length = 0
-            if past_key_values is not None:
-                for idx, layer_past in enumerate(past_key_values):
-                    if isinstance(self.layers[idx], TransformerDecoderBlock):
-                        pk, _ = unwrap_kv_pair(layer_past)
-                        if pk is not None:
-                            past_length = pk.shape[-2]
-                            break
-
+            past_length = self._get_past_length(past_key_values)
             if attention_mask is not None and past_length == 0:
                 position_ids = mx.maximum(
                     mx.cumsum(attention_mask.astype(mx.int32), axis=-1) - 1, 0
@@ -127,6 +130,89 @@ class BareTorchModelMLX(nn.Module):
         h = self.final_norm(h)
         return h, next_cache
 
+    def __call__(
+        self,
+        input_ids: mx.array,
+        past_key_values: list | None = None,
+        attention_mask: mx.array | None = None,
+        position_ids: mx.array | None = None,
+        use_cache: bool = True,
+        num_logits_to_keep: int = 0,
+        prefill_chunk_size: int | None = None,
+    ) -> tuple[mx.array, list | None]:
+        if past_key_values is not None and input_ids.shape[1] > 1:
+            # Standard autoregressive decode guard when caller passes full sequence with existing cache
+            pass
+
+        seq_length = input_ids.shape[1]
+        chunk_limit = (
+            prefill_chunk_size
+            if prefill_chunk_size is not None
+            else self.prefill_chunk_size
+        )
+
+        # Automatic Chunked Prefill for long contexts (caps temporary activation memory)
+        if use_cache and chunk_limit and seq_length > chunk_limit:
+            past_length = self._get_past_length(past_key_values)
+            if position_ids is None:
+                if attention_mask is not None and past_length == 0:
+                    full_position_ids = mx.maximum(
+                        mx.cumsum(attention_mask.astype(mx.int32), axis=-1) - 1, 0
+                    )
+                else:
+                    full_position_ids = mx.arange(
+                        past_length, past_length + seq_length, dtype=mx.int32
+                    )[None, :]
+            else:
+                full_position_ids = position_ids
+
+            curr_cache = past_key_values
+            keep_only_last_chunk = (
+                num_logits_to_keep > 0 and num_logits_to_keep <= chunk_limit
+            )
+            collected_hidden = []
+            last_h = None
+
+            for start in range(0, seq_length, chunk_limit):
+                end = min(start + chunk_limit, seq_length)
+                chunk_ids = input_ids[:, start:end]
+                chunk_pos = full_position_ids[:, start:end]
+
+                if attention_mask is not None:
+                    # For CS-LRAD chunk_forward, pass the current chunk's mask slice
+                    chunk_mask = attention_mask[:, start:end]
+                else:
+                    chunk_mask = None
+
+                last_h, curr_cache = self._forward_chunk(
+                    input_ids=chunk_ids,
+                    past_key_values=curr_cache,
+                    attention_mask=chunk_mask,
+                    position_ids=chunk_pos,
+                    use_cache=True,
+                )
+
+                if not keep_only_last_chunk:
+                    if num_logits_to_keep > 0 and end <= seq_length - num_logits_to_keep:
+                        pass
+                    else:
+                        collected_hidden.append(last_h)
+
+                # Materialize updated recurrent/KV states and release chunk workspace buffers
+                mx.eval(last_h, curr_cache)
+
+            if keep_only_last_chunk:
+                return last_h, curr_cache
+            return mx.concatenate(collected_hidden, axis=1), curr_cache
+
+        return self._forward_chunk(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=use_cache,
+        )
+
 
 class BareTorchForCausalLMMLX(nn.Module):
     def __init__(self, config: BareTorchConfig):
@@ -143,6 +229,7 @@ class BareTorchForCausalLMMLX(nn.Module):
         position_ids: mx.array | None = None,
         use_cache: bool = True,
         num_logits_to_keep: int = 0,
+        prefill_chunk_size: int | None = None,
     ) -> tuple[mx.array, list | None]:
         hidden_states, next_cache = self.model(
             input_ids=input_ids,
@@ -150,6 +237,8 @@ class BareTorchForCausalLMMLX(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=use_cache,
+            num_logits_to_keep=num_logits_to_keep,
+            prefill_chunk_size=prefill_chunk_size,
         )
 
         if num_logits_to_keep > 0 and hidden_states.shape[1] > num_logits_to_keep:
@@ -179,19 +268,28 @@ class BareTorchForCausalLMMLX(nn.Module):
 
         if sf_files:
             for sf_f in sf_files:
-                logger.info(f"Loading MLX weights from safetensors: {os.path.basename(sf_f)}")
+                logger.info(
+                    f"Loading MLX weights from safetensors: {os.path.basename(sf_f)}"
+                )
                 raw_weights.update(mx.load(sf_f))
         else:
-            bin_files = sorted(glob.glob(os.path.join(checkpoint_dir, "pytorch_model*.bin")))
+            bin_files = sorted(
+                glob.glob(os.path.join(checkpoint_dir, "pytorch_model*.bin"))
+            )
             if bin_files:
                 import torch
+
                 for bin_f in bin_files:
-                    logger.info(f"Loading MLX weights from pytorch bin: {os.path.basename(bin_f)}")
+                    logger.info(
+                        f"Loading MLX weights from pytorch bin: {os.path.basename(bin_f)}"
+                    )
                     pt_state = torch.load(bin_f, map_location="cpu", weights_only=False)
                     for k, v in pt_state.items():
                         raw_weights[k] = mx.array(v.numpy())
             else:
-                raise FileNotFoundError(f"No .safetensors or pytorch_model*.bin weights found in {checkpoint_dir}")
+                raise FileNotFoundError(
+                    f"No .safetensors or pytorch_model*.bin weights found in {checkpoint_dir}"
+                )
 
         # 2. Normalize prefixes (FSDP, DDP, torch.compile)
         cleaned_weights = {}
@@ -199,7 +297,7 @@ class BareTorchForCausalLMMLX(nn.Module):
             clean_k = k
             for pfx in ["_fsdp_wrapped_module.", "module.", "_orig_mod."]:
                 if clean_k.startswith(pfx):
-                    clean_k = clean_k[len(pfx):]
+                    clean_k = clean_k[len(pfx) :]
 
             if not clean_k.startswith("model.") and clean_k != "lm_head.weight":
                 clean_k = f"model.{clean_k}"
@@ -215,7 +313,9 @@ class BareTorchForCausalLMMLX(nn.Module):
 
         # 4. Verify all model parameters (excluding non-persistent RoPE inv_freq) are present
         expected_keys = {
-            k for k, _ in tree_flatten(model.parameters()) if not k.endswith(".inv_freq")
+            k
+            for k, _ in tree_flatten(model.parameters())
+            if not k.endswith(".inv_freq")
         }
         missing_keys = expected_keys - set(cleaned_weights.keys())
         if missing_keys:

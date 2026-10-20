@@ -12,10 +12,7 @@ class RMSNorm(nn.Module):
     self.weight = mx.ones((d_model,))
 
   def __call__(self, x: mx.array) -> mx.array:
-    x_fp32 = x.astype(mx.float32)
-    variance = mx.mean(mx.square(x_fp32), axis=-1, keepdims=True)
-    x_norm = x_fp32 * mx.rsqrt(variance + self.eps)
-    return (x_norm * self.weight.astype(mx.float32)).astype(x.dtype)
+    return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class GatedMLP(nn.Module):
@@ -144,8 +141,8 @@ class CausalSelfAttention(nn.Module):
     v = mx.transpose(mx.reshape(self.W_v(x), (B, L, H_kv, d_h)), (0, 2, 1, 3))
 
     if self.use_qk_norm:
-      q = mx.transpose(self.q_norm(mx.transpose(q, (0, 2, 1, 3))), (0, 2, 1, 3))
-      k = mx.transpose(self.k_norm(mx.transpose(k, (0, 2, 1, 3))), (0, 2, 1, 3))
+      q = self.q_norm(q)
+      k = self.k_norm(k)
 
     q, k = self.rope.apply_rope(q, k, position_ids)
 
@@ -158,10 +155,10 @@ class CausalSelfAttention(nn.Module):
     scale = 1.0 / math.sqrt(d_h)
     total_k_len = k.shape[-2]
 
-    # Zero-allocation causal mask
+    # Zero-allocation causal mask for both unchunked and chunked prefill
     mask = None
     if L > 1:
-      if attention_mask is None and past_len == 0:
+      if attention_mask is None:
         mask = "causal"
       else:
         q_idx = mx.arange(past_len, past_len + L)
