@@ -17,7 +17,10 @@ import numpy as np
 from mlx.utils import tree_unflatten
 
 from baretorch.integration.configuration_baretorch import BareTorchConfig
-from baretorch.integration_mlx.modeling_baretorch import BareTorchForCausalLMMLX
+from baretorch.integration_mlx.modeling_baretorch import (
+    BareTorchForCausalLMMLX,
+    extract_baretorch_cache_arrays,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("benchmark_mlx_4bit")
@@ -114,69 +117,14 @@ def load_and_quantize_baretorch_mlx(
     group_size: int = 64,
     dtype=mx.float16,
 ) -> BareTorchForCausalLMMLX:
-    """
-    Safely loads BareTorch weights in batched chunks over the CPU stream to prevent
-    macOS Metal GPU watchdog timeouts (kIOGPUCommandBufferCallbackErrorTimeout) on
-    10.1 GB FP32 safetensors files, then quantizes layer-by-layer.
-    """
-    config_path = os.path.join(checkpoint_path, "config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg_dict = json.load(f)
-    config = BareTorchConfig(**cfg_dict)
-
-    model = BareTorchForCausalLMMLX(config)
-
-    sf_path = os.path.join(checkpoint_path, "model.safetensors")
-    logger.info(f"Loading safetensors via CPU stream from '{sf_path}'...")
-    raw_weights = mx.load(sf_path, stream=mx.cpu)
-
-    converted_items = []
-    batch_tensors = []
-    for k, v in raw_weights.items():
-        # Cast FP32/BF16 weights to target dtype on CPU stream so Metal GPU never stalls on disk I/O
-        if v.dtype in (mx.float32, mx.bfloat16) and (not k.endswith(".ln1.weight")) and (not k.endswith(".ln2.weight")) and (not k.endswith(".final_norm.weight")) and (not k.endswith("_norm.weight")):
-            v_cast = mx.astype(v, dtype, stream=mx.cpu)
-        elif v.dtype == mx.bfloat16:
-            v_cast = mx.astype(v, dtype, stream=mx.cpu)
-        else:
-            v_cast = v
-
-        converted_items.append((k, v_cast))
-        batch_tensors.append(v_cast)
-
-        if len(batch_tensors) >= 32:
-            mx.eval(batch_tensors)
-            batch_tensors.clear()
-
-    if batch_tensors:
-        mx.eval(batch_tensors)
-        batch_tensors.clear()
-
-    del raw_weights
-    gc.collect()
-
-    if getattr(config, "tie_word_embeddings", False):
-        weight_keys = {k for k, _ in converted_items}
-        if "lm_head.weight" not in weight_keys:
-            for k, v in converted_items:
-                if k == "model.token_embedding.weight":
-                    converted_items.append(("lm_head.weight", v))
-                    break
-
-    model.update(tree_unflatten(converted_items))
-    del converted_items
-    flush_mlx_cache()
-
+    model = BareTorchForCausalLMMLX.from_pretrained(
+        checkpoint_path, dtype=dtype, fuse=True
+    )
     if bits in (4, 8):
-        logger.info(f"Quantizing BareTorch to {bits}-bit (group_size={group_size}) via mlx.nn.quantize...")
+        logger.info(
+            f"Quantizing fused BareTorch to {bits}-bit (group_size={group_size}) via mlx.nn.quantize..."
+        )
         quantize_mlx_model_in_place(model, bits=bits, group_size=group_size)
-    else:
-        for layer in model.model.layers:
-            mx.eval(layer.parameters())
-            mx.synchronize()
-        mx.eval(model.parameters())
-        mx.synchronize()
-
     reset_mlx_memory_stats()
     return model
 
@@ -195,12 +143,12 @@ def benchmark_baretorch_mlx_at_context(
     for _ in range(warmup):
         logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
         tok = mx.argmax(logits[:, -1:, :], axis=-1)
-        mx.eval(tok, past_kv)
+        mx.eval(tok, extract_baretorch_cache_arrays(past_kv))
 
         for _ in range(min(4, gen_tokens)):
             logits, past_kv = model(tok, past_key_values=past_kv, use_cache=True)
             tok = mx.argmax(logits[:, -1:, :], axis=-1)
-            mx.eval(tok, past_kv)
+            mx.eval(tok, extract_baretorch_cache_arrays(past_kv))
         del logits, past_kv, tok
     reset_mlx_memory_stats()
 
@@ -217,7 +165,7 @@ def benchmark_baretorch_mlx_at_context(
         t0 = time.perf_counter()
 
         logits, past_kv = model(synth_input, use_cache=True, num_logits_to_keep=1)
-        mx.eval(logits, past_kv)
+        mx.eval(logits, extract_baretorch_cache_arrays(past_kv))
         mx.synchronize()
 
         ttft_ms = (time.perf_counter() - t0) * 1000.0
@@ -227,7 +175,6 @@ def benchmark_baretorch_mlx_at_context(
         mx.eval(next_tok)
         del logits
 
-        # Record prefill high-water mark BEFORE flushing dead buffers for decode
         prefill_peak_gb = get_mlx_peak_memory_gb()
         flush_mlx_cache()
 
@@ -238,7 +185,7 @@ def benchmark_baretorch_mlx_at_context(
         for _ in range(gen_tokens):
             logits, past_kv = model(next_tok, past_key_values=past_kv, use_cache=True)
             next_tok = mx.argmax(logits[:, -1:, :], axis=-1)
-            mx.eval(next_tok, past_kv)
+            mx.eval(next_tok, extract_baretorch_cache_arrays(past_kv))
 
         mx.synchronize()
         dec_time_ms = (time.perf_counter() - t_start_dec) * 1000.0

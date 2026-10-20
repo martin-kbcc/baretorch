@@ -1,8 +1,37 @@
-# baretorch/modeling_mlx/cs_lrad.py
+# /home/martinkb/Desktop/BareTorch_F/baretorch/modeling_mlx/cs_lrad.py
+from functools import partial
 import math
 import mlx.core as mx
 import mlx.nn as nn
-from baretorch.modeling_mlx.transformer import GatedMLP, RMSNorm
+from baretorch.modeling_mlx.transformer import GatedMLP, RMSNorm, fused_swiglu
+
+
+@partial(mx.compile, shapeless=True)
+def _compiled_step_gates(gate_raw: mx.array, beta_raw: mx.array):
+    gate = mx.clip(mx.sigmoid(gate_raw.astype(mx.float32)), 1e-4, 0.9999)
+    beta_gate = mx.sigmoid(beta_raw.astype(mx.float32))
+    log_gate = mx.log(gate)
+    return log_gate, beta_gate
+
+
+@partial(mx.compile, shapeless=True)
+def _compiled_step_attn(
+    Q: mx.array,
+    R: mx.array,
+    all_k: mx.array,
+    all_v: mx.array,
+    all_lambda: mx.array,
+    lambda_curr: mx.array,
+    past_S: mx.array,
+    scaling: float,
+):
+    exp_lambda_curr = mx.exp(mx.clip(lambda_curr, -30.0, 0.0))
+    diff = lambda_curr - mx.transpose(all_lambda, (0, 1, 3, 2))
+    m_links = mx.exp(mx.clip(diff, -1e4, 0.0))
+    attn_weights = (Q.astype(mx.float32) @ mx.transpose(all_k, (0, 1, 3, 2))) * scaling * m_links
+    Y_local = attn_weights @ all_v
+    Y_global = (R.astype(mx.float32) * exp_lambda_curr) @ past_S * scaling
+    return (Y_local + Y_global).astype(Q.dtype)
 
 
 class LowRankAssociativeDeltaEngine(nn.Module):
@@ -14,17 +43,80 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         self.r = rank
         self.d_head = d_model // num_heads
         self.inner_dim = self.num_heads * self.d_head
+        self.ur_dim = self.num_heads * self.r
 
         # Unfused parameter projections matching PyTorch weights 1-to-1
         self.W_q = nn.Linear(d_model, self.inner_dim, bias=False)
         self.W_k = nn.Linear(d_model, self.inner_dim, bias=False)
         self.W_v = nn.Linear(d_model, self.inner_dim, bias=False)
-        self.W_u = nn.Linear(d_model, self.num_heads * self.r, bias=False)
-        self.W_r = nn.Linear(d_model, self.num_heads * self.r, bias=False)
+        self.W_u = nn.Linear(d_model, self.ur_dim, bias=False)
+        self.W_r = nn.Linear(d_model, self.ur_dim, bias=False)
         self.W_gate = nn.Linear(d_model, self.num_heads, bias=True)
         self.W_beta_gate = nn.Linear(d_model, self.num_heads, bias=True)
         self.W_swish_gate = nn.Linear(d_model, self.inner_dim, bias=False)
         self.W_out = nn.Linear(self.inner_dim, d_model, bias=False)
+
+        # Optional fused projections (populated via fuse_weights() for single-dispatch speed)
+        self.W_qkvurs = None
+        self.W_gates = None
+
+    def fuse_weights(self):
+        """
+        Fuses the 6 bias-free input projections (W_q, W_k, W_v, W_u, W_r, W_swish_gate)
+        into a single W_qkvurs GEMM and the 2 gate projections into W_gates.
+        Reduces Metal kernel launches in CS-LRAD from 9 to 3 per layer!
+        """
+        if self.W_qkvurs is None and hasattr(self, "W_q"):
+            total_out = 4 * self.inner_dim + 2 * self.ur_dim
+            fused_w = mx.concatenate(
+                [
+                    self.W_q.weight,
+                    self.W_k.weight,
+                    self.W_v.weight,
+                    self.W_u.weight,
+                    self.W_r.weight,
+                    self.W_swish_gate.weight,
+                ],
+                axis=0,
+            )
+            self.W_qkvurs = nn.Linear(self.d_model, total_out, bias=False)
+            self.W_qkvurs.weight = fused_w
+            mx.eval(self.W_qkvurs.weight)
+            del self.W_q, self.W_k, self.W_v, self.W_u, self.W_r, self.W_swish_gate
+
+        if self.W_gates is None and hasattr(self, "W_gate"):
+            gates_w = mx.concatenate([self.W_gate.weight, self.W_beta_gate.weight], axis=0)
+            gates_b = mx.concatenate([self.W_gate.bias, self.W_beta_gate.bias], axis=0)
+            self.W_gates = nn.Linear(self.d_model, 2 * self.num_heads, bias=True)
+            self.W_gates.weight = gates_w
+            self.W_gates.bias = gates_b
+            mx.eval(self.W_gates.weight, self.W_gates.bias)
+            del self.W_gate, self.W_beta_gate
+
+    def _project_inputs(self, x_in: mx.array):
+        if self.W_qkvurs is not None:
+            d = self.inner_dim
+            ur = self.ur_dim
+            proj = self.W_qkvurs(x_in)
+            q_raw, k_raw, v_raw, u_raw, r_raw, swish_raw = mx.split(
+                proj, [d, 2 * d, 3 * d, 3 * d + ur, 3 * d + 2 * ur], axis=-1
+            )
+        else:
+            q_raw = self.W_q(x_in)
+            k_raw = self.W_k(x_in)
+            v_raw = self.W_v(x_in)
+            u_raw = self.W_u(x_in)
+            r_raw = self.W_r(x_in)
+            swish_raw = self.W_swish_gate(x_in)
+
+        if self.W_gates is not None:
+            gates_raw = self.W_gates(x_in)
+            g_raw, bg_raw = mx.split(gates_raw, 2, axis=-1)
+        else:
+            g_raw = self.W_gate(x_in)
+            bg_raw = self.W_beta_gate(x_in)
+
+        return q_raw, k_raw, v_raw, u_raw, r_raw, swish_raw, g_raw, bg_raw
 
     def chunk_forward(self, x: mx.array, attention_mask: mx.array | None = None, use_cache: bool = True):
         B, L, D = x.shape
@@ -52,16 +144,18 @@ class LowRankAssociativeDeltaEngine(nn.Module):
             mask_padded = mx.reshape((seq_idx < L).astype(mx.float32), (1, N, C))
             mask_5d = mx.expand_dims(mx.expand_dims(mask_padded, axis=1), axis=-1)
 
-        Q = mx.transpose(mx.reshape(nn.silu(self.W_q(x_padded)), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        K = mx.transpose(mx.reshape(nn.silu(self.W_k(x_padded)), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        V = mx.transpose(mx.reshape(self.W_v(x_padded), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
-        U = mx.transpose(mx.reshape(self.W_u(x_padded), (B, N, C, H, r)), (0, 3, 1, 2, 4))
-        R = mx.transpose(mx.reshape(self.W_r(x_padded), (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        q_raw, k_raw, v_raw, u_raw, r_raw, swish_raw, g_raw, bg_raw = self._project_inputs(x_padded)
+
+        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        V = mx.transpose(mx.reshape(v_raw, (B, N, C, H, d_h)), (0, 3, 1, 2, 4))
+        U = mx.transpose(mx.reshape(u_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
+        R = mx.transpose(mx.reshape(r_raw, (B, N, C, H, r)), (0, 3, 1, 2, 4))
 
         gate_fp32 = mx.expand_dims(
             mx.transpose(
                 mx.reshape(
-                    mx.clip(mx.sigmoid(self.W_gate(x_padded).astype(mx.float32)), 1e-4, 0.9999),
+                    mx.clip(mx.sigmoid(g_raw.astype(mx.float32)), 1e-4, 0.9999),
                     (B, N, C, H),
                 ),
                 (0, 3, 1, 2),
@@ -70,7 +164,7 @@ class LowRankAssociativeDeltaEngine(nn.Module):
         )
         beta_gate_fp32 = mx.expand_dims(
             mx.transpose(
-                mx.reshape(mx.sigmoid(self.W_beta_gate(x_padded).astype(mx.float32)), (B, N, C, H)),
+                mx.reshape(mx.sigmoid(bg_raw.astype(mx.float32)), (B, N, C, H)),
                 (0, 3, 1, 2),
             ),
             axis=-1,
@@ -120,8 +214,9 @@ class LowRankAssociativeDeltaEngine(nn.Module):
             mx.transpose(Y_local + Y_global, (0, 2, 3, 1, 4)), (B, N * C, self.inner_dim)
         ).astype(x.dtype)
         Out = Out[:, :L, :]
+        swish_cropped = swish_raw[:, :L, :]
 
-        output = self.W_out(Out * nn.silu(self.W_swish_gate(x)))
+        output = self.W_out(fused_swiglu(swish_cropped, Out))
 
         next_cache = None
         if use_cache:
@@ -169,35 +264,23 @@ class LowRankAssociativeDeltaEngine(nn.Module):
 
         if past_S is None:
             past_S = mx.zeros((B, H, r, d_h), dtype=mx.float32)
-        else:
+        elif past_S.dtype != mx.float32:
             past_S = past_S.astype(mx.float32)
 
         if L > 1:
             return self.chunk_forward(x, attention_mask=attention_mask, use_cache=use_cache)
 
-        Q = mx.transpose(mx.reshape(nn.silu(self.W_q(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        K = mx.transpose(mx.reshape(nn.silu(self.W_k(x)), (B, L, H, d_h)), (0, 2, 1, 3))
-        V = mx.transpose(mx.reshape(self.W_v(x), (B, L, H, d_h)), (0, 2, 1, 3))
-        U = mx.transpose(mx.reshape(self.W_u(x), (B, L, H, r)), (0, 2, 1, 3))
-        R = mx.transpose(mx.reshape(self.W_r(x), (B, L, H, r)), (0, 2, 1, 3))
+        q_raw, k_raw, v_raw, u_raw, r_raw, swish_raw, g_raw, bg_raw = self._project_inputs(x)
 
-        gate = mx.expand_dims(
-            mx.transpose(
-                mx.reshape(
-                    mx.clip(mx.sigmoid(self.W_gate(x).astype(mx.float32)), 1e-4, 0.9999), (B, L, H)
-                ),
-                (0, 2, 1),
-            ),
-            axis=-1,
-        )
-        beta_gate = mx.expand_dims(
-            mx.transpose(
-                mx.reshape(mx.sigmoid(self.W_beta_gate(x).astype(mx.float32)), (B, L, H)),
-                (0, 2, 1),
-            ),
-            axis=-1,
-        )
-        log_gate = mx.log(gate)
+        Q = mx.transpose(mx.reshape(nn.silu(q_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        K = mx.transpose(mx.reshape(nn.silu(k_raw), (B, L, H, d_h)), (0, 2, 1, 3))
+        V = mx.transpose(mx.reshape(v_raw, (B, L, H, d_h)), (0, 2, 1, 3))
+        U = mx.transpose(mx.reshape(u_raw, (B, L, H, r)), (0, 2, 1, 3))
+        R = mx.transpose(mx.reshape(r_raw, (B, L, H, r)), (0, 2, 1, 3))
+
+        log_gate_3d, beta_gate_3d = _compiled_step_gates(g_raw, bg_raw)
+        log_gate = mx.expand_dims(mx.transpose(log_gate_3d, (0, 2, 1)), axis=-1)
+        beta_gate = mx.expand_dims(mx.transpose(beta_gate_3d, (0, 2, 1)), axis=-1)
 
         if buf_lambda is not None:
             last_lambda = buf_lambda[:, :, -1:, :]
@@ -213,18 +296,9 @@ class LowRankAssociativeDeltaEngine(nn.Module):
             all_v = V.astype(mx.float32)
             all_u = U.astype(mx.float32) * beta_gate
 
-        exp_lambda_curr = mx.exp(mx.clip(lambda_curr, -30.0, 0.0))
-        diff = lambda_curr - mx.transpose(all_lambda, (0, 1, 3, 2))
-        m_links = mx.exp(mx.clip(diff, -1e4, 0.0))
-        attn_weights = (Q.astype(mx.float32) @ mx.transpose(all_k, (0, 1, 3, 2))) * scaling * m_links
-        Y_local = attn_weights @ all_v
-
-        Y_global = (R.astype(mx.float32) * exp_lambda_curr) @ past_S * scaling
-
-        Out = mx.reshape(
-            mx.transpose(Y_local + Y_global, (0, 2, 1, 3)), (B, 1, self.inner_dim)
-        ).astype(x.dtype)
-        output = self.W_out(Out * nn.silu(self.W_swish_gate(x)))
+        Y_comb = _compiled_step_attn(Q, R, all_k, all_v, all_lambda, lambda_curr, past_S, scaling)
+        Out = mx.reshape(mx.transpose(Y_comb, (0, 2, 1, 3)), (B, 1, self.inner_dim))
+        output = self.W_out(fused_swiglu(swish_raw, Out))
 
         curr_c = all_k.shape[2]
         if curr_c >= C:
@@ -261,6 +335,10 @@ class LRADDecoderBlock(nn.Module):
         self.attn = LowRankAssociativeDeltaEngine(d_model, num_heads, chunk_size=chunk_size, rank=rank)
         self.ln2 = RMSNorm(d_model)
         self.mlp = GatedMLP(d_model, d_ff=int(d_model * 3.5))
+
+    def fuse_weights(self):
+        self.attn.fuse_weights()
+        self.mlp.fuse_weights()
 
     def __call__(
         self,
