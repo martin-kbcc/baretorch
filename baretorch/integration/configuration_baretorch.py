@@ -1,18 +1,19 @@
-from transformers import PretrainedConfig, AutoConfig
+# /home/martinkb/Desktop/BareTorch_F/baretorch/integration/configuration_baretorch.py
+from transformers import AutoConfig, PretrainedConfig
 
-# Direct absolute imports of our core modular configurations
-from baretorch.modeling.cs_lrad import CSLRADConfig
-from baretorch.modeling.transformer import TransformerConfig
+try:
+    from baretorch.modeling.cs_lrad import CSLRADConfig
+    from baretorch.modeling.transformer import TransformerConfig
+except ImportError:
+    from .cs_lrad import CSLRADConfig
+    from .transformer import TransformerConfig
 
-
-# ==========================================
-# 1. Master Unified BareTorch Configuration
-# ==========================================
 
 class BareTorchConfig(PretrainedConfig):
     """
     Unified Master Configuration for the BareTorch Framework.
     """
+
     model_type = "baretorch"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -29,6 +30,7 @@ class BareTorchConfig(PretrainedConfig):
         max_seq_len=4096,
         use_grad_checkpointing=False,
         use_qk_norm=False,
+        rope_theta=10000.0,
         layer_types=None,
         pad_token_id=0,
         bos_token_id=1,
@@ -55,18 +57,22 @@ class BareTorchConfig(PretrainedConfig):
         self.max_seq_len = max_seq_len
         self.use_grad_checkpointing = use_grad_checkpointing
         self.use_qk_norm = use_qk_norm
+        self.rope_theta = rope_theta
         self.use_cache = kwargs.get("use_cache", True)
 
-        # Explicit auto_map attribute for Hugging Face integration compatibility
-        self.auto_map = auto_map if auto_map is not None else {
-            "AutoConfig": "baretorch.BareTorchConfig",
-            "AutoModelForCausalLM": "baretorch.BareTorchForCausalLM",
-        }
+        self.auto_map = (
+            auto_map
+            if auto_map is not None
+            else {
+                "AutoConfig": "configuration_baretorch.BareTorchConfig",
+                "AutoModel": "modeling_baretorch.BareTorchModel",
+                "AutoModelForCausalLM": "modeling_baretorch.BareTorchForCausalLM",
+            }
+        )
 
         if layer_types is None:
             self.layer_types = []
             for i in range(num_layers):
-                # Default 3:1 ratio (3 CS-LRAD layers for every 1 Transformer layer)
                 if (i + 1) % 4 == 0:
                     self.layer_types.append("transformer")
                 else:
@@ -75,10 +81,13 @@ class BareTorchConfig(PretrainedConfig):
             self.layer_types = layer_types
 
 
-# ==========================================
-# 2. Hugging Face Global AutoConfig Registration
-# ==========================================
-
-AutoConfig.register("baretorch", BareTorchConfig)
-AutoConfig.register("cs_lrad", CSLRADConfig)
-AutoConfig.register("transformer", TransformerConfig)
+try:
+    AutoConfig.register("baretorch", BareTorchConfig, exist_ok=True)
+    AutoConfig.register("cs_lrad", CSLRADConfig, exist_ok=True)
+    AutoConfig.register("transformer", TransformerConfig, exist_ok=True)
+except TypeError:
+    # Fallback for older transformers versions without exist_ok
+    try:
+        AutoConfig.register("baretorch", BareTorchConfig)
+    except ValueError:
+        pass

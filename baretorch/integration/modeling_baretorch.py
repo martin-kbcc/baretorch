@@ -1,4 +1,4 @@
-# baretorch/integration/modeling_baretorch.py
+# /home/martinkb/Desktop/BareTorch_F/baretorch/integration/modeling_baretorch.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,20 +13,36 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
-from baretorch.integration.configuration_baretorch import (
-    BareTorchConfig,
-    CSLRADConfig,
-    TransformerConfig,
-)
-from baretorch.modeling.cs_lrad import (
-    CSLRADForCausalLM,
-    LRADDecoderBlock,
-)
-from baretorch.modeling.transformer import (
-    RMSNorm,
-    TransformerDecoderBlock,
-    TransformerForCausalLM,
-)
+try:
+    from baretorch.integration.configuration_baretorch import (
+        BareTorchConfig,
+        CSLRADConfig,
+        TransformerConfig,
+    )
+    from baretorch.modeling.cs_lrad import (
+        CSLRADForCausalLM,
+        LRADDecoderBlock,
+    )
+    from baretorch.modeling.transformer import (
+        RMSNorm,
+        TransformerDecoderBlock,
+        TransformerForCausalLM,
+    )
+except ImportError:
+    from .configuration_baretorch import (
+        BareTorchConfig,
+        CSLRADConfig,
+        TransformerConfig,
+    )
+    from .cs_lrad import (
+        CSLRADForCausalLM,
+        LRADDecoderBlock,
+    )
+    from .transformer import (
+        RMSNorm,
+        TransformerDecoderBlock,
+        TransformerForCausalLM,
+    )
 
 
 class BareTorchPreTrainedModel(PreTrainedModel):
@@ -69,7 +85,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
         self.config = config
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(config.dropout)
-        
+
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
             layer_type = config.layer_types[i]
@@ -82,7 +98,7 @@ class BareTorchModel(BareTorchPreTrainedModel):
                     max_seq_len=config.max_seq_len,
                     use_grad_checkpointing=config.use_grad_checkpointing,
                     use_qk_norm=getattr(config, "use_qk_norm", False),
-                    rope_theta=getattr(config, "rope_theta", 10000.0)
+                    rope_theta=getattr(config, "rope_theta", 10000.0),
                 )
             elif layer_type == "cs_lrad":
                 block = LRADDecoderBlock(
@@ -91,12 +107,12 @@ class BareTorchModel(BareTorchPreTrainedModel):
                     chunk_size=config.chunk_size,
                     rank=config.rank,
                     dropout=config.dropout,
-                    use_grad_checkpointing=config.use_grad_checkpointing
+                    use_grad_checkpointing=config.use_grad_checkpointing,
                 )
             else:
                 raise ValueError(f"Unsupported layer type '{layer_type}' at index {i}")
             self.layers.append(block)
-            
+
         self.final_norm = RMSNorm(config.d_model)
         self.post_init()
 
@@ -118,15 +134,25 @@ class BareTorchModel(BareTorchPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
@@ -143,40 +169,65 @@ class BareTorchModel(BareTorchPreTrainedModel):
 
         h = self.drop(inputs_embeds)
         next_decoder_cache = [] if use_cache else None
-        
+
         if position_ids is None:
             past_length = 0
             if past_key_values is not None:
                 for idx, layer_past in enumerate(past_key_values):
                     if isinstance(self.layers[idx], TransformerDecoderBlock):
-                        if isinstance(layer_past, tuple) and len(layer_past) > 0 and layer_past[0] is not None:
+                        if (
+                            isinstance(layer_past, tuple)
+                            and len(layer_past) > 0
+                            and layer_past[0] is not None
+                        ):
                             p_item = layer_past[0]
-                            while isinstance(p_item, (tuple, list)) and len(p_item) > 0:
+                            while (
+                                isinstance(p_item, (tuple, list)) and len(p_item) > 0
+                            ):
                                 p_item = p_item[0]
                             if isinstance(p_item, torch.Tensor):
                                 past_length = p_item.size(-2)
                                 break
-                        
+
             if attention_mask is not None and past_length == 0:
                 position_ids = (torch.cumsum(attention_mask, dim=-1) - 1).clamp(min=0)
             else:
                 position_ids = torch.arange(
-                    past_length, past_length + seq_length, dtype=torch.long, device=inputs_embeds.device
+                    past_length,
+                    past_length + seq_length,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
                 ).unsqueeze(0)
 
+        # During single-token cached decoding with batch_size == 1, omit growing 1D mask
+        # to prevent dynamic shape recompilations in torch.compile
+        layer_attention_mask = attention_mask
+        if past_key_values is not None and seq_length == 1 and batch_size == 1:
+            layer_attention_mask = None
+
         all_hidden_states = () if output_hidden_states else None
-        
+
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (h,)
-                
+
             past_state = past_key_values[i] if past_key_values is not None else None
-            
+
             if isinstance(layer, TransformerDecoderBlock):
-                h, next_state = layer(h, past_kv=past_state, position_ids=position_ids, attention_mask=attention_mask)
+                h, next_state = layer(
+                    h,
+                    past_kv=past_state,
+                    position_ids=position_ids,
+                    attention_mask=layer_attention_mask,
+                )
             elif isinstance(layer, LRADDecoderBlock):
-                h, next_state = layer(h, past_state=past_state, use_cache=use_cache, attention_mask=attention_mask)
-                
+                h, next_state = layer(
+                    h,
+                    past_state=past_state,
+                    use_cache=use_cache,
+                    attention_mask=layer_attention_mask,
+                )
+
             if use_cache:
                 next_decoder_cache.append(next_state)
 
@@ -186,7 +237,11 @@ class BareTorchModel(BareTorchPreTrainedModel):
             all_hidden_states = all_hidden_states + (h,)
 
         if not return_dict:
-            return tuple(v for v in [h, next_decoder_cache, all_hidden_states] if v is not None)
+            return tuple(
+                v
+                for v in [h, next_decoder_cache, all_hidden_states]
+                if v is not None
+            )
 
         return BaseModelOutputWithPast(
             last_hidden_state=h,
@@ -226,6 +281,16 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
 
+    def compile_lrad(self):
+        """Compiles all CS-LRAD recurrent modules using torch.compile for maximum CUDA throughput."""
+        compiled_count = 0
+        for name, module in self.named_modules():
+            cls_name = module.__class__.__name__.lower()
+            if "lrad" in cls_name or "lrad" in name.lower():
+                module.forward = torch.compile(module.forward)
+                compiled_count += 1
+        return compiled_count
+
     def forward(
         self,
         input_ids=None,
@@ -240,7 +305,9 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         return_dict=None,
         num_logits_to_keep: int = 0,
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -256,14 +323,18 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
 
         hidden_states = outputs[0]
 
-        if num_logits_to_keep > 0 and hidden_states.size(1) > num_logits_to_keep:
+        if (
+            labels is None
+            and num_logits_to_keep > 0
+            and hidden_states.size(1) > num_logits_to_keep
+        ):
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
 
         logits = self.lm_head(hidden_states)
 
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
+        if self.training:
             logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        
+
         logits = torch.clamp(logits, min=-50.0, max=50.0)
 
         loss = None
@@ -271,7 +342,9 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -286,14 +359,23 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, position_ids=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        position_ids=None,
+        **kwargs,
     ):
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
         cache_position = kwargs.get("cache_position", None)
         if cache_position is not None and past_key_values is not None:
-            position_ids = cache_position[-1:].unsqueeze(0) if cache_position.dim() == 1 else cache_position
+            position_ids = (
+                cache_position[-1:].unsqueeze(0)
+                if cache_position.dim() == 1
+                else cache_position
+            )
 
         if position_ids is not None:
             position_ids = position_ids.to(input_ids.device)
@@ -304,25 +386,29 @@ class BareTorchForCausalLM(BareTorchPreTrainedModel, GenerationMixin):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "use_cache": kwargs.get("use_cache", True),
+            "num_logits_to_keep": kwargs.get("num_logits_to_keep", 1),
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
-      if past_key_values is None:
-        return None
+        if past_key_values is None:
+            return None
 
-      def _reorder_item(item):
-        if isinstance(item, torch.Tensor):
-          return item.index_select(0, beam_idx)
-        elif isinstance(item, (tuple, list)):
-          return tuple(_reorder_item(x) for x in item)
-        return item
+        def _reorder_item(item):
+            if isinstance(item, torch.Tensor):
+                return item.index_select(0, beam_idx)
+            elif isinstance(item, (tuple, list)):
+                return tuple(_reorder_item(x) for x in item)
+            return item
 
-      return tuple(
-          _reorder_item(layer_past) for layer_past in past_key_values
-      )
+        return tuple(
+            _reorder_item(layer_past) for layer_past in past_key_values
+        )
 
 
-AutoModel.register(BareTorchConfig, BareTorchModel)
-AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM)
-AutoModelForCausalLM.register(CSLRADConfig, CSLRADForCausalLM)
-AutoModelForCausalLM.register(TransformerConfig, TransformerForCausalLM)
+try:
+    AutoModel.register(BareTorchConfig, BareTorchModel, exist_ok=True)
+    AutoModelForCausalLM.register(BareTorchConfig, BareTorchForCausalLM, exist_ok=True)
+    AutoModelForCausalLM.register(CSLRADConfig, CSLRADForCausalLM, exist_ok=True)
+    AutoModelForCausalLM.register(TransformerConfig, TransformerForCausalLM, exist_ok=True)
+except TypeError:
+    pass

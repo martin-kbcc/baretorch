@@ -4,8 +4,12 @@ import csv
 import json
 import os
 import shutil
+import torch
+from safetensors.torch import load_file, save_file
 from huggingface_hub import HfApi, create_repo
 from transformers import AutoTokenizer
+
+GITHUB_REPO_URL = "https://github.com/martin-kbcc/baretorch"
 
 BENCHMARK_TASKS = [
     ("boolq", "BoolQ (Reading Comprehension)", "acc,none", 64.10, 63.00),
@@ -28,14 +32,92 @@ DEFAULT_CUDA_ROWS = [
 ]
 
 DEFAULT_MLX_ROWS = [
-    {"context_len": 512, "bt_ttft": 415.2, "bt_prefill": 1233.1, "bt_decode": 31.45, "bt_ram": 5.24, "qw_ttft": 912.4, "qw_prefill": 561.2, "qw_decode": 16.80, "qw_ram": 3.92},
-    {"context_len": 1024, "bt_ttft": 801.5, "bt_prefill": 1277.6, "bt_decode": 31.28, "bt_ram": 5.24, "qw_ttft": 1810.2, "qw_prefill": 565.7, "qw_decode": 16.65, "qw_ram": 3.92},
-    {"context_len": 2048, "bt_ttft": 1588.8, "bt_prefill": 1289.0, "bt_decode": 31.10, "bt_ram": 5.24, "qw_ttft": 3663.7, "qw_prefill": 559.0, "qw_decode": 16.50, "qw_ram": 3.92},
-    {"context_len": 4096, "bt_ttft": 3172.4, "bt_prefill": 1291.1, "bt_decode": 30.42, "bt_ram": 5.24, "qw_ttft": 8124.5, "qw_prefill": 504.2, "qw_decode": 15.60, "qw_ram": 3.92},
-    {"context_len": 8192, "bt_ttft": 6350.4, "bt_prefill": 1290.0, "bt_decode": 29.70, "bt_ram": 5.24, "qw_ttft": 18912.0, "qw_prefill": 433.2, "qw_decode": 14.30, "qw_ram": 3.92},
-    {"context_len": 16384, "bt_ttft": 12928.0, "bt_prefill": 1267.3, "bt_decode": 28.50, "bt_ram": 5.24, "qw_ttft": 45896.0, "qw_prefill": 357.0, "qw_decode": 11.70, "qw_ram": 3.92},
-    {"context_len": 32768, "bt_ttft": 30520.0, "bt_prefill": 1073.7, "bt_decode": 25.90, "bt_ram": 5.24, "qw_ttft": 114007.0, "qw_prefill": 287.4, "qw_decode": 7.90, "qw_ram": 3.92},
+    {"context_len": 512, "bt_ttft": 416.39, "bt_prefill": 1229.62, "bt_decode": 35.78, "bt_ram": 4.80, "qw_ttft": 1192.24, "qw_prefill": 429.44, "qw_decode": 27.05, "qw_ram": 3.54},
+    {"context_len": 1024, "bt_ttft": 773.78, "bt_prefill": 1323.37, "bt_decode": 35.67, "bt_ram": 4.87, "qw_ttft": 2384.76, "qw_prefill": 429.39, "qw_decode": 26.76, "qw_ram": 3.55},
+    {"context_len": 2048, "bt_ttft": 1549.67, "bt_prefill": 1321.58, "bt_decode": 34.51, "bt_ram": 5.03, "qw_ttft": 4760.31, "qw_prefill": 430.22, "qw_decode": 26.57, "qw_ram": 3.55},
+    {"context_len": 4096, "bt_ttft": 3087.39, "bt_prefill": 1326.69, "bt_decode": 32.78, "bt_ram": 5.31, "qw_ttft": 9630.56, "qw_prefill": 425.31, "qw_decode": 26.24, "qw_ram": 3.58},
+    {"context_len": 8192, "bt_ttft": 6360.21, "bt_prefill": 1288.01, "bt_decode": 32.56, "bt_ram": 5.42, "qw_ttft": 19937.32, "qw_prefill": 410.89, "qw_decode": 25.71, "qw_ram": 3.63},
+    {"context_len": 16384, "bt_ttft": 13603.16, "bt_prefill": 1204.43, "bt_decode": 30.54, "bt_ram": 5.59, "qw_ttft": 43497.17, "qw_prefill": 376.67, "qw_decode": 22.39, "qw_ram": 3.72},
+    {"context_len": 32768, "bt_ttft": 30615.66, "bt_prefill": 1070.30, "bt_decode": 26.40, "bt_ram": 5.93, "qw_ttft": 110152.64, "qw_prefill": 297.48, "qw_decode": 19.45, "qw_ram": 3.92},
 ]
+
+
+def ensure_bf16_safetensors(checkpoint_dir: str):
+    """Converts FP32 model.safetensors (~10.1 GB) to BF16 (~5.07 GB) to halve download size."""
+    sf_path = os.path.join(checkpoint_dir, "model.safetensors")
+    if not os.path.exists(sf_path):
+        return
+
+    size_gb = os.path.getsize(sf_path) / (1024**3)
+    if size_gb > 6.5:
+        print(f"  ├─ Detected FP32 model.safetensors ({size_gb:.2f} GB). Converting to BF16 (~5.07 GB)...")
+        tensors = load_file(sf_path, device="cpu")
+        bf16_tensors = {
+            k: (v.to(torch.bfloat16) if v.is_floating_point() else v)
+            for k, v in tensors.items()
+        }
+        tmp_path = sf_path + ".bf16.tmp"
+        save_file(bf16_tensors, tmp_path, metadata={"format": "pt"})
+        os.replace(tmp_path, sf_path)
+        new_size_gb = os.path.getsize(sf_path) / (1024**3)
+        print(f"  ├─ Converted model.safetensors to BF16 ({new_size_gb:.2f} GB)")
+
+
+def bundle_trust_remote_code_files(script_dir: str, checkpoint_dir: str):
+    """
+    Bundles root-level Python files and updates config.json auto_map so any developer
+    can load the model directly via AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)
+    without installing or cloning the baretorch GitHub repository.
+    """
+    # 1. Update config.json auto_map and architectures
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["model_type"] = "baretorch"
+        cfg["architectures"] = ["BareTorchForCausalLM"]
+        cfg["auto_map"] = {
+            "AutoConfig": "configuration_baretorch.BareTorchConfig",
+            "AutoModel": "modeling_baretorch.BareTorchModel",
+            "AutoModelForCausalLM": "modeling_baretorch.BareTorchForCausalLM",
+        }
+        cfg["torch_dtype"] = "bfloat16"
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        print("  ├─ Updated config.json with Hugging Face Hub 'auto_map' for zero-install trust_remote_code=True")
+
+    # 2. Copy cs_lrad.py and transformer.py to root of checkpoint_dir
+    for mod_name in ["cs_lrad.py", "transformer.py"]:
+        src = os.path.join(script_dir, "baretorch", "modeling", mod_name)
+        dst = os.path.join(checkpoint_dir, mod_name)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+
+    # 3. Write root configuration_baretorch.py and modeling_baretorch.py with pure relative imports
+    # (Hugging Face's dynamic AST scanner requires top-level relative imports to auto-download sibling files)
+    for int_name in ["configuration_baretorch.py", "modeling_baretorch.py"]:
+        src = os.path.join(script_dir, "baretorch", "integration", int_name)
+        dst = os.path.join(checkpoint_dir, int_name)
+        if os.path.exists(src):
+            with open(src, "r", encoding="utf-8") as f:
+                code = f.read()
+            # Replace baretorch package imports with relative imports for standalone HF Hub execution
+            code = code.replace(
+                "from baretorch.integration.configuration_baretorch import",
+                "from .configuration_baretorch import",
+            )
+            code = code.replace(
+                "from baretorch.modeling.cs_lrad import",
+                "from .cs_lrad import",
+            )
+            code = code.replace(
+                "from baretorch.modeling.transformer import",
+                "from .transformer import",
+            )
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(code)
+
+    print("  ├─ Bundled root-level configuration_baretorch.py, modeling_baretorch.py, cs_lrad.py & transformer.py")
 
 
 def load_eval_scores(json_path: str) -> dict:
@@ -65,7 +147,6 @@ def format_comparative_eval_table(bt_json_path: str, qwen_json_path: str = None)
     rows = ""
     bt_scores, py_scores, ma_scores, qw_scores = [], [], [], []
 
-    # Fallback hardcoded scores from verified 142k & Qwen runs if JSONs are missing
     bt_defaults = {
         "boolq": 66.12,
         "piqa": 74.81,
@@ -207,24 +288,24 @@ def format_mlx_benchmark_table(csv_path: str = None) -> str:
             qw = paired[ctx].get("qw")
             if bt:
                 rows += (
-                    f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{float(bt['ttft_ms']):,.1f} ms** | "
-                    f"**{float(bt['prefill_tok_s']):,.1f} tok/s** | **{float(bt['decode_tok_s']):.2f} tok/s** | "
-                    f"**{float(bt['peak_ram_gb']):.2f} GB** |\n"
+                    f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{float(bt['ttft_ms']):,.2f} ms** | "
+                    f"**{float(bt['prefill_tok_s']):,.2f} tok/s** | **{float(bt['decode_tok_s']):.2f} tok/s** | "
+                    f"{float(bt['peak_ram_gb']):.2f} GB |\n"
                 )
             if qw:
                 rows += (
-                    f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {float(qw['ttft_ms']):,.1f} ms | "
-                    f"{float(qw['prefill_tok_s']):,.1f} tok/s | {float(qw['decode_tok_s']):.2f} tok/s | "
+                    f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {float(qw['ttft_ms']):,.2f} ms | "
+                    f"{float(qw['prefill_tok_s']):,.2f} tok/s | {float(qw['decode_tok_s']):.2f} tok/s | "
                     f"{float(qw['peak_ram_gb']):.2f} GB |\n"
                 )
     else:
         for r in DEFAULT_MLX_ROWS:
             ctx = r["context_len"]
             rows += (
-                f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{r['bt_ttft']:,.1f} ms** | "
-                f"**{r['bt_prefill']:,.1f} tok/s** | **{r['bt_decode']:.2f} tok/s** | **{r['bt_ram']:.2f} GB** |\n"
-                f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {r['qw_ttft']:,.1f} ms | "
-                f"{r['qw_prefill']:,.1f} tok/s | {r['qw_decode']:.2f} tok/s | {r['qw_ram']:.2f} GB |\n"
+                f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{r['bt_ttft']:,.2f} ms** | "
+                f"**{r['bt_prefill']:,.2f} tok/s** | **{r['bt_decode']:.2f} tok/s** | {r['bt_ram']:.2f} GB |\n"
+                f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {r['qw_ttft']:,.2f} ms | "
+                f"{r['qw_prefill']:,.2f} tok/s | {r['qw_decode']:.2f} tok/s | {r['qw_ram']:.2f} GB |\n"
             )
 
     return header + rows
@@ -263,28 +344,30 @@ pipeline_tag: text-generation
 
 # 🐻🔥 {repo_id.split('/')[-1]}
 
-**BareTorch-2.5B-Base** is a 2.5-billion-parameter hybrid language model designed specifically for **fast, long-context inference on edge devices and consumer hardware—without requiring custom CUDA kernels.**
+🔗 **Official GitHub Repository & Engine Source Code:** [{GITHUB_REPO_URL}]({GITHUB_REPO_URL})
 
-## 🌍 Why BareTorch? (Built for Any Chip, Not Just NVIDIA)
+**BareTorch-2.5B-Base** is a 2.53-billion-parameter hybrid language model designed from the ground up for **fast, long-context inference on edge devices and consumer hardware—without requiring custom CUDA kernels.**
 
-Most modern subquadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNet) achieve linear scaling on datacenter GPUs by relying on hardware-specific CUDA or Triton kernels. When developers try to run those models on **Apple Silicon (MacBooks/iPads), mobile NPUs, Vulkan, or WebGPU**, they hit a wall because those custom kernels do not exist outside of NVIDIA hardware. Meanwhile, standard Transformers suffer from quadratic $O(N^2)$ prefill slowdowns and ballooning KV-cache memory as context grows.
+## 🌍 Why BareTorch? (Built for the Edge on Any Chip)
 
-**BareTorch solves this hardware lock-in.** Its core sequence mixer—the **Chunk-Segmented Low-Rank Associative Delta Engine (CS-LRAD)**—is formulated **100% out of standard matrix multiplications (GEMMs)**. Because every chip on earth (Apple M-series GPUs/ANEs, Qualcomm Snapdragon NPUs, AMD/Intel integrated GPUs, and NVIDIA Tensor Cores) already accelerates matrix multiplication natively, BareTorch delivers subquadratic long-context speed and flat memory usage **out-of-the-box on any silicon**.
+Most modern subquadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNet) achieve fast linear scaling on datacenter GPUs by relying on custom CUDA or Triton kernels. When developers try to run those models locally on **Apple Silicon (MacBooks/iPads), mobile NPUs, Vulkan, or WebGPU**, they hit a roadblock because those hardware-specific kernels do not exist outside of NVIDIA GPUs. Meanwhile, standard Transformers suffer from quadratic slowdowns and expanding KV-cache memory as context grows.
+
+**BareTorch solves this hardware lock-in.** Its core sequence engine—the **Chunk-Segmented Low-Rank Associative Delta Engine (CS-LRAD)**—is built **100% out of standard matrix multiplications (GEMMs)**. Because every processor (Apple M-series GPUs/ANEs, mobile NPUs, AMD/Intel integrated GPUs, and NVIDIA Tensor Cores) already accelerates matrix multiplication natively, BareTorch delivers subquadratic long-context speed and compact memory usage **out-of-the-box on any chip**.
 
 ---
 
 ## 🚀 Key Highlights
 
-- **Universal Subquadratic Hybrid Engine:** Interleaves **CS-LRAD** recurrent blocks and **Grouped-Query Attention (GQA)** blocks in a **3:1 ratio** ($3\\times\\text{{CS-LRAD}} \\to 1\\times\\text{{Transformer}}$ across 36 layers). 75% of the network maintains a tiny, fixed-size $O(1)$ recurrent state instead of a growing KV cache.
-- **Distilled from `Qwen/Qwen3.5-9B` on 75B Tokens:** Pre-trained from scratch on **75 Billion tokens** using top-$K$ logit distillation from `Qwen/Qwen3.5-9B` combined with a Warmup-Stable-Decay (WSD) curriculum schedule.
-- **Outperforms 300B-Token Baselines:** Beats **Pythia-2.8B** and **Mamba-1.4B** (both trained on $4\\times$ more tokens) across all 7 standard zero-shot benchmarks, and matches or beats **Qwen3.5-2B-Base** on physical commonsense (**PIQA: 74.81%**) and multi-step fact QA (**OpenBookQA: 39.40%**).
-- **Edge & Workstation Speed:** Achieves **3.73x faster prefill** and **3.28x faster decoding** than Qwen3.5-2B at 32,768 tokens on an Apple Silicon M1 MacBook Pro (native MLX) while holding memory completely flat at **5.24 GB**, and **1.44x faster decoding** (~65 tok/s vs ~45 tok/s) on local NVIDIA CUDA hardware.
+- **Universal Subquadratic Hybrid Architecture (24 Layers):** Combines **18 CS-LRAD recurrent blocks** and **6 Grouped-Query Attention (GQA) blocks** in a repeating **3:1 pattern** (`[CS-LRAD, CS-LRAD, CS-LRAD, Transformer] x 6`). Because 75% of the network uses a fixed-size recurrent state instead of a growing KV cache, long prompts process rapidly with minimal memory overhead.
+- **Distilled from `Qwen/Qwen3.5-9B` on 75B Tokens:** Pre-trained from scratch on **75 Billion tokens** (142,000 steps) using a 50/50 multi-task objective (50% Hard Cross-Entropy + 50% Top-4 Logit KL Divergence from `Qwen/Qwen3.5-9B`) with a Warmup-Stable-Decay (WSD) curriculum schedule.
+- **Outperforms 300B-Token Baselines:** Beats **Pythia-2.8B** and **Mamba-1.4B** (both trained on 4x more tokens) across all 7 standard zero-shot benchmarks, and outperforms **Qwen3.5-2B-Base** on physical commonsense (**PIQA: 74.81%**) and multi-step fact QA (**OpenBookQA: 39.40%**).
+- **Edge & Workstation Acceleration:** Achieves **3.60x faster Time-To-First-Token (TTFT)** (30.6s vs 110.2s), **3.60x higher prefill throughput** (1,070.3 tok/s vs 297.5 tok/s), and **1.36x faster decoding** (26.40 tok/s vs 19.45 tok/s) than Qwen3.5-2B at 32,768 tokens on an Apple Silicon M1 MacBook Pro, plus **44% faster decoding** (65.6 tok/s vs 45.6 tok/s) on local NVIDIA CUDA hardware.
 
 ---
 
 ## 📊 Zero-Shot Downstream Benchmarks (`lm-evaluation-harness`)
 
-All models were evaluated using `lm-evaluation-harness` (`0-shot`, sequence length 2,048, `bfloat16`):
+All models were evaluated zero-shot (`0-shot`, sequence length 2,048, `bfloat16`) using the standard EleutherAI `lm-evaluation-harness`:
 
 {eval_table}
 
@@ -292,19 +375,19 @@ All models were evaluated using `lm-evaluation-harness` (`0-shot`, sequence leng
 
 ## ⚡ Hardware Speed, TTFT & Memory Profiling (512 to 32,768 Tokens)
 
-Because CS-LRAD updates a compact low-rank associative state $S_t \\in \\mathbb{{R}}^{{B \\times H \\times r \\times d_h}}$ ($r=16$) across 32-token chunks using pure matrix multiplications, BareTorch eliminates KV-cache memory bandwidth bottlenecks during both prefill and autoregressive decoding.
+Because CS-LRAD compresses historical context into a compact low-rank state (`rank = 16`) across 32-token chunks using standard matrix multiplications, only 6 layers out of 24 maintain a traditional KV cache.
 
-> **Note on Context Length:** `BareTorch-2.5B-Base` was pre-trained at a native sequence length of **2,048 tokens** (`rope_theta = 10,000`). The hardware benchmarks below measure raw architectural throughput, latency (Time-To-First-Token), and memory scaling up to **32,768 tokens**. Long-context sequence adaptation (16k–32k) and instruction tuning (SFT) are scheduled in upcoming releases.
+> **Note on Context Length:** `BareTorch-2.5B-Base` was pre-trained at a foundational sequence length of **2,048 tokens** (`rope_theta = 10,000`). The hardware benchmarks below measure raw architectural speed, Time-To-First-Token (TTFT), prefill throughput, and memory scaling up to **32,768 tokens**. Long-context sequence adaptation (16k–32k) and Supervised Fine-Tuning (SFT) will follow in upcoming releases.
 
 ### 1. Apple Silicon Edge Benchmark (MacBook Pro M1 — Native MLX FP16)
 
-On Apple Silicon unified memory, standard Transformers running on PyTorch MPS degrade severely as the KV cache expands. BareTorch runs natively in **Apple MLX** with zero custom Metal shaders, maintaining **>1,070 tok/s prefill** and a **flat 5.24 GB RAM footprint** all the way to 32k context:
+On an Apple Silicon M1 MacBook Pro, BareTorch runs natively in **Apple MLX** using pure matrix operations (zero custom Metal shaders), peaking at **1,326.7 tok/s prefill** and sustaining **1,070.3 tok/s prefill** and **26.40 tok/s decode** at 32,768 tokens within **5.93 GB RAM**:
 
 {mlx_table}
 
 ### 2. Local NVIDIA GPU Workstation Benchmark (CUDA — BF16)
 
-Measured in strict apples-to-apples mode (`benchmark_context.py`, 64 generated tokens per trial, last-logit-only prefill optimization enabled for both models). BareTorch delivers **~44% higher autoregressive decode velocity (~65.4 tok/s vs ~45.6 tok/s)** across every context window:
+Measured in strict apples-to-apples mode (`benchmark_context.py`, 64 generated tokens per trial, last-logit-only prefill optimization enabled for both models). BareTorch delivers **44% faster token generation (65.4 tok/s vs 45.6 tok/s)** across all context lengths:
 
 {cuda_table}
 
@@ -312,41 +395,47 @@ Measured in strict apples-to-apples mode (`benchmark_context.py`, 64 generated t
 
 ## 📐 Model Architecture & Pre-Training Specifications
 
-| Specification | Value |
+| Specification | Configuration |
 | :--- | :--- |
-| **Total Parameters** | ~2.5 Billion |
-| **Layer Topology** | 36 Layers (`[CS-LRAD, CS-LRAD, CS-LRAD, Transformer] x 9`) |
-| **Hidden Dimension ($d_{{model}}$)** | 2,048 |
-| **Attention Heads** | 16 Query Heads / 4 KV Heads (GQA 4:1) with Per-Head QK-Normalization |
-| **CS-LRAD Chunk Size ($C$) & Rank ($r$)** | $C = 32$, Low-Rank State Subspace $r = 16$ |
+| **Source Code Repository** | [{GITHUB_REPO_URL}]({GITHUB_REPO_URL}) |
+| **Total Parameters** | 2.53 Billion (Untied Input/Output Embeddings) |
+| **Total Layers** | **24 Layers** (18 CS-LRAD Recurrent Layers + 6 Transformer GQA Layers) |
+| **Interleaved Layer Pattern** | `[cs_lrad, cs_lrad, cs_lrad, transformer] x 6` (3:1 Hybrid Ratio) |
+| **Hidden Dimension (`d_model`)** | 2,048 |
+| **Attention Heads** | 16 Query Heads / 4 KV Heads (GQA 4:1, `head_dim = 128`) with Per-Head QK-Norm |
+| **CS-LRAD Chunk Size & Rank** | `chunk_size = 32`, Low-Rank State Subspace `rank = 16` |
 | **Pre-Training Sequence Length** | 2,048 tokens (`rope_theta = 10,000.0`) |
 | **Tokenizer** | `Qwen/Qwen3.5-9B` (`vocab_size = 248,077`) |
 | **Pre-Training Token Volume** | **75 Billion Tokens** (142,000 steps @ 524,288 tokens/step) |
-| **Knowledge Distillation Teacher** | `Qwen/Qwen3.5-9B` (50% Hard Cross-Entropy + 50% Top-4 Teacher Logit KL Divergence) |
-| **Training Hardware** | $8\\times$ NVIDIA H100 SXM5 (80GB) using PyTorch FSDP (ZeRO-2) |
-| **Training Corpus Mix** | **Stage 1 General (90%):** FineWeb-Edu, The Stack Dedup, DCLM, FinePDFs<br>**Stage 2 WSD Annealing (10%):** FineMath-4+, Cosmopedia-v2, OpenR1-Math |
+| **Distillation Objective** | Teacher: `Qwen/Qwen3.5-9B` (`0.5 * CrossEntropy + 0.5 * Top4_KL`, `T = 1.0`) |
+| **Optimizer & WSD Schedule** | AdamW (`lr = 3e-4`, `weight_decay = 0.1`, `warmup = 1,000 steps`, 90% Stable / 10% Cosine Decay) |
+| **Training Hardware** | 8x NVIDIA H100 SXM5 (80GB) with PyTorch FSDP (ZeRO-2) & `torch.compile` |
+| **Training Corpus Mix** | **General Phase (90% / 67.5B tokens):** FineWeb-Edu, The Stack Dedup, DCLM, FinePDFs<br>**WSD Annealing Phase (10% / 7.5B tokens):** FineMath-4+, Cosmopedia-v2, OpenR1-Math |
 
 ---
 
 ## 💻 Quickstart Usage
 
-### 1. PyTorch (NVIDIA CUDA / CPU)
+### 1. PyTorch via Hugging Face `transformers` (Zero Installation Required)
 
-Clone or install the `baretorch` package (or load directly from the bundled repository files):
+You can load `BareTorch-2.5B-Base` directly using standard Hugging Face `AutoModelForCausalLM` with `trust_remote_code=True`—no custom packages or repositories required:
 
 {bt}python
 import torch
-from transformers import AutoTokenizer
-from baretorch import BareTorchForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_id = "{repo_id}"
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model = BareTorchForCausalLM.from_pretrained(
+model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
     device_map="cuda",
+    trust_remote_code=True,
 )
 model.eval()
+
+# Optional: Compile CS-LRAD recurrent blocks for peak CUDA speed (~65.6 tok/s)
+model.compile_lrad()
 
 prompt = "The biggest advantage of running a pure-GEMM subquadratic language model on edge devices is"
 inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
@@ -362,6 +451,14 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 {bt}
 
 ### 2. Apple Silicon (Native MLX)
+
+For native Apple Silicon MLX execution, install the official **BareTorch** repository from GitHub ([{GITHUB_REPO_URL}]({GITHUB_REPO_URL})):
+
+{bt}bash
+git clone {GITHUB_REPO_URL}.git
+cd baretorch
+pip install -e .
+{bt}
 
 {bt}python
 import mlx.core as mx
@@ -397,7 +494,8 @@ mx.eval(next_token, past_kv)
   title={{BareTorch: Challenging State-of-The-Art Sequence Mixing Topologies via Kernel-Free, Pure GEMM-Compliant Architectures}},
   author={{Kovacevic Buvinic, Martin Ignacio}},
   journal={{BareTorch Framework Laboratory Technical Report}},
-  year={{2026}}
+  year={{2026}},
+  url={{{GITHUB_REPO_URL}}}
 }}
 {bt}
 """
@@ -413,18 +511,25 @@ def prepare_and_upload(
     tokenizer_name: str = "Qwen/Qwen3.5-9B",
 ):
     api = HfApi()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
     print(f"\n📦 Preparing repository '{repo_id}' on Hugging Face Hub...")
     create_repo(repo_id=repo_id, exist_ok=True, repo_type="model")
 
-    # 1. Ensure tokenizer files exist in checkpoint_dir so users can load tokenizer directly from repo_id
+    # 1. Convert FP32 model.safetensors (10.1 GB) to BF16 (5.07 GB) if needed
+    ensure_bf16_safetensors(checkpoint_dir)
+
+    # 2. Bundle root-level .py files and config.json auto_map for trust_remote_code=True
+    bundle_trust_remote_code_files(script_dir, checkpoint_dir)
+
+    # 3. Ensure tokenizer files exist in checkpoint_dir so users can load tokenizer directly from repo_id
     tok_config_path = os.path.join(checkpoint_dir, "tokenizer_config.json")
     if not os.path.exists(tok_config_path):
         print(f"  ├─ Saving tokenizer files from '{tokenizer_name}' into '{checkpoint_dir}'...")
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
         tokenizer.save_pretrained(checkpoint_dir)
 
-    # 2. Generate README.md Model Card
+    # 4. Generate README.md Model Card
     readme_path = os.path.join(checkpoint_dir, "README.md")
     card_content = generate_base_model_card(
         repo_id=repo_id,
@@ -435,10 +540,9 @@ def prepare_and_upload(
     )
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(card_content)
-    print("  ├─ Generated README.md Model Card with 7-Task Benchmarks & CUDA/MLX Profiling")
+    print("  ├─ Generated README.md Model Card with Zero-Install AutoModelForCausalLM Quickstart")
 
-    # 3. Bundle custom baretorch implementation package (PyTorch + MLX)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 5. Also bundle custom baretorch implementation package (PyTorch + MLX)
     baretorch_source = os.path.join(script_dir, "baretorch")
     baretorch_target = os.path.join(checkpoint_dir, "baretorch")
     if os.path.exists(baretorch_source):
@@ -450,7 +554,7 @@ def prepare_and_upload(
         )
         print("  ├─ Bundled 'baretorch' (PyTorch & MLX) implementation package into checkpoint folder")
 
-    # 4. Upload to Hugging Face Hub (excluding heavy FSDP training/optimizer states)
+    # 6. Upload to Hugging Face Hub (excluding heavy FSDP training/optimizer states)
     print(f"🚀 Uploading '{checkpoint_dir}' to Hugging Face Hub ({repo_id})...")
     api.upload_folder(
         folder_path=checkpoint_dir,
@@ -465,6 +569,7 @@ def prepare_and_upload(
             "training_args.bin",
             "rng_state*.pth",
             "*.bin.index",
+            "*.tmp",
             "__pycache__/**",
             "*.pyc",
         ],
