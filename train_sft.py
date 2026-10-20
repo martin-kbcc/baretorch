@@ -1,4 +1,4 @@
-# /home/martinkb/Desktop/BareTorch_F/train_sft.py
+# /data/baretorch/train_sft.py
 import argparse
 import logging
 import os
@@ -77,6 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("fsspec").setLevel(logging.WARNING)
@@ -316,13 +317,14 @@ def pack_chatml_dataset(raw_dataset, tokenizer, max_seq_len=4096, local_rank=0):
 
 def main():
     if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend="nccl",
                 timeout=timedelta(minutes=60),
+                device_id=torch.device(f"cuda:{local_rank}"),
             )
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
     else:
         local_rank = 0
 
@@ -429,7 +431,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name, trust_remote_code=True
     )
-    tokenizer.model_max_length = args.seq_len
+    # Set high model_max_length to suppress benign >4096 warning before filtering
+    tokenizer.model_max_length = 1000000
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -437,6 +440,23 @@ def main():
         logger.info(
             f"Loading model weights into FP32 master copy from: {args.pretrained_model_path}"
         )
+
+    # Patch BareTorchPreTrainedModel._set_gradient_checkpointing to accept **kwargs (Transformers v5+ compatibility)
+    def _compat_set_gradient_checkpointing(
+        self, enable=True, gradient_checkpointing_func=None, *a, **kw
+    ):
+        self.gradient_checkpointing = enable
+        if hasattr(self, "config"):
+            self.config.use_grad_checkpointing = enable
+        for module in self.modules():
+            if hasattr(module, "use_grad_checkpointing"):
+                module.use_grad_checkpointing = enable
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = enable
+
+    BareTorchForCausalLM._set_gradient_checkpointing = (
+        _compat_set_gradient_checkpointing
+    )
 
     # Load master weights in FP32; FSDP handles sharding & BF16 mixed-precision autocast
     model = BareTorchForCausalLM.from_pretrained(
@@ -448,6 +468,11 @@ def main():
     model.config.use_cache = False
     model.config.use_grad_checkpointing = args.grad_checkpointing
 
+    # Explicitly activate native block-level gradient checkpointing
+    for module in model.modules():
+        if hasattr(module, "use_grad_checkpointing"):
+            module.use_grad_checkpointing = args.grad_checkpointing
+
     # Enforce RoPE theta and ensure the sinusoidal cache covers the full context span
     adapted_count = adapt_model_for_long_context(
         model,
@@ -456,7 +481,7 @@ def main():
         target_rope_theta=args.rope_theta,
     )
 
-    # Targeted torch.compile on custom CS-LRAD recurrent sub-modules (matching train_distill.py)
+    # Targeted torch.compile on custom CS-LRAD recurrent sub-modules
     compiled_blocks = 0
     if args.compile:
         if local_rank == 0:
@@ -481,7 +506,12 @@ def main():
         logger.info(f"   ├─ Sequence Length       : {args.seq_len:,} tokens")
         logger.info(f"   ├─ RoPE Theta Base       : {args.rope_theta:,.0f}")
         logger.info(f"   ├─ Adapted RoPE Blocks   : {adapted_count}")
-        logger.info(f"   ├─ Compiled LRAD Modules : {compiled_blocks} (compile={args.compile})")
+        logger.info(
+            f"   ├─ Compiled LRAD Modules : {compiled_blocks} (compile={args.compile})"
+        )
+        logger.info(
+            f"   ├─ Grad Checkpointing    : {args.grad_checkpointing} (Native Block-Level)"
+        )
         logger.info(f"   ├─ Learning Rate         : {args.learning_rate}")
         logger.info(
             f"   └─ Batch per Step        : "
@@ -642,6 +672,8 @@ def main():
         )
 
     # PyTorch FSDP Configuration (ZeRO-2 Sharding with FP32 Master Weights)
+    # Note: gradient_checkpointing=False in TrainingArguments avoids HF Trainer's
+    # redundant FSDP AllGather while our native block-level use_grad_checkpointing remains active.
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -662,7 +694,7 @@ def main():
         save_steps=args.save_steps,
         save_total_limit=2,
         torch_compile=False,
-        gradient_checkpointing=args.grad_checkpointing,
+        gradient_checkpointing=False,
         fsdp="shard_grad_op",
         ddp_find_unused_parameters=False,
         dataloader_num_workers=2,

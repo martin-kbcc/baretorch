@@ -45,7 +45,9 @@ class BareTorchPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _set_gradient_checkpointing(self, enable=True, gradient_checkpointing_func=None):
+    def _set_gradient_checkpointing(
+        self, enable=True, gradient_checkpointing_func=None, *args, **kwargs
+    ):
         if isinstance(self, (BareTorchModel, BareTorchForCausalLM)):
             self.gradient_checkpointing = enable
             if hasattr(self, "config"):
