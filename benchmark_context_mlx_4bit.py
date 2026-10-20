@@ -1,7 +1,8 @@
-# /home/martinkb/Desktop/BareTorch_F/benchmark_context_mlx_4bit.py
+# benchmark_context_mlx_4bit.py
 import argparse
 import csv
 import gc
+import json
 import logging
 import os
 import platform
@@ -13,7 +14,9 @@ os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_unflatten
 
+from baretorch.integration.configuration_baretorch import BareTorchConfig
 from baretorch.integration_mlx.modeling_baretorch import BareTorchForCausalLMMLX
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -86,16 +89,96 @@ def enable_last_logit_only_mlx_qwen(model):
 
 
 def quantize_mlx_model_in_place(model: nn.Module, bits: int = 4, group_size: int = 64):
-    """Applies native MLX quantization to all compatible Linear/Embedding layers."""
+    """Applies native MLX quantization to all compatible Linear/Embedding layers in chunks."""
     if bits in (4, 8):
         def class_predicate(path, module):
             if hasattr(module, "weight"):
-                # Only quantize 2D weight matrices whose last dimension is divisible by group_size
                 return module.weight.ndim == 2 and (module.weight.shape[-1] % group_size == 0)
             return False
 
         nn.quantize(model, group_size=group_size, bits=bits, class_predicate=class_predicate)
+
+    # Evaluate layer-by-layer to prevent single giant Metal command buffer timeout
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            mx.eval(layer.parameters())
+            mx.synchronize()
     mx.eval(model.parameters())
+    mx.synchronize()
+    flush_mlx_cache()
+
+
+def load_and_quantize_baretorch_mlx(
+    checkpoint_path: str,
+    bits: int = 4,
+    group_size: int = 64,
+    dtype=mx.float16,
+) -> BareTorchForCausalLMMLX:
+    """
+    Safely loads BareTorch weights in batched chunks over the CPU stream to prevent
+    macOS Metal GPU watchdog timeouts (kIOGPUCommandBufferCallbackErrorTimeout) on
+    10.1 GB FP32 safetensors files, then quantizes layer-by-layer.
+    """
+    config_path = os.path.join(checkpoint_path, "config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg_dict = json.load(f)
+    config = BareTorchConfig(**cfg_dict)
+
+    model = BareTorchForCausalLMMLX(config)
+
+    sf_path = os.path.join(checkpoint_path, "model.safetensors")
+    logger.info(f"Loading safetensors via CPU stream from '{sf_path}'...")
+    raw_weights = mx.load(sf_path, stream=mx.cpu)
+
+    converted_items = []
+    batch_tensors = []
+    for k, v in raw_weights.items():
+        # Cast FP32/BF16 weights to target dtype on CPU stream so Metal GPU never stalls on disk I/O
+        if v.dtype in (mx.float32, mx.bfloat16) and (not k.endswith(".ln1.weight")) and (not k.endswith(".ln2.weight")) and (not k.endswith(".final_norm.weight")) and (not k.endswith("_norm.weight")):
+            v_cast = mx.astype(v, dtype, stream=mx.cpu)
+        elif v.dtype == mx.bfloat16:
+            v_cast = mx.astype(v, dtype, stream=mx.cpu)
+        else:
+            v_cast = v
+
+        converted_items.append((k, v_cast))
+        batch_tensors.append(v_cast)
+
+        if len(batch_tensors) >= 32:
+            mx.eval(batch_tensors)
+            batch_tensors.clear()
+
+    if batch_tensors:
+        mx.eval(batch_tensors)
+        batch_tensors.clear()
+
+    del raw_weights
+    gc.collect()
+
+    if getattr(config, "tie_word_embeddings", False):
+        weight_keys = {k for k, _ in converted_items}
+        if "lm_head.weight" not in weight_keys:
+            for k, v in converted_items:
+                if k == "model.token_embedding.weight":
+                    converted_items.append(("lm_head.weight", v))
+                    break
+
+    model.update(tree_unflatten(converted_items))
+    del converted_items
+    flush_mlx_cache()
+
+    if bits in (4, 8):
+        logger.info(f"Quantizing BareTorch to {bits}-bit (group_size={group_size}) via mlx.nn.quantize...")
+        quantize_mlx_model_in_place(model, bits=bits, group_size=group_size)
+    else:
+        for layer in model.model.layers:
+            mx.eval(layer.parameters())
+            mx.synchronize()
+        mx.eval(model.parameters())
+        mx.synchronize()
+
+    reset_mlx_memory_stats()
+    return model
 
 
 def benchmark_baretorch_mlx_at_context(
@@ -288,7 +371,7 @@ def main():
     parser.add_argument(
         "--baretorch_path",
         type=str,
-        default="./checkpoint-142000",
+        default="./checkpoint-132000",
         help="Local path to BareTorch checkpoint directory",
     )
     parser.add_argument(
@@ -371,19 +454,16 @@ def main():
     qwen_results = {}
 
     # --------------------------------------------------------------------------
-    # 1. Benchmark BareTorch in Native MLX (Quantized in-memory via nn.quantize)
+    # 1. Benchmark BareTorch in Native MLX (CPU-stream batched load + quantize)
     # --------------------------------------------------------------------------
     if os.path.exists(args.baretorch_path):
-        logger.info(f"Loading BareTorch from '{args.baretorch_path}' in FP16...")
-        bt_model = BareTorchForCausalLMMLX.from_pretrained(
-            args.baretorch_path, dtype=mx.float16
+        logger.info(f"Loading & quantizing BareTorch from '{args.baretorch_path}'...")
+        bt_model = load_and_quantize_baretorch_mlx(
+            checkpoint_path=args.baretorch_path,
+            bits=args.bits,
+            group_size=args.group_size,
+            dtype=mx.float16,
         )
-        if args.bits in (4, 8):
-            logger.info(
-                f"Quantizing BareTorch to {args.bits}-bit (group_size={args.group_size}) via mlx.nn.quantize..."
-            )
-            quantize_mlx_model_in_place(bt_model, bits=args.bits, group_size=args.group_size)
-        reset_mlx_memory_stats()
 
         logger.info(f"Starting {bt_label} context evaluation loop...")
         for ctx in args.context_lengths:
