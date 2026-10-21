@@ -72,7 +72,7 @@ def benchmark_model_on_tpu(
     label: str,
     device: torch.device,
     context_lengths: list[int],
-    gen_tokens: int = 32,
+    gen_tokens: int = 64,
     trials: int = 3,
     use_compile: bool = False,
 ):
@@ -104,7 +104,8 @@ def benchmark_model_on_tpu(
         sync_tpu()
 
         try:
-            # 1. Untimed Warmup (Populates TorchTPU's XLA Compilation Cache)
+            # 1. Full Untimed Warmup: Compiles prefill + ALL `gen_tokens` decode step shapes
+            # so zero XLA graph compilations occur during the timed measurement trials.
             t_warmup_start = time.perf_counter()
             with torch.no_grad():
                 out = model(inp, use_cache=True)
@@ -112,7 +113,7 @@ def benchmark_model_on_tpu(
                 tok = out.logits[:, -1:].argmax(dim=-1)
                 sync_tpu()
 
-                for _ in range(min(4, gen_tokens)):
+                for _ in range(gen_tokens):
                     step = model(tok, past_key_values=p_kv, use_cache=True)
                     p_kv = step.past_key_values
                     tok = step.logits[:, -1:].argmax(dim=-1)
@@ -121,7 +122,7 @@ def benchmark_model_on_tpu(
             del out, p_kv, tok, step
             reset_tpu_memory()
 
-            # 2. Timed Hardware Execution Trials
+            # 2. Timed Hardware Execution Trials (100% XLA Cache Hit)
             prefill_latencies = []
             decode_latencies = []
             peak_memories = []
@@ -129,7 +130,8 @@ def benchmark_model_on_tpu(
             for _ in range(trials):
                 reset_tpu_memory()
 
-                # --- A. Measure Prefill (TTFT) ---
+                # --- A. Measure Prefill Phase (TTFT) ---
+                sync_tpu()
                 t0 = time.perf_counter()
                 with torch.no_grad():
                     out = model(inp, use_cache=True)
@@ -141,7 +143,8 @@ def benchmark_model_on_tpu(
                 prefill_mem = get_tpu_memory_gb()
                 del out
 
-                # --- B. Measure Autoregressive Decode ---
+                # --- B. Measure Autoregressive Decode Phase (64 tokens) ---
+                sync_tpu()
                 t1 = time.perf_counter()
                 with torch.no_grad():
                     for _ in range(gen_tokens):
@@ -196,9 +199,9 @@ def main():
         "--context_lengths",
         type=int,
         nargs="+",
-        default=[512, 1024, 2048, 4096, 8192, 16384],
+        default=[512, 1024, 2048, 4096, 8192, 16384, 32768],
     )
-    parser.add_argument("--gen_tokens", type=int, default=32)
+    parser.add_argument("--gen_tokens", type=int, default=64)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument("--csv_path", type=str, default="benchmark_tpu_colab.csv")
@@ -207,6 +210,9 @@ def main():
     device = torch.device("tpu")
     print("=" * 95)
     print(f"⚡ GOOGLE TORCHTPU BENCHMARK: BareTorch-2.5B vs. Qwen3.5-2B (device='{device}')")
+    print(f"Contexts     : {args.context_lengths}")
+    print(f"Decode Steps : {args.gen_tokens} tokens")
+    print(f"Trials       : {args.trials} per context length")
     print("=" * 95)
 
     bt_res = benchmark_model_on_tpu(
