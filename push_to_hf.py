@@ -32,13 +32,13 @@ DEFAULT_CUDA_ROWS = [
 ]
 
 DEFAULT_MLX_ROWS = [
-    {"context_len": 512, "bt_ttft": 416.39, "bt_prefill": 1229.62, "bt_decode": 35.78, "bt_ram": 4.80, "qw_ttft": 1192.24, "qw_prefill": 429.44, "qw_decode": 27.05, "qw_ram": 3.54},
-    {"context_len": 1024, "bt_ttft": 773.78, "bt_prefill": 1323.37, "bt_decode": 35.67, "bt_ram": 4.87, "qw_ttft": 2384.76, "qw_prefill": 429.39, "qw_decode": 26.76, "qw_ram": 3.55},
-    {"context_len": 2048, "bt_ttft": 1549.67, "bt_prefill": 1321.58, "bt_decode": 34.51, "bt_ram": 5.03, "qw_ttft": 4760.31, "qw_prefill": 430.22, "qw_decode": 26.57, "qw_ram": 3.55},
-    {"context_len": 4096, "bt_ttft": 3087.39, "bt_prefill": 1326.69, "bt_decode": 32.78, "bt_ram": 5.31, "qw_ttft": 9630.56, "qw_prefill": 425.31, "qw_decode": 26.24, "qw_ram": 3.58},
-    {"context_len": 8192, "bt_ttft": 6360.21, "bt_prefill": 1288.01, "bt_decode": 32.56, "bt_ram": 5.42, "qw_ttft": 19937.32, "qw_prefill": 410.89, "qw_decode": 25.71, "qw_ram": 3.63},
-    {"context_len": 16384, "bt_ttft": 13603.16, "bt_prefill": 1204.43, "bt_decode": 30.54, "bt_ram": 5.59, "qw_ttft": 43497.17, "qw_prefill": 376.67, "qw_decode": 22.39, "qw_ram": 3.72},
-    {"context_len": 32768, "bt_ttft": 30615.66, "bt_prefill": 1070.30, "bt_decode": 26.40, "bt_ram": 5.93, "qw_ttft": 110152.64, "qw_prefill": 297.48, "qw_decode": 19.45, "qw_ram": 3.92},
+    {"context_len": 512, "bt_ttft": 437.90, "bt_prefill": 1169.30, "bt_decode": 99.06, "bt_ram": 1.99, "qw_ttft": 576.40, "qw_prefill": 888.20, "qw_decode": 98.82, "qw_ram": 1.84},
+    {"context_len": 1024, "bt_ttft": 855.50, "bt_prefill": 1197.00, "bt_decode": 99.27, "bt_ram": 2.28, "qw_ttft": 1140.10, "qw_prefill": 898.20, "qw_decode": 99.07, "qw_ram": 2.10},
+    {"context_len": 2048, "bt_ttft": 1700.80, "bt_prefill": 1204.10, "bt_decode": 95.85, "bt_ram": 2.41, "qw_ttft": 2271.70, "qw_prefill": 901.50, "qw_decode": 96.63, "qw_ram": 2.32},
+    {"context_len": 4096, "bt_ttft": 3438.40, "bt_prefill": 1191.20, "bt_decode": 93.63, "bt_ram": 2.69, "qw_ttft": 4617.70, "qw_prefill": 887.00, "qw_decode": 94.39, "qw_ram": 2.76},
+    {"context_len": 8192, "bt_ttft": 6963.20, "bt_prefill": 1176.50, "bt_decode": 90.85, "bt_ram": 2.69, "qw_ttft": 9386.10, "qw_prefill": 872.80, "qw_decode": 90.65, "qw_ram": 3.18},
+    {"context_len": 16384, "bt_ttft": 14549.30, "bt_prefill": 1126.10, "bt_decode": 85.05, "bt_ram": 3.33, "qw_ttft": 19503.70, "qw_prefill": 840.00, "qw_decode": 83.17, "qw_ram": 3.75},
+    {"context_len": 32768, "bt_ttft": 31876.90, "bt_prefill": 1028.00, "bt_decode": 75.54, "bt_ram": 3.52, "qw_ttft": 42567.70, "qw_prefill": 769.80, "qw_decode": 71.28, "qw_ram": 5.00},
 ]
 
 
@@ -257,7 +257,7 @@ def format_cuda_benchmark_table(csv_path: str = None) -> str:
 
 
 def format_mlx_benchmark_table(csv_path: str = None) -> str:
-    """Parses benchmark_apple_silicon.csv (if present) or uses verified M1 MacBook Pro results."""
+    """Parses benchmark_apple_silicon_4bit.csv (if present) or uses verified M1 MacBook Pro 4-bit MLX results."""
     paired = {}
     if csv_path and os.path.exists(csv_path):
         try:
@@ -288,24 +288,24 @@ def format_mlx_benchmark_table(csv_path: str = None) -> str:
             qw = paired[ctx].get("qw")
             if bt:
                 rows += (
-                    f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{float(bt['ttft_ms']):,.2f} ms** | "
-                    f"**{float(bt['prefill_tok_s']):,.2f} tok/s** | **{float(bt['decode_tok_s']):.2f} tok/s** | "
-                    f"{float(bt['peak_ram_gb']):.2f} GB |\n"
+                    f"| **{ctx:,}** | **BareTorch-2.5B (MLX 4-bit)** | **{float(bt['ttft_ms']):,.1f} ms** | "
+                    f"**{float(bt['prefill_tok_s']):,.1f} tok/s** | **{float(bt['decode_tok_s']):.2f} tok/s** | "
+                    f"**{float(bt['peak_ram_gb']):.2f} GB** |\n"
                 )
             if qw:
                 rows += (
-                    f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {float(qw['ttft_ms']):,.2f} ms | "
-                    f"{float(qw['prefill_tok_s']):,.2f} tok/s | {float(qw['decode_tok_s']):.2f} tok/s | "
+                    f"| {ctx:,} | Qwen3.5-2B (MLX 4-bit) | {float(qw['ttft_ms']):,.1f} ms | "
+                    f"{float(qw['prefill_tok_s']):,.1f} tok/s | {float(qw['decode_tok_s']):.2f} tok/s | "
                     f"{float(qw['peak_ram_gb']):.2f} GB |\n"
                 )
     else:
         for r in DEFAULT_MLX_ROWS:
             ctx = r["context_len"]
             rows += (
-                f"| **{ctx:,}** | **BareTorch-2.5B (MLX Native)** | **{r['bt_ttft']:,.2f} ms** | "
-                f"**{r['bt_prefill']:,.2f} tok/s** | **{r['bt_decode']:.2f} tok/s** | {r['bt_ram']:.2f} GB |\n"
-                f"| {ctx:,} | Qwen3.5-2B (PyTorch MPS) | {r['qw_ttft']:,.2f} ms | "
-                f"{r['qw_prefill']:,.2f} tok/s | {r['qw_decode']:.2f} tok/s | {r['qw_ram']:.2f} GB |\n"
+                f"| **{ctx:,}** | **BareTorch-2.5B (MLX 4-bit)** | **{r['bt_ttft']:,.1f} ms** | "
+                f"**{r['bt_prefill']:,.1f} tok/s** | **{r['bt_decode']:.2f} tok/s** | **{r['bt_ram']:.2f} GB** |\n"
+                f"| {ctx:,} | Qwen3.5-2B (MLX 4-bit) | {r['qw_ttft']:,.1f} ms | "
+                f"{r['qw_prefill']:,.1f} tok/s | {r['qw_decode']:.2f} tok/s | {r['qw_ram']:.2f} GB |\n"
             )
 
     return header + rows
@@ -346,11 +346,11 @@ pipeline_tag: text-generation
 
 🔗 **Official GitHub Repository & Engine Source Code:** [{GITHUB_REPO_URL}]({GITHUB_REPO_URL})
 
-**BareTorch-2.5B-Base** is a 2.53-billion-parameter hybrid language model designed from the ground up for **fast, long-context inference on edge devices and consumer hardware—without requiring custom CUDA kernels.**
+**BareTorch-2.5B-Base** is a 2.53-billion-parameter hybrid language model designed from the ground up for **fast, long-context inference on edge devices and consumer hardware—without requiring custom hardware kernels.**
 
 ## 🌍 Why BareTorch? (Built for the Edge on Any Chip)
 
-Most modern subquadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNet) achieve fast linear scaling on datacenter GPUs by relying on custom CUDA or Triton kernels. When developers try to run those models locally on **Apple Silicon (MacBooks/iPads), mobile NPUs, Vulkan, or WebGPU**, they hit a roadblock because those hardware-specific kernels do not exist outside of NVIDIA GPUs. Meanwhile, standard Transformers suffer from quadratic slowdowns and expanding KV-cache memory as context grows.
+Most modern subquadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNet) achieve fast linear scaling on datacenter GPUs by relying on custom CUDA, Triton, or platform-specific Metal kernels. When developers try to deploy those models across **mobile NPUs, Apple Silicon, Vulkan, or WebGPU**, they hit a roadblock wherever custom hardware kernels are missing or unoptimized. Meanwhile, standard Transformers suffer from quadratic slowdowns and expanding KV-cache memory as context grows.
 
 **BareTorch solves this hardware lock-in.** Its core sequence engine—the **Chunk-Segmented Low-Rank Associative Delta Engine (CS-LRAD)**—is built **100% out of standard matrix multiplications (GEMMs)**. Because every processor (Apple M-series GPUs/ANEs, mobile NPUs, AMD/Intel integrated GPUs, and NVIDIA Tensor Cores) already accelerates matrix multiplication natively, BareTorch delivers subquadratic long-context speed and compact memory usage **out-of-the-box on any chip**.
 
@@ -358,10 +358,10 @@ Most modern subquadratic architectures (such as Mamba-2, RWKV, and Gated DeltaNe
 
 ## 🚀 Key Highlights
 
-- **Universal Subquadratic Hybrid Architecture (24 Layers):** Combines **18 CS-LRAD recurrent blocks** and **6 Grouped-Query Attention (GQA) blocks** in a repeating **3:1 pattern** (`[CS-LRAD, CS-LRAD, CS-LRAD, Transformer] x 6`). Because 75% of the network uses a fixed-size recurrent state instead of a growing KV cache, long prompts process rapidly with minimal memory overhead.
+- **Universal Subquadratic Hybrid Architecture (24 Layers):** Combines **18 CS-LRAD recurrent blocks** and **6 Grouped-Query Attention (GQA) blocks** in a repeating **3:1 pattern** (`[CS-LRAD, CS-LRAD, CS-LRAD, Transformer] x 6`). Because 75% of the network uses a fixed-size low-rank recurrent state (`rank = 16`) instead of a growing KV cache, long prompts process rapidly with minimal memory overhead.
 - **Distilled from `Qwen/Qwen3.5-9B` on 75B Tokens:** Pre-trained from scratch on **75 Billion tokens** (142,000 steps) using a 50/50 multi-task objective (50% Hard Cross-Entropy + 50% Top-4 Logit KL Divergence from `Qwen/Qwen3.5-9B`) with a Warmup-Stable-Decay (WSD) curriculum schedule.
 - **Outperforms 300B-Token Baselines:** Beats **Pythia-2.8B** and **Mamba-1.4B** (both trained on 4x more tokens) across all 7 standard zero-shot benchmarks, and outperforms **Qwen3.5-2B-Base** on physical commonsense (**PIQA: 74.81%**) and multi-step fact QA (**OpenBookQA: 39.40%**).
-- **Edge & Workstation Acceleration:** Achieves **3.60x faster Time-To-First-Token (TTFT)** (30.6s vs 110.2s), **3.60x higher prefill throughput** (1,070.3 tok/s vs 297.5 tok/s), and **1.36x faster decoding** (26.40 tok/s vs 19.45 tok/s) than Qwen3.5-2B at 32,768 tokens on an Apple Silicon M1 MacBook Pro, plus **44% faster decoding** (65.6 tok/s vs 45.6 tok/s) on local NVIDIA CUDA hardware.
+- **Edge & Workstation Acceleration:** Under strict 4-bit native Apple MLX benchmarking on a MacBook Pro M1, BareTorch delivers **33.5% faster prefill throughput** (peaking at **1,204.1 tok/s** and sustaining **1,028.0 tok/s** vs 769.8 tok/s at 32k context), **faster long-context decoding** (**75.54 tok/s** vs 71.28 tok/s at 32k, and **99.27 tok/s** at 1k), and **30% lower peak RAM at 32,768 tokens** (**3.52 GB** vs 5.00 GB)—plus **44% faster decoding** (65.6 tok/s vs 45.6 tok/s) on local NVIDIA CUDA hardware.
 
 ---
 
@@ -379,9 +379,9 @@ Because CS-LRAD compresses historical context into a compact low-rank state (`ra
 
 > **Note on Context Length:** `BareTorch-2.5B-Base` was pre-trained at a foundational sequence length of **2,048 tokens** (`rope_theta = 10,000`). The hardware benchmarks below measure raw architectural speed, Time-To-First-Token (TTFT), prefill throughput, and memory scaling up to **32,768 tokens**. Long-context sequence adaptation (16k–32k) and Supervised Fine-Tuning (SFT) will follow in upcoming releases.
 
-### 1. Apple Silicon Edge Benchmark (MacBook Pro M1 — Native MLX FP16)
+### 1. Apple Silicon Edge Benchmark (MacBook Pro M1 — Native MLX 4-Bit)
 
-On an Apple Silicon M1 MacBook Pro, BareTorch runs natively in **Apple MLX** using pure matrix operations (zero custom Metal shaders), peaking at **1,326.7 tok/s prefill** and sustaining **1,070.3 tok/s prefill** and **26.40 tok/s decode** at 32,768 tokens within **5.93 GB RAM**:
+Both models were evaluated head-to-head in **native Apple MLX** using identical 4-bit quantization (`mlx.nn.quantize`, `bits=4`, `group_size=64`). Even with zero custom Metal shaders, `BareTorch-2.5B` achieves **~34% faster prefill across all context lengths**, **99.3 tok/s short-context / 75.5 tok/s 32k-context decode speed**, and cuts 32k peak unified memory by **1.48 GB (3.52 GB vs 5.00 GB)**:
 
 {mlx_table}
 
@@ -450,7 +450,7 @@ with torch.no_grad():
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 {bt}
 
-### 2. Apple Silicon (Native MLX)
+### 2. Apple Silicon (Native MLX — 4-Bit Quantized or FP16)
 
 For native Apple Silicon MLX execution, install the official **BareTorch** repository from GitHub ([{GITHUB_REPO_URL}]({GITHUB_REPO_URL})):
 
@@ -462,19 +462,32 @@ pip install -e .
 
 {bt}python
 import mlx.core as mx
+import mlx.nn as nn
 from transformers import AutoTokenizer
-from baretorch.integration_mlx.modeling_baretorch import BareTorchForCausalLMMLX
+from baretorch.integration_mlx.modeling_baretorch import (
+    BareTorchForCausalLMMLX,
+    extract_baretorch_cache_arrays,
+)
 
 model_path = "./BareTorch-2.5B-Base"  # Local clone of {repo_id}
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-model = BareTorchForCausalLMMLX.from_pretrained(model_path, dtype=mx.float16)
+model = BareTorchForCausalLMMLX.from_pretrained(model_path, dtype=mx.float16, fuse=True)
+
+# Optional: Quantize in-place to 4-bit (~99 tok/s decode, 3.52 GB RAM @ 32k context)
+nn.quantize(
+    model,
+    group_size=64,
+    bits=4,
+    class_predicate=lambda p, m: hasattr(m, "weight") and m.weight.ndim == 2 and m.weight.shape[-1] % 64 == 0,
+)
+mx.eval(model.parameters())
 
 prompt = "Edge AI applications require models that can process large documents locally because"
 input_ids = mx.array([tokenizer.encode(prompt)])
 
 logits, past_kv = model(input_ids, use_cache=True, num_logits_to_keep=1)
 next_token = mx.argmax(logits[:, -1:, :], axis=-1)
-mx.eval(next_token, past_kv)
+mx.eval(next_token, extract_baretorch_cache_arrays(past_kv))
 {bt}
 
 ---
@@ -540,7 +553,7 @@ def prepare_and_upload(
     )
     with open(readme_path, "w", encoding="utf-8") as f:
         f.write(card_content)
-    print("  ├─ Generated README.md Model Card with Zero-Install AutoModelForCausalLM Quickstart")
+    print("  ├─ Generated README.md Model Card with Native MLX 4-Bit Profiling & Zero-Install Quickstart")
 
     # 5. Also bundle custom baretorch implementation package (PyTorch + MLX)
     baretorch_source = os.path.join(script_dir, "baretorch")
@@ -622,8 +635,8 @@ def main():
     parser.add_argument(
         "--mlx_csv",
         type=str,
-        default=os.path.join(root_dir, "benchmark_apple_silicon.csv"),
-        help="Path to Apple Silicon MLX context & memory benchmark CSV.",
+        default=os.path.join(root_dir, "benchmark_apple_silicon_4bit.csv"),
+        help="Path to Apple Silicon MLX 4-bit context & memory benchmark CSV.",
     )
     args = parser.parse_args()
 
