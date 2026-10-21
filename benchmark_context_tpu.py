@@ -96,15 +96,17 @@ def _unwrap_kv_pair_torch(past_kv):
     return None, None
 
 
-def fuse_baretorch_pytorch_for_inference(model):
+def fuse_baretorch_pytorch_for_inference(model, max_decode_steps: int = 64):
     """
-    Fuses unfused PyTorch Linear projections in-memory:
-      - GatedMLP (24 layers): w1 + w2 -> _w12_weight (2 -> 1 GEMM)
-      - CausalSelfAttention (6 layers): W_q + W_k + W_v -> _qkv_weight (3 -> 1 GEMM)
-      - LowRankAssociativeDeltaEngine (18 layers):
-          W_q + W_k + W_v + W_u + W_r + W_swish_gate -> _qkvurs_w (6 -> 1 GEMM)
-          W_gate + W_beta_gate -> _gates_w / _gates_b (2 -> 1 GEMM)
-    Reduces Linear PjRt dispatches per token across the 24 layers from 276 down to 114!
+    Fuses BareTorch's linear projections AND converts both CS-LRAD and GQA caches
+    to 100% STATIC TENSOR SHAPES during autoregressive decoding on TPU:
+      1. GatedMLP: fuses w1 + w2 -> _w12_weight.
+      2. CausalSelfAttention: fuses W_q + W_k + W_v -> _qkv_weight AND pre-allocates
+         a static `(B, H_kv, ctx + max_decode_steps, d_h)` KV buffer after prefill so
+         decode never calls dynamic-shape `torch.cat`!
+      3. LowRankAssociativeDeltaEngine: fuses 6 main projections + 2 gate projections
+         AND uses a static `(B, H, 32, d_h)` intra-chunk buffer so all 64 decode steps
+         have identical tensor shapes!
     """
     fused_mlps, fused_gqa, fused_lrad = 0, 0, 0
 
@@ -125,7 +127,7 @@ def fuse_baretorch_pytorch_for_inference(model):
                 module.forward = fused_mlp_forward.__get__(module, module.__class__)
                 fused_mlps += 1
 
-            # 2. Fuse CausalSelfAttention (W_q + W_k + W_v -> _qkv_weight)
+            # 2. Fuse CausalSelfAttention + Static Pre-Allocated KV Cache for Decode
             elif cls_name == "CausalSelfAttention" and hasattr(module, "W_q") and hasattr(module, "W_k"):
                 q_dim = module.W_q.weight.shape[0]
                 kv_dim = module.W_k.weight.shape[0]
@@ -135,19 +137,15 @@ def fuse_baretorch_pytorch_for_inference(model):
                 module.register_buffer("_qkv_weight", qkv_weight, persistent=False)
                 module._q_dim = q_dim
                 module._kv_dim = kv_dim
+                module._max_decode_steps = max_decode_steps
                 del module.W_q, module.W_k, module.W_v
 
                 def fused_gqa_forward(self_attn, x, past_kv=None, position_ids=None, attention_mask=None):
                     B, L, D = x.shape
-                    pk_past, pv_past = _unwrap_kv_pair_torch(past_kv)
-                    past_len = pk_past.size(-2) if pk_past is not None else 0
-
-                    if position_ids is None:
-                        position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
-
-                    qkv = F.linear(x, self_attn._qkv_weight)
                     qd = self_attn._q_dim
                     kvd = self_attn._kv_dim
+
+                    qkv = F.linear(x, self_attn._qkv_weight)
                     q_raw, k_raw, v_raw = torch.split(qkv, [qd, kvd, kvd], dim=-1)
 
                     q = q_raw.view(B, L, self_attn.num_heads, self_attn.head_dim).transpose(1, 2)
@@ -158,29 +156,64 @@ def fuse_baretorch_pytorch_for_inference(model):
                         q = self_attn.q_norm(q)
                         k = self_attn.k_norm(k)
 
-                    q, k = self_attn.rope.apply_rope(q, k, position_ids)
+                    # Prefill path (L > 1)
+                    if L > 1 or past_kv is None:
+                        pk_past, pv_past = _unwrap_kv_pair_torch(past_kv)
+                        past_len = pk_past.size(-2) if pk_past is not None else 0
+                        if position_ids is None:
+                            position_ids = torch.arange(past_len, past_len + L, dtype=torch.long, device=x.device).unsqueeze(0)
+                        q, k = self_attn.rope.apply_rope(q, k, position_ids)
 
-                    if pk_past is not None and pv_past is not None:
-                        k = torch.cat([pk_past, k], dim=-2)
-                        v = torch.cat([pv_past, v], dim=-2)
+                        if pk_past is not None and pv_past is not None:
+                            k = torch.cat([pk_past, k], dim=-2)
+                            v = torch.cat([pv_past, v], dim=-2)
 
-                    current_kv = (k, v)
+                        if self_attn.num_queries_per_kv > 1:
+                            k_attn = k.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
+                            v_attn = v.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
+                        else:
+                            k_attn, v_attn = k, v
+
+                        is_causal = (past_len == 0) and (L > 1) and (attention_mask is None)
+                        out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=None, is_causal=is_causal)
+                        out = out.transpose(1, 2).contiguous().view(B, L, D)
+
+                        # Pre-allocate static decode KV buffer of fixed length `total_len + max_decode_steps`
+                        total_len = k.size(-2)
+                        max_len = total_len + self_attn._max_decode_steps
+                        k_buf = F.pad(k, (0, 0, 0, self_attn._max_decode_steps))
+                        v_buf = F.pad(v, (0, 0, 0, self_attn._max_decode_steps))
+                        pos_tensor = torch.tensor([total_len], dtype=torch.long, device=x.device)
+                        arange_max = torch.arange(max_len, dtype=torch.long, device=x.device)
+                        return self_attn.W_out(out), (k_buf, v_buf, pos_tensor, arange_max, total_len)
+
+                    # Static-Shape Single-Token Decode Path (L == 1)
+                    k_buf, v_buf, pos_tensor, arange_max, cur_len = past_kv
+                    pos_ids = pos_tensor.unsqueeze(0)
+                    q, k = self_attn.rope.apply_rope(q, k, pos_ids)
+
+                    # Static shape update using broadcast mask (zero dynamic slicing or torch.cat!)
+                    slot_mask = (arange_max == pos_tensor).view(1, 1, -1, 1)
+                    k_buf = torch.where(slot_mask, k, k_buf)
+                    v_buf = torch.where(slot_mask, v, v_buf)
+                    new_pos_tensor = pos_tensor + 1
 
                     if self_attn.num_queries_per_kv > 1:
-                        k_attn = k.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
-                        v_attn = v.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
+                        k_attn = k_buf.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
+                        v_attn = v_buf.repeat_interleave(self_attn.num_queries_per_kv, dim=1)
                     else:
-                        k_attn, v_attn = k, v
+                        k_attn, v_attn = k_buf, v_buf
 
-                    is_causal = (past_len == 0) and (L > 1) and (attention_mask is None)
-                    out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=None, is_causal=is_causal)
-                    out = out.transpose(1, 2).contiguous().view(B, L, D)
-                    return self_attn.W_out(out), current_kv
+                    valid_mask = (arange_max < new_pos_tensor).view(1, 1, 1, -1)
+                    attn_bias = torch.where(valid_mask, 0.0, -1e4).to(q.dtype)
+                    out = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask=attn_bias, is_causal=False)
+                    out = out.transpose(1, 2).contiguous().view(B, 1, D)
+                    return self_attn.W_out(out), (k_buf, v_buf, new_pos_tensor, arange_max, cur_len + 1)
 
                 module.forward = fused_gqa_forward.__get__(module, module.__class__)
                 fused_gqa += 1
 
-            # 3. Fuse LowRankAssociativeDeltaEngine (6 main projections + 2 gate projections)
+            # 3. Fuse LowRankAssociativeDeltaEngine + Static 32-Slot Intra-Chunk Buffer
             elif cls_name == "LowRankAssociativeDeltaEngine" and hasattr(module, "W_q"):
                 d = module.inner_dim
                 ur = module.num_heads * module.r
@@ -201,6 +234,7 @@ def fuse_baretorch_pytorch_for_inference(model):
                 module.register_buffer("_qkvurs_w", qkvurs_w, persistent=False)
                 module.register_buffer("_gates_w", gates_w, persistent=False)
                 module.register_buffer("_gates_b", gates_b, persistent=False)
+                module.register_buffer("_chunk_arange", torch.arange(module.chunk_size, dtype=torch.long, device=qkvurs_w.device), persistent=False)
                 module._d_inner = d
                 module._ur_dim = ur
                 del module.W_q, module.W_k, module.W_v, module.W_u, module.W_r, module.W_swish_gate
@@ -247,7 +281,7 @@ def fuse_baretorch_pytorch_for_inference(model):
                     Lambda = torch.cumsum(log_gate, dim=-2)
                     exp_Lambda = torch.exp(Lambda.clamp(min=-30.0, max=0.0))
 
-                    idx = torch.arange(C, device=x.device)
+                    idx = self_attn._chunk_arange
                     causal_mask = (idx[:, None] >= idx[None, :]).view(1, 1, 1, C, C)
                     diff = torch.where(causal_mask, Lambda - Lambda.transpose(-1, -2), -1e4)
                     M_links = torch.exp(diff.clamp(min=-1e4, max=0.0))
@@ -283,24 +317,18 @@ def fuse_baretorch_pytorch_for_inference(model):
 
                     next_cache = None
                     if use_cache:
-                        rem = L % C
-                        if rem == 0:
-                            S_local_last = U_decayed[:, :, -1].transpose(-1, -2) @ V_fp32[:, :, -1]
-                            S_final = ((exp_Lambda[:, :, -1, -1:, :] * S_historical[:, :, -1]) + S_local_last).clamp(
-                                -50.0, 50.0
-                            )
-                            next_cache = (S_final, None, None, None, None, L)
-                        else:
-                            past_S = (
-                                S_historical[:, :, -1]
-                                if N > 1
-                                else torch.zeros((B, H, r, d_h), device=x.device, dtype=torch.float32)
-                            )
-                            buf_k = K[:, :, -1, :rem, :].float()
-                            buf_v = V_fp32[:, :, -1, :rem, :]
-                            buf_u = U_fp32[:, :, -1, :rem, :] * beta_gate_fp32[:, :, -1, :rem, :]
-                            buf_lambda = Lambda[:, :, -1, :rem, :]
-                            next_cache = (past_S, buf_k, buf_v, buf_u, buf_lambda, L)
+                        S_local_last = U_decayed[:, :, -1].transpose(-1, -2) @ V_fp32[:, :, -1]
+                        S_final = ((exp_Lambda[:, :, -1, -1:, :] * S_historical[:, :, -1]) + S_local_last).clamp(
+                            -50.0, 50.0
+                        )
+                        # Pre-allocate static 32-slot intra-chunk buffers so decode has 100% static shapes
+                        buf_k = torch.zeros((B, H, C, d_h), device=x.device, dtype=torch.float32)
+                        buf_v = torch.zeros((B, H, C, d_h), device=x.device, dtype=torch.float32)
+                        buf_u = torch.zeros((B, H, C, r), device=x.device, dtype=torch.float32)
+                        buf_lambda = torch.zeros((B, H, C, 1), device=x.device, dtype=torch.float32)
+                        slot_tensor = torch.zeros((1,), device=x.device, dtype=torch.long)
+                        last_lambda = torch.zeros((B, H, 1, 1), device=x.device, dtype=torch.float32)
+                        next_cache = (S_final, buf_k, buf_v, buf_u, buf_lambda, slot_tensor, last_lambda, L)
                     return output, next_cache
 
                 def fused_step_forward(self_attn, x, past_state=None, use_cache=True, attention_mask=None):
@@ -312,20 +340,7 @@ def fuse_baretorch_pytorch_for_inference(model):
                     ur_in = self_attn._ur_dim
                     scaling = 1.0 / math.sqrt(d_h)
 
-                    past_S, buf_k, buf_v, buf_u, buf_lambda, curr_seq_len = None, None, None, None, None, 0
-                    if isinstance(past_state, (tuple, list)):
-                        past_S = past_state[0]
-                        if len(past_state) >= 5:
-                            buf_k, buf_v, buf_u, buf_lambda = past_state[1:5]
-                        if len(past_state) >= 6 and isinstance(past_state[5], int):
-                            curr_seq_len = past_state[5]
-                    elif isinstance(past_state, torch.Tensor):
-                        past_S = past_state
-
-                    if past_S is None:
-                        past_S = torch.zeros((B, H, r, d_h), device=x.device, dtype=torch.float32)
-                    elif past_S.dtype != torch.float32:
-                        past_S = past_S.float()
+                    past_S, buf_k, buf_v, buf_u, buf_lambda, slot_tensor, last_lambda, curr_seq_len = past_state
 
                     proj = F.linear(x, self_attn._qkvurs_w)
                     q_raw, k_raw, v_raw, u_raw, r_raw, swish_raw = torch.split(
@@ -333,55 +348,58 @@ def fuse_baretorch_pytorch_for_inference(model):
                     )
                     g_raw, bg_raw = F.linear(x, self_attn._gates_w, self_attn._gates_b).chunk(2, dim=-1)
 
-                    Q = F.silu(q_raw).view(B, L, H, d_h).transpose(1, 2)
-                    K = F.silu(k_raw).view(B, L, H, d_h).transpose(1, 2)
-                    V = v_raw.view(B, L, H, d_h).transpose(1, 2)
-                    U = u_raw.view(B, L, H, r).transpose(1, 2)
-                    R = r_raw.view(B, L, H, r).transpose(1, 2)
+                    Q = F.silu(q_raw).view(B, 1, H, d_h).transpose(1, 2).float()
+                    K = F.silu(k_raw).view(B, 1, H, d_h).transpose(1, 2).float()
+                    V = v_raw.view(B, 1, H, d_h).transpose(1, 2).float()
+                    U = u_raw.view(B, 1, H, r).transpose(1, 2).float()
+                    R = r_raw.view(B, 1, H, r).transpose(1, 2).float()
 
-                    gate = torch.sigmoid(g_raw.float()).clamp(1e-4, 0.9999).view(B, L, H).transpose(1, 2).unsqueeze(-1)
-                    beta_gate = torch.sigmoid(bg_raw.float()).view(B, L, H).transpose(1, 2).unsqueeze(-1)
+                    gate = torch.sigmoid(g_raw.float()).clamp(1e-4, 0.9999).view(B, H, 1, 1)
+                    beta_gate = torch.sigmoid(bg_raw.float()).view(B, H, 1, 1)
                     log_gate = torch.log(gate)
 
-                    if buf_lambda is not None:
-                        lambda_curr = buf_lambda[:, :, -1:, :] + log_gate
-                        all_lambda = torch.cat([buf_lambda, lambda_curr], dim=2)
-                        all_k = torch.cat([buf_k, K.float()], dim=2)
-                        all_v = torch.cat([buf_v, V.float()], dim=2)
-                        all_u = torch.cat([buf_u, U.float() * beta_gate], dim=2)
-                    else:
-                        lambda_curr = log_gate
-                        all_lambda = lambda_curr
-                        all_k = K.float()
-                        all_v = V.float()
-                        all_u = U.float() * beta_gate
+                    # Static-shape slot update (100% static tensor shapes across all 64 decode steps!)
+                    c_arange = self_attn._chunk_arange
+                    is_slot_zero = (slot_tensor == 0).view(1, 1, 1, 1)
+                    lambda_curr = torch.where(is_slot_zero, log_gate, last_lambda + log_gate)
 
+                    slot_mask = (c_arange == slot_tensor).view(1, 1, C, 1)
+                    buf_k = torch.where(slot_mask, K, buf_k)
+                    buf_v = torch.where(slot_mask, V, buf_v)
+                    buf_u = torch.where(slot_mask, U * beta_gate, buf_u)
+                    buf_lambda = torch.where(slot_mask, lambda_curr, buf_lambda)
+
+                    valid_mask = (c_arange <= slot_tensor).view(1, 1, 1, C)
                     exp_lambda_curr = torch.exp(lambda_curr.clamp(min=-30.0, max=0.0))
-                    m_links = torch.exp((lambda_curr - all_lambda.transpose(-1, -2)).clamp(min=-1e4, max=0.0))
-                    Y_local = ((Q.float() @ all_k.transpose(-1, -2)) * scaling * m_links) @ all_v
-                    Y_global = (R.float() * exp_lambda_curr) @ past_S * scaling
+                    diff = torch.where(valid_mask, lambda_curr - buf_lambda.transpose(-1, -2), -1e4)
+                    m_links = torch.exp(diff.clamp(min=-1e4, max=0.0))
+
+                    Y_local = ((Q @ buf_k.transpose(-1, -2)) * scaling * m_links) @ buf_v
+                    Y_global = (R * exp_lambda_curr) @ past_S * scaling
 
                     Out = (Y_local + Y_global).to(x.dtype).transpose(1, 2).contiguous().view(B, 1, d_in)
                     output = self_attn.W_out(Out * F.silu(swish_raw))
 
-                    if all_k.size(2) >= C:
-                        chunk_decay = torch.exp(all_lambda[:, :, -1:, :].clamp(min=-30.0, max=0.0))
-                        intra_decay = torch.exp((all_lambda[:, :, -1:, :] - all_lambda).clamp(min=-30.0, max=0.0))
-                        s_local = (all_u * intra_decay).transpose(-1, -2) @ all_v
-                        past_S = ((chunk_decay * past_S) + s_local).clamp(-50.0, 50.0)
-                        buf_k, buf_v, buf_u, buf_lambda = None, None, None, None
-                    else:
-                        buf_k, buf_v, buf_u, buf_lambda = all_k, all_v, all_u, all_lambda
+                    # Branch-free chunk rollover at slot == C - 1 (keeps XLA graph 100% static!)
+                    is_chunk_end = (slot_tensor == (C - 1)).view(1, 1, 1, 1)
+                    chunk_decay = exp_lambda_curr
+                    intra_decay = torch.exp((lambda_curr - buf_lambda).clamp(min=-30.0, max=0.0))
+                    s_local = (buf_u * intra_decay).transpose(-1, -2) @ buf_v
+                    folded_S = ((chunk_decay * past_S) + s_local).clamp(-50.0, 50.0)
 
-                    return output, (past_S, buf_k, buf_v, buf_u, buf_lambda, curr_seq_len + 1)
+                    next_S = torch.where(is_chunk_end, folded_S, past_S)
+                    next_slot = torch.where(slot_tensor == (C - 1), torch.zeros_like(slot_tensor), slot_tensor + 1)
+                    next_last_lambda = torch.where(is_chunk_end, torch.zeros_like(lambda_curr), lambda_curr)
+
+                    return output, (next_S, buf_k, buf_v, buf_u, buf_lambda, next_slot, next_last_lambda, curr_seq_len + 1)
 
                 module.chunk_forward = fused_chunk_forward.__get__(module, module.__class__)
                 module.step_forward = fused_step_forward.__get__(module, module.__class__)
                 fused_lrad += 1
 
     print(
-        f"  ⚡ Fused BareTorch projections in-memory: {fused_lrad} CS-LRAD blocks, "
-        f"{fused_gqa} GQA blocks, and {fused_mlps} MLPs!"
+        f"  ⚡ Fused BareTorch projections & enabled 100% STATIC-SHAPE TPU caches: "
+        f"{fused_lrad} CS-LRAD blocks, {fused_gqa} GQA blocks, and {fused_mlps} MLPs!"
     )
 
 
@@ -405,7 +423,20 @@ def benchmark_model_on_tpu(
     enable_last_logit_only(model)
 
     if "baretorch" in model_id.lower():
-        fuse_baretorch_pytorch_for_inference(model)
+        fuse_baretorch_pytorch_for_inference(model, max_decode_steps=gen_tokens)
+        # Override _get_past_length so modeling_baretorch handles our static 5-tuple GQA cache
+        if hasattr(model, "model") and hasattr(model.model, "_get_past_length"):
+            orig_get_past_len = model.model._get_past_length
+
+            def static_get_past_length(past_key_values):
+                if past_key_values is None:
+                    return 0
+                for layer_past in past_key_values:
+                    if isinstance(layer_past, tuple) and len(layer_past) == 5 and isinstance(layer_past[4], int):
+                        return layer_past[4]
+                return orig_get_past_len(past_key_values)
+
+            model.model._get_past_length = static_get_past_length
 
     if use_compile:
         print(f"  🔥 Compiling {label} with torch.compile(backend='tpu')...")
@@ -425,8 +456,9 @@ def benchmark_model_on_tpu(
         sync_tpu()
 
         try:
-            # 1. Full Untimed Warmup: Compiles prefill + ALL `gen_tokens` decode step shapes
-            # so zero XLA graph compilations occur during the timed measurement trials.
+            # 1. Warmup: Because BareTorch's decode cache is now 100% static-shape,
+            # warming up just 2 decode steps compiles the exact graph used by all 64 steps!
+            warmup_steps = 2 if "baretorch" in model_id.lower() else gen_tokens
             t_warmup_start = time.perf_counter()
             with torch.no_grad():
                 out = model(inp, use_cache=True)
@@ -434,7 +466,7 @@ def benchmark_model_on_tpu(
                 tok = out.logits[:, -1:].argmax(dim=-1)
                 sync_tpu()
 
-                for _ in range(gen_tokens):
+                for _ in range(warmup_steps):
                     step = model(tok, past_key_values=p_kv, use_cache=True)
                     p_kv = step.past_key_values
                     tok = step.logits[:, -1:].argmax(dim=-1)
@@ -536,7 +568,7 @@ def main():
 
     device = torch.device("tpu")
     print("=" * 95)
-    print(f"⚡ GOOGLE TORCHTPU BENCHMARK: BareTorch-2.5B (Fused) vs. Qwen3.5-2B (device='{device}')")
+    print(f"⚡ GOOGLE TORCHTPU BENCHMARK: BareTorch-2.5B (Static-Shape Fused) vs. Qwen3.5-2B (device='{device}')")
     print(f"Contexts     : {args.context_lengths}")
     print(f"Decode Steps : {args.gen_tokens} tokens")
     print(f"Trials       : {args.trials} per context length")
